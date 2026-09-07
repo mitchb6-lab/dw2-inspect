@@ -265,6 +265,57 @@ internal sealed class Commands
         return null;
     }
 
+    /// <summary>
+    /// Custom attributes on a type and its members. Properties are included and matter:
+    /// DW2 declares its entire command line as [Option("ugc-publish", ...)] on properties
+    /// of DWCommandLineArgs, which no other view in this tool can see.
+    /// </summary>
+    public void Attributes(string typeName)
+    {
+        foreach (var type in Resolve(typeName))
+        {
+            _out.WriteLine();
+            _out.WriteLine("===== " + type.FullName + "   [" + type.Assembly.GetName().Name + "]");
+
+            foreach (var a in AttributePrinter.SafeGet(type))
+                _out.WriteLine("   " + AttributePrinter.Format(a));
+
+            var members = type.GetProperties(AllDeclared).Cast<MemberInfo>()
+                .Concat(type.GetFields(AllDeclared))
+                .Concat(type.GetMethods(AllDeclared))
+                .Concat(type.GetConstructors(AllDeclared));
+
+            int found = 0;
+
+            foreach (var member in members)
+            {
+                var attributes = AttributePrinter.SafeGet(member);
+                if (attributes.Count == 0)
+                    continue;
+
+                // Only members that actually carry attributes: printing the rest would
+                // bury the handful that matter under hundreds of blank lines.
+                var kind = member switch
+                {
+                    PropertyInfo => "p",
+                    FieldInfo => "f",
+                    ConstructorInfo => "c",
+                    _ => "m",
+                };
+
+                _out.WriteLine($"   {kind}  {member.Name}");
+
+                foreach (var a in attributes)
+                    _out.WriteLine("        " + AttributePrinter.Format(a));
+
+                found++;
+            }
+
+            if (found == 0)
+                Log.Warn($"{type.Name}: no members carry attributes.");
+        }
+    }
+
     /// <summary>Assembly references, which is how the absence of a dependency gets proved.</summary>
     public void Refs(string filter)
     {

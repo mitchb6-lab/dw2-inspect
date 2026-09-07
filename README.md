@@ -57,6 +57,7 @@ dw2inspect <command> [argument] [options]
 | `enum <Type>` | Enum members with their values |
 | `strings <Type>` | Every string literal in a type's methods, nested types included |
 | `il <Type[::Method]>` | Decompile method bodies to IL; method may be `*` |
+| `attrs <Type>` | Custom attributes on a type and its members, properties included |
 | `refs [substring]` | Assembly references of each game assembly |
 
 Options: `--game <path>` (otherwise `DW2_PATH`, otherwise a Steam library scan),
@@ -74,6 +75,22 @@ dw2inspect il "DistantWorlds.Types.MessagePacket::*" > MessagePacket.il.txt
 
 `strings` is the fastest way to orient yourself in an unfamiliar type — it is what
 identified `NetworkHelper` as an HTTP telemetry poster rather than game networking.
+
+`attrs` covers what `strings` structurally cannot. Attribute arguments are **metadata,
+not IL literals**, so they are invisible to every other view here — and DW2 declares its
+entire command line that way:
+
+```bash
+dw2inspect attrs DWCommandLineArgs
+```
+
+```
+p  GenerateSchemas
+     [Option("gen-xsd", Required = false, HelpText = "Export XML schema definitions (.xsd) files for definition types.")]
+```
+
+It reads via `CustomAttributeData` rather than `GetCustomAttributes()`, so nothing in a
+protected assembly is constructed just because we looked at it.
 
 `il` follows async and iterator methods into their generated state machines by
 default, because the outer method is just a stub that starts one. `--no-follow`

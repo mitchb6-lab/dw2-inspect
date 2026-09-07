@@ -12,11 +12,12 @@ internal static class Cli
 
         COMMANDS
           types   [substring]        List type names, optionally filtered.
-          find    <substring>        Search type AND method names.
+          find    <substring>        Search type, method and field names.
           members <Type>             Methods and fields of a type.
           enum    <Type>             Enum members with their values.
           strings <Type>             Every string literal in a type's methods.
           il      <Type[::Method]>   Decompile method bodies to IL. Method may be *.
+          attrs   <Type>             Custom attributes on a type and its members.
           refs    [substring]        Assembly references of each game assembly.
 
         OPTIONS
@@ -31,6 +32,7 @@ internal static class Cli
           dw2inspect enum PlayMode
           dw2inspect il GameClient::SendMessageToServer
           dw2inspect strings NetworkHelper
+          dw2inspect attrs DWCommandLineArgs
           dw2inspect il "DistantWorlds.Types.MessagePacket::*" > MessagePacket.il.txt
 
         NOTE
@@ -67,6 +69,7 @@ internal static class Cli
                 case "enum":    commands.EnumOf(options.Argument); break;
                 case "strings": commands.Strings(options.Argument); break;
                 case "il":      commands.Il(options.Argument, options.FollowStateMachines); break;
+                case "attrs":   commands.Attributes(options.Argument); break;
                 case "refs":    commands.Refs(options.Argument); break;
 
                 default:
