@@ -38,7 +38,18 @@ param(
     [int]    $Snapshots = 6,
     [int]    $TimeoutMinutes = 10,
     [string] $GamePath,
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+
+    # 'continue' loads the most recent save; 'new' generates a fresh galaxy.
+    #
+    # 'continue' is the default because it is the better experiment: both runs start
+    # from byte-identical state, so galaxy generation is removed as a variable and any
+    # divergence is unambiguously the simulation. It is also the only one that works
+    # without a game having been configured -- '--new-game' against unconfigured
+    # GameStartSettings throws NullReferenceException inside
+    # DWGame.InitializeSinglePlayerGame (playerEmpire is null).
+    [ValidateSet('continue', 'new')]
+    [string] $Mode = 'continue'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,7 +109,23 @@ function Parse-RunLog {
 # ---------------------------------------------------------------------------
 
 $game = Find-GamePath -Explicit $GamePath
-Write-Host "Game: $game"
+Write-Host "Game: $game   (mode: $Mode)"
+
+if ($Mode -eq 'continue') {
+    $saves = @(Get-ChildItem (Join-Path $game 'data\SavedGames') -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -ne 'PlaceHolder' -and $_.Extension -ne '.vdf' })
+
+    if ($saves.Count -eq 0) {
+        Write-Host ''
+        Write-Host 'No saved game found, and -Mode continue needs one.' -ForegroundColor Yellow
+        Write-Host 'Start DW2 normally, set up any game, save it, then quit. Both runs will'
+        Write-Host 'load that save, which is what makes the comparison meaningful: identical'
+        Write-Host 'starting state, so any divergence is the simulation and not galaxy generation.'
+        exit 1
+    }
+
+    Write-Host "Save:  $($saves[0].Name) ($([math]::Round($saves[0].Length/1MB,1)) MB)"
+}
 
 if (-not $SkipBuild) {
     Write-Host 'Building Dw2Mp...'
@@ -125,7 +152,8 @@ for ($i = 1; $i -le $Runs; $i++) {
     $env:DW2MP_MAX_SNAPSHOTS  = $Snapshots
     $env:DW2MP_EXIT_WHEN_DONE = '1'
 
-    $args = @('--skip-splash', '--new-game', '--low-level-inject', $modDll)
+    $startFlag = if ($Mode -eq 'continue') { '--continue' } else { '--new-game' }
+    $args = @('--skip-splash', $startFlag, '--low-level-inject', $modDll)
     $proc = Start-Process -FilePath (Join-Path $game 'DistantWorlds2.exe') `
                           -ArgumentList $args -WorkingDirectory $game -PassThru
 

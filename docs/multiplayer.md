@@ -131,7 +131,39 @@ Three things that had to be right, and would each have failed silently:
 - **Log outside the game directory.** The install is under Program Files; a write there
   is not reliably permitted, and the log is the only evidence the injection worked.
 
-### M2 — The determinism experiment ← *the decision point*
+### M2 — The determinism experiment ← *the decision point*  🔧 BUILT, AWAITING A SAVE
+
+`src/Dw2Mp/Determinism.cs` + `Scripts/determinism-run.ps1`. Armed only when
+`DW2MP_DETERMINISM=1`, since it exits the process when a run completes.
+
+**Blocked on one manual step: the game needs a saved game to exist.**
+`--new-game` cannot be used to drive this, because with unconfigured
+`GameStartSettings` (234 bytes, no empires) the game throws during setup:
+
+```
+System.NullReferenceException
+   at DWGame.InitializeSinglePlayerGame(Galaxy, Empire playerEmpire, DateTime)
+   at DWGame.StartGameNewGenerate(Galaxy, GameStartSettings)
+```
+
+`playerEmpire` is null — those settings are normally written by the New Game screen.
+Verified unrelated to our patch: the harness reported `0 server cycle(s) seen`, so
+`UpdateGameAsServer` had not run when the game failed.
+
+**Loading a save is the better experiment anyway.** Both runs then start from
+byte-identical state, which removes galaxy generation as a variable, so any divergence
+is unambiguously the simulation — exactly the property lockstep needs. `-Mode continue`
+is therefore the default.
+
+Two diagnostics that earned their place immediately:
+
+- **Snapshot taken twice back to back.** The simulation runs on background threads, so
+  a single hash could differ between runs from a torn read rather than a real
+  divergence. Agreement means the instant is stable; disagreement means the row is not
+  evidence and the script says so.
+- **Heartbeat + watchdog.** An empty result is otherwise ambiguous between "patch never
+  fired", "fired but game time is frozen", and "time advancing slower than the
+  interval". `0 server cycle(s) seen` immediately pointed at the game, not the hook.
 Harmony-patch a hash of galaxy state (positions, stocks, populations, ids) computed at
 fixed **game-time** intervals, dumped to a file. Then:
 
