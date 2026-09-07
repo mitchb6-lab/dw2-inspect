@@ -91,7 +91,37 @@ state sync for a joining client. And Steam integration is **Workshop/UGC only**:
 fossil of an intention, not a disabled feature. Adding multiplayer would mean writing the
 entire netcode against a commercially protected binary.
 
-## 4. Method-body sizes on disk mean nothing
+## 4. Enabling a mod, and the command line
+
+`mods/mods.json` holds `{"order":[...]}`, and **that array is the enabled set, not just
+a sort order** — `EnableModInternal` appends the mod id to it and `DisableModInternal`
+splices it out by index. A freshly created `mods.json` is `{"order":[]}`, meaning every
+listed mod is *installed but off*. Mod ids are `mods/<Name>` or `steam/<workshopId>`.
+
+Mods **replace** same-named data files rather than merging, so two mods shipping the
+same filename conflict outright and the load order decides. Checking for collisions is
+just comparing filenames between mod folders.
+
+`DWCommandLineArgs` (option names recovered from the attribute blobs, since they are
+metadata rather than IL string literals):
+
+| Flag | Purpose |
+|---|---|
+| `--tool-mode` | Non-game tooling mode |
+| `--ugc-publish` | Publish a mod to Steam Workshop |
+| `--ugc-id` | Workshop item id to publish to |
+| `--ugc-log` | Workshop changelog text |
+| `--ugc-dont-open` | Do not open the Workshop URL afterwards |
+| `--ugc-sync` | Sync subscribed Workshop mods |
+| `--gen-xsd` | **Generate XSD schemas for the data files** |
+| `--new-game`, `--skip-splash`, `--non-interactive` | Startup control |
+| `--use-dx11`, `--use-dxvk`, `--use-dxvk2` | Renderer selection |
+| `--wait-for-debugger`, `--debug-graphics`, `--debug-fatal-exceptions` | Diagnostics |
+
+`--gen-xsd` is the useful one for modding: it emits schemas for the XML formats, which
+beats inferring structure from comments.
+
+## 5. Method-body sizes on disk mean nothing
 
 Worth recording as a methodology note, because it nearly produced a wrong conclusion.
 
