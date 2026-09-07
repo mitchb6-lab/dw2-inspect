@@ -60,7 +60,15 @@ public static class Boot
         TryLog($"we are      : {typeof(Boot).Assembly.Location}");
 
         ReportGameAssemblies();
-        SelfTestHarmony();
+        var harmony = SelfTestHarmony();
+
+        // Opt-in: the determinism harness exits the process when its run completes, so
+        // it must never arm itself during ordinary play.
+        if (harmony is not null && Environment.GetEnvironmentVariable("DW2MP_DETERMINISM") == "1")
+        {
+            TryLog("determinism : arming M2 harness");
+            Determinism.Install(harmony);
+        }
 
         TryLog("=== boot complete ===");
     }
@@ -89,7 +97,7 @@ public static class Boot
     /// can emit and apply a patch in this process without needing a game to be
     /// running, and without leaving a patch on game code that M1 has no use for.
     /// </summary>
-    private static void SelfTestHarmony()
+    private static Harmony SelfTestHarmony()
     {
         try
         {
@@ -106,10 +114,13 @@ public static class Boot
             TryLog(after == "patched"
                 ? $"patching    : OK (\"{before}\" -> \"{after}\")"
                 : $"patching    : FAILED (still \"{after}\")");
+
+            return after == "patched" ? harmony : null;
         }
         catch (Exception ex)
         {
             TryLog("patching    : FAILED " + ex.GetType().Name + ": " + ex.Message);
+            return null;
         }
     }
 
