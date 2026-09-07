@@ -89,6 +89,17 @@ turns that off.
   actually do", which is the point, but it is not a source reconstruction.
 - Warnings go to **stderr**, so redirecting stdout gives you a clean dump.
 
+## Mods
+
+`mods/` holds data mods built with what this tool uncovered. Each is a **generator**
+rather than a checked-in copy of a game file, because the mod loader replaces
+same-named data files outright — so a mod carries a full copy of a game file and
+drifts on patch day. Re-run the generator after a game update.
+
+- **[Pirate Economies](mods/PirateEconomies/)** — DW2's nine pirate governments have
+  distinct names, leaders and AI flavour, and identical income factors, every value
+  exactly `1.0`. This gives each one an economy that matches its name.
+
 ## Scope
 
 This reads a game the user owns, in their own process, to understand its data and
