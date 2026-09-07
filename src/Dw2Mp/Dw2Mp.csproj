@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      net8.0, NOT net9.0. The game hosts Microsoft.NETCore.App 8.0.0 (see
+      DistantWorlds2.Windows.runtimeconfig.json). A net9.0 assembly will not load
+      into a net8.0 runtime, and the failure mode is the injection silently doing
+      nothing.
+    -->
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Dw2Mp</AssemblyName>
+    <RootNamespace>Dw2Mp</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+
+    <!-- We are loaded into someone else's process; never drag our own copies in. -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(DW2_PATH)' != ''">
+    <Dw2Dir>$(DW2_PATH)</Dw2Dir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Dw2Dir)' == ''">
+    <Dw2Dir>C:\Program Files (x86)\Steam\steamapps\common\Distant Worlds 2</Dw2Dir>
+  </PropertyGroup>
+
+  <!--
+    Private=false / CopyLocal off on every one of these: at runtime the game has
+    already loaded them. Shipping our own copies risks binding a second, different
+    instance of the same assembly, which is how a Harmony patch silently applies to
+    a type nobody is using.
+  -->
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(Dw2Dir)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="DistantWorlds.Types">
+      <HintPath>$(Dw2Dir)\DistantWorlds.Types.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="DistantWorlds.Core">
+      <HintPath>$(Dw2Dir)\DistantWorlds.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

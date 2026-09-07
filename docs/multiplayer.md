@@ -95,10 +95,41 @@ must not be assumed in either direction.
 
 ## Milestones
 
-### M1 — Get our code running inside the game
-Minimal assembly loaded via `--low-level-inject`, with a `[ModuleInitializer]` that writes
-a log line and confirms Harmony can attach. Proves the delivery path end to end.
-**Small and definite.**
+### M1 — Get our code running inside the game ✅ DONE
+
+`src/Dw2Mp` — a `[ModuleInitializer]` loaded with:
+
+```
+DistantWorlds2.exe --tool-mode --skip-splash --low-level-inject "<path>\Dw2Mp.dll"
+```
+
+Verified output (`%LOCALAPPDATA%\Dw2Mp\boot.log`):
+
+```
+process     : ...\Distant Worlds 2\DistantWorlds2.exe
+pid         : 42380
+runtime     : 8.0.0 / .NET 8.0.0
+assembly    : DistantWorlds.Types 1.3.6.3
+assembly    : DistantWorlds.Core 1.3.6.3
+assembly    : DistantWorlds2 1.3.6.3
+assembly    : Stride.Engine 4.2.0.28
+harmony     : 2.3.3.0
+patching    : OK ("unpatched" -> "patched")
+```
+
+**The delivery path is proven end to end**: our assembly loads into the game process, the
+game's own types are reachable, Harmony 2.3.3 is live, and a patch applies and takes
+effect. Nothing was installed into the game directory to achieve it.
+
+Three things that had to be right, and would each have failed silently:
+
+- **Target `net8.0`.** The game hosts `Microsoft.NETCore.App 8.0.0`. A `net9.0` assembly
+  will not load, and `LowLevelInjection` catches the failure and returns quietly.
+- **`Private=false` on every game reference.** Copying game DLLs next to ours risks
+  loading a *second* instance of `DistantWorlds.Types`, so patches would apply to types
+  nobody is using.
+- **Log outside the game directory.** The install is under Program Files; a write there
+  is not reliably permitted, and the log is the only evidence the injection worked.
 
 ### M2 — The determinism experiment ← *the decision point*
 Harmony-patch a hash of galaxy state (positions, stocks, populations, ids) computed at
