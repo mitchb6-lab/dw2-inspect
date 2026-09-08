@@ -95,10 +95,19 @@ public static class Determinism
         if (Env("DW2MP_SEQUENTIAL", "0") == "1")
             Sequential.Install(harmony, Log);
 
+        // The lobby's agreed session, if the launcher supplied one. Loaded BEFORE MakeSave
+        // installs, because it decides what galaxy gets generated and which empire this
+        // machine plays.
+        MakeSave.Session = SessionConfig.Load(Env("DW2MP_SESSION", ""), Log);
+
         // NetSession reuses the apply path, so install it for either consumer.
         NetSession.Install(harmony, Log);
 
-        if (MakeSave.Active) MakeSave.Install(harmony, Log);
+        // A session means "generate the agreed galaxy", for BOTH roles. The client's copy
+        // is a throwaway that only exists to give StartGameExisting a game context to
+        // adopt the host's state into — which is what removes the need for players to
+        // share a save file at all.
+        if (MakeSave.Active || MakeSave.Session is not null) MakeSave.Install(harmony, Log);
 
         if (Env("DW2MP_MEASURE_APPLY", "0") == "1" || NetSession.Active)
             ApplyState.Install(harmony, _writeToStream, _galaxyDataType, Log);
@@ -135,7 +144,7 @@ public static class Determinism
             // sits ABOVE the _finished check on purpose: the two measurements are
             // independent, and coupling them meant a completed snapshot run silently
             // cancelled the apply measurement before it ever armed.
-            if (MakeSave.Active) MakeSave.OnServerCycle();
+            if (MakeSave.Active || MakeSave.Session is not null) MakeSave.OnServerCycle();
 
             // Host: ship a full state every N ticks. No-op in client or offline roles.
             // __instance is the GameServer; the host needs it to inject relayed commands

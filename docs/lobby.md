@@ -282,3 +282,63 @@ each machine know which empire is its own without either side guessing.
 The mod does not yet read `session.json`, so the agreed empires do not yet shape the
 generated galaxy. `MakeSave` already proves that path works — it builds `GameStartSettings`
 with per-empire configuration and generates a galaxy — so this is wiring, not discovery.
+
+---
+
+## Session-driven generation — 2026-09-08
+
+The mod now reads `session.json` and the host builds the galaxy from the agreed players,
+so both players' empire choices shape the game. `--continue` is gone from the launch
+command: **nobody needs to share a save file any more.**
+
+```
+# session: mode=competitive players=2 mySlot=0 stars=15 ai=2 seed=4242
+#   slot 0: Mitch — Terran Union (race 0, gov 0)
+#   slot 1: Friend — Ackdarian Compact (race 1, gov 2)
+# makesave: empire for slot 0 — Terran Union (race 0, gov 0)
+# makesave: empire for slot 1 — Ackdarian Compact (race 1, gov 2)
+# makesave: competitive — 2 human empire(s)
+# makesave: generating — stars=15, 2 AI empire(s), seed=4242
+# makesave: playing empire[0] '' (slot 0, mode competitive)
+```
+
+The game's own log for that galaxy, with **no exceptions in the entire run**:
+
+```
+Dimensions: 6 x 6 sectors, Star Systems: 17, Total bodies: 821,
+Standard Empires: 3, Pirate Empires: 3, Colonies: 3, Ships and Bases: 50
+```
+
+### How the two modes differ — one line, not two code paths
+
+`SessionConfig.PlayableEmpireIndex` returns `MySlot` in competitive and `0` in co-op.
+Co-op therefore adds only slot 0's empire to the settings (adding both would create a
+second empire nobody plays) and every machine promotes empire 0, so both players drive the
+same one. `MakeSave.EnsurePlayerEmpire` promotes that index, and since
+`StartGameExisting` binds the whole UI to whichever empire carries `IsPlayer`, that single
+choice decides what this player commands.
+
+### The client no longer needs a save
+
+Both roles generate. The client's galaxy is a **throwaway** whose only job is to give
+`StartGameExisting` a game context to adopt the host's state into — so it does not matter
+whether generation is deterministic between the two machines, which is fortunate, because
+nothing suggests it is.
+
+### NOT verified — empire identity may not survive generation
+
+Two signals say the chosen names and races may not reach the generated empires:
+
+1. The promoted empire logged an **empty name** — `playing empire[0] ''` — rather than
+   "Terran Union".
+2. The galaxy contains **3 standard empires**, where 2 human + 2 AI implies 4.
+
+So what is proven is that the session is read, both empires are submitted to
+`GameStartSettings`, and a galaxy is generated cleanly from the session's star count, AI
+count and seed. What is **not** proven is that the generated empires carry the chosen
+names, races, governments or colours.
+
+This is the same class of gap found earlier: `IsPlayer` set on a `GameStartSettingsEmpire`
+does not survive `Galaxy.Generate`, so other fields may not either. The next step is to
+read the generated `Galaxy.Empires` back and compare against the session — a small check
+that settles it either way.

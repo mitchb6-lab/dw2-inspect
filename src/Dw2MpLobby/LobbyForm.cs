@@ -517,9 +517,13 @@ public sealed class LobbyForm : Form
         };
 
         psi.ArgumentList.Add("--skip-splash");
-        psi.ArgumentList.Add("--continue");
         psi.ArgumentList.Add("--low-level-inject");
         psi.ArgumentList.Add(modDll);
+
+        // NO --continue. The mod generates the agreed galaxy from session.json instead of
+        // loading a save, which is what removes save-sharing from the process: the client
+        // generates a throwaway galaxy purely to have a game context, then adopts the
+        // host's state over it.
 
         psi.Environment["DW2MP_DETERMINISM"] = "1";
         psi.Environment["DW2MP_STEP_MS"] = "100";

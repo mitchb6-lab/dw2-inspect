@@ -131,15 +131,26 @@ public static class MakeSave
 
             var item = empires.GetType().GetMethod("get_Item", new[] { typeof(int) });
 
-            for (int i = 0; i < count; i++)
+            // WHICH empire this machine plays. In competitive each player drives their own,
+            // so it is their lobby slot; in co-op both drive slot 0. This is the payoff of
+            // slot exchange -- StartGameExisting binds the entire UI to whichever empire
+            // carries IsPlayer, so setting it here decides what this player commands.
+            int wanted = Math.Clamp(Session?.PlayableEmpireIndex ?? 0, 0, count - 1);
+
+            for (int offset = 0; offset < count; offset++)
             {
+                int i = (wanted + offset) % count;   // preferred first, then any valid one
+
                 var empire = item?.Invoke(empires, new object[] { i });
                 var isPlayer = empire is null ? null : AccessTools.Field(empire.GetType(), "IsPlayer");
                 if (isPlayer is null) continue;
 
                 isPlayer.SetValue(empire, true);
                 var name = AccessTools.Field(empire.GetType(), "Name")?.GetValue(empire);
-                _log($"# makesave: promoted empire[{i}] '{name}' to player (generation set none)");
+
+                _log(i == wanted
+                    ? $"# makesave: playing empire[{i}] '{name}' (slot {Session?.MySlot ?? 0}, mode {Session?.Mode ?? "solo"})"
+                    : $"# makesave: empire[{wanted}] unusable; fell back to empire[{i}] '{name}'");
                 return;
             }
         }
@@ -172,6 +183,11 @@ public static class MakeSave
         {
             if (!_started) { StartSmallGame(); return; }
 
+            // In a multiplayer session the galaxy is generated to be PLAYED, not saved.
+            // Saving would also exit the process, which is fine for the save-making tool
+            // and catastrophic for a live session.
+            if (Session is not null) { _saved = true; return; }
+
             if (_saved || _cyclesAtStart < 0) return;
             if (_cyclesSeen - _cyclesAtStart < SettleCycles) return;
 
@@ -187,24 +203,76 @@ public static class MakeSave
         }
     }
 
+    /// <summary>The agreed session, when the launcher supplied one.</summary>
+    public static SessionConfig Session { get; set; }
+
     private static void StartSmallGame()
     {
         _started = true;
 
         var settings = Activator.CreateInstance(_settingsType);
 
+        int stars = Session?.Galaxy.Stars ?? Stars;
+        int ai = Session?.Galaxy.AiEmpires ?? OtherEmpires;
+        int seed = Session?.Galaxy.Seed ?? 12345;
+
         // Defaults for everything except size and the one field whose absence broke
         // --new-game. Overriding more than necessary is how a subtly invalid
         // configuration gets built.
-        SetField(settings, "StarCount", Stars);
-        SetField(settings, "OtherEmpiresAutoGenerateAmount", OtherEmpires);
-        SetField(settings, "RandomSeed", 12345);
+        SetField(settings, "StarCount", stars);
+        SetField(settings, "OtherEmpiresAutoGenerateAmount", ai);
+        SetField(settings, "RandomSeed", seed);
 
-        AddPlayerEmpire(settings);
+        if (Session is { Players.Count: > 0 }) AddSessionEmpires(settings);
+        else AddPlayerEmpire(settings);
 
-        _log($"# makesave: generating — stars={Stars}, {OtherEmpires} other empire(s)");
+        _log($"# makesave: generating — stars={stars}, {ai} AI empire(s), seed={seed}");
         _startGameNew.Invoke(_game, new[] { settings });
         _log("# makesave: StartGameNew returned; waiting for the simulation to tick");
+    }
+
+    /// <summary>
+    /// One GameStartSettingsEmpire per human player, built from the lobby's agreed
+    /// session — so the galaxy the host generates actually contains both players'
+    /// chosen empires rather than only the host's.
+    ///
+    /// In co-op both players drive the same empire, so only slot 0 is added; adding two
+    /// would create a second empire nobody is playing.
+    /// </summary>
+    private static void AddSessionEmpires(object settings)
+    {
+        var empiresField = AccessTools.Field(_settingsType, "Empires");
+        var empires = empiresField?.GetValue(settings);
+
+        if (empires is null) { _log("# makesave: Empires list is null; falling back"); AddPlayerEmpire(settings); return; }
+
+        var add = empires.GetType().GetMethod("Add", new[] { _empireType })
+               ?? empires.GetType().GetMethods().FirstOrDefault(m => m.Name == "Add" && m.GetParameters().Length == 1);
+
+        if (add is null) { _log("# makesave: no Add on the empire list; falling back"); AddPlayerEmpire(settings); return; }
+
+        var wanted = Session.IsCompetitive
+            ? Session.Players
+            : Session.Players.Take(1).ToList();
+
+        foreach (var player in wanted)
+        {
+            var empire = Activator.CreateInstance(_empireType);
+
+            SetField(empire, "IsPlayer", true);
+            SetField(empire, "Name", player.Empire.Name);
+            SetField(empire, "RaceId", (short)player.Empire.RaceId);
+            SetField(empire, "GovernmentId", (short)player.Empire.GovernmentId);
+            SetField(empire, "AllowAnyGovernment", true);
+
+            add.Invoke(empires, new[] { empire });
+            _log($"# makesave: empire for slot {player.Slot} — {player.Empire.Name} " +
+                 $"(race {player.Empire.RaceId}, gov {player.Empire.GovernmentId})");
+        }
+
+        _log(Session.IsCompetitive
+            ? $"# makesave: competitive — {wanted.Count} human empire(s)"
+            : "# makesave: co-op shared — one empire for both players");
     }
 
     /// <summary>
