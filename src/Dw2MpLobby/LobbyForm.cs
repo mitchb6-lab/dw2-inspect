@@ -55,8 +55,24 @@ public sealed class LobbyForm : Form
     private Relay _relay;
     private readonly System.Windows.Forms.Timer _statusTimer = new() { Interval = 1000 };
 
-    /// <summary>Localhost port the game connects back on. Not the peer port.</summary>
-    private const int LocalGamePort = 47810;
+    /// <summary>
+    /// Localhost port the game connects back on — not the peer port.
+    ///
+    /// Assigned per launcher instance rather than fixed, because a fixed one means two
+    /// launchers on the same machine collide. That is exactly the configuration used for
+    /// testing here, and it would also bite anyone running host and client on one PC.
+    /// </summary>
+    private readonly int _localGamePort = FreeLocalPort();
+
+    /// <summary>Asks the OS for a free port by binding one and immediately releasing it.</summary>
+    private static int FreeLocalPort()
+    {
+        var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        probe.Start();
+        int port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+        probe.Stop();
+        return port;
+    }
 
     public LobbyForm(string gamePath)
     {
@@ -346,7 +362,7 @@ public sealed class LobbyForm : Form
             // connection attempts fail. It retries, but starting in the right order keeps
             // the log clean and the failure modes few.
             _relay = new Relay(
-                LocalGamePort,
+                _localGamePort,
                 new TcpTransport((int)_port.Value),
                 _roleHost.Checked,
                 _address.Text.Trim(),
@@ -357,7 +373,7 @@ public sealed class LobbyForm : Form
             StartGame(session);
             _launch.Enabled = false;
 
-            Log("Launched. The game connects back to this launcher on 127.0.0.1:" + LocalGamePort + ".");
+            Log("Launched. The game connects back to this launcher on 127.0.0.1:" + _localGamePort + ".");
             Log(_roleHost.Checked
                 ? "Tell the other player to join once you are in the galaxy."
                 : "Waiting for the host — they must be in the galaxy already.");
@@ -437,7 +453,7 @@ public sealed class LobbyForm : Form
 
         // Phase 1: the game talks ONLY to us, on localhost. It is not told the peer
         // address or the peer port at all.
-        psi.Environment["DW2MP_LOCAL_PORT"] = LocalGamePort.ToString();
+        psi.Environment["DW2MP_LOCAL_PORT"] = _localGamePort.ToString();
 
         Log($"Launching {psi.FileName}");
         Process.Start(psi);

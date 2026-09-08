@@ -202,9 +202,31 @@ two players who enabled the same mods in a different order still match.
 Vanilla is the supported configuration. This exists so a mismatch is *detected* rather than
 discovered as strange behaviour an hour into a session.
 
-## NOT YET VERIFIED
+## Phase 1 VERIFIED end to end — 2026-09-08
 
-The Phase 1 refactor **has not been run end to end**. Both projects build and the client
-launches, but no session has yet gone game → launcher → launcher → game. That test needs two
-game instances and about twelve minutes. Until it passes, treat Phase 1 as written but
-unproven — the previously verified path (mod-owned TCP) no longer exists to fall back on.
+Two live games, each talking only to its own launcher-side relay on localhost, with the
+relays linked over TCP.
+
+```
+relay : host(game=True peer=True frames=25 up=46,287,270B)
+        client(game=True peer=True frames=25 down=46,287,270B)
+
+client: connected to launcher on 127.0.0.1:47811
+        peer protocol=1 game=1.3.6.3 mode=coop-shared
+        handshake OK
+        APPLIED sync #1  23,138,191B  read=201ms  apply=45ms  ships=90 empires=6
+        ... 10 states applied
+```
+
+**Byte counts are identical on both sides of the relay** — 46,287,270 in and out, so not a
+byte was lost or duplicated across frame boundaries. Ten full galaxies were applied, and
+the handshake travelled the relay in BOTH directions: each end read the other Hello and
+confirmed protocol and game version.
+
+Host cost is unchanged by the refactor (serialise ~57-102 ms, pack ~101-124 ms,
+send 1-2 ms) and the client still applies in ~10-45 ms after a ~94-201 ms parse. The relay
+adds no measurable overhead on loopback.
+
+One limitation the test exposed and FIXED: the launcher hardcoded local port 47810, so two
+launchers on one machine would collide. It now asks the OS for a free loopback port per
+instance and passes it to the game as `DW2MP_LOCAL_PORT`.
