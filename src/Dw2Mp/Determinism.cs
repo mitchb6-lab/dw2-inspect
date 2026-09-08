@@ -144,7 +144,7 @@ public static class Determinism
         if (MeasureApply || NetSession.Active)
             ApplyState.Install(harmony, _writeToStream, _galaxyDataType, Log);
 
-        var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
+        var prefix = typeof(Determinism).GetMethod(nameof(ServerCyclePrefix), BindingFlags.NonPublic | BindingFlags.Static);
         harmony.Patch(target, new HarmonyMethod(prefix));
         Log($"# patched {serverType.Name}.{target.Name}");
 
@@ -172,6 +172,42 @@ public static class Determinism
 
         Log("# cycle  bytes  hashA  hashB  stable");
     }
+
+    /// <summary>
+    /// The Harmony prefix. Runs our per-tick work, then decides whether DW2 simulates.
+    ///
+    /// A CLIENT DOES NOT SIMULATE. It has no authority over anything, and simulating is
+    /// precisely what made it diverge: it built and lost different ships from the host, so
+    /// its structure disagreed within a few summaries and it asked for a 4.4 MB correction
+    /// every 20 seconds. With the simulation off, its world changes only when the host says
+    /// so -- through deltas, in place, for a few hundred bytes.
+    ///
+    /// This is what a host-authoritative client is supposed to be, and it is why deltas can
+    /// work at all: a client that keeps simulating would drift away from every delta it is
+    /// sent, because DW2 is not deterministic.
+    ///
+    /// Our own work still runs first -- cycle counting, the command heartbeat, the clock --
+    /// because returning false here only skips the ORIGINAL, not the prefix that decided it.
+    /// Set DW2MP_CLIENT_SIMULATES=1 to restore the old behaviour for comparison.
+    /// </summary>
+    private static bool ServerCyclePrefix(object __instance, object[] __args)
+    {
+        OnServerCycle(__instance, __args);
+
+        if (NetSession.Role != NetSession.NetRole.Client || ClientSimulates) return true;
+
+        if (!_loggedSimulationStopped)
+        {
+            _loggedSimulationStopped = true;
+            Log("# net[client]: local simulation STOPPED — the host's deltas move this world");
+        }
+
+        return false;
+    }
+
+    private static bool _loggedSimulationStopped;
+
+    private static readonly bool ClientSimulates = Env("DW2MP_CLIENT_SIMULATES", "0") == "1";
 
     /// <summary>Harmony prefix. Must never throw: this runs inside the simulation loop.</summary>
     private static void OnServerCycle(object __instance, object[] __args)

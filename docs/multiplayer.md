@@ -1320,3 +1320,63 @@ simulation would make divergence impossible by construction, but then its world 
 frozen between corrections, so it would need MORE state, not less. The way out is delta
 updates rather than full galaxies — which is a much larger piece of work, and is the next
 architectural step whenever adoption cost matters again.
+
+---
+
+## The client stops simulating, and deltas move its world — 2026-09-08
+
+Two changes that only work together.
+
+**The client no longer simulates.** `ServerCyclePrefix` returns false on the client, so
+DW2's simulation step never runs there. A host-authoritative client has authority over
+nothing, and simulating was precisely what made it diverge: it built and lost different
+ships from the host, so its structure disagreed within a few summaries and it demanded a
+4.4 MB correction every 20 seconds. (`DW2MP_CLIENT_SIMULATES=1` restores the old behaviour.)
+
+**Ship deltas move it instead.** `StateDelta` sends position, hull damage and destroyed-ness
+per ship, only for ships that actually moved, and the client applies them **in place** —
+no `StartGameExisting`, so no adoption, so none of the ~30 MB of unreleasable native memory
+an adoption costs.
+
+### Measured, one 240-second two-instance run
+
+| | Timer syncing | Commands + summaries | **+ deltas, client not simulating** |
+|---|---:|---:|---:|
+| Full-state adoptions | ~30 | 13 | **5** |
+| Delta traffic | — | — | **1,401 deltas, 283 KB total** |
+| Client memory | +400–800 MB | +67 MB | **flat** (6.54 → 6.66 GB, no trend) |
+
+A representative delta: `91/92 ships, 1,923B`. A full state is 4.33 MB — deltas carry the
+motion at roughly **1%** of the cost, and adoptions dropped six-fold.
+
+### The bug that made the first attempt do nothing
+
+The first version rejected any delta whose ship count disagreed with the host's, on the
+reasoning that a mismatch meant the client's structure had drifted. That was right while
+the client still simulated, and became wrong the moment it stopped: **a client that does
+not simulate can never create a ship**, so the instant the host built one the counts
+diverged permanently and every delta was rejected. Deltas moved nothing for an entire run
+while looking like they were working — 1,400 sent, 0 applied.
+
+A delta now moves ships both sides know about and silently skips ids the client has not
+seen. Those arrive with the next full state, so the client is briefly behind on what
+*exists* while everything it can see keeps moving. That is the right trade: structure
+changes rarely, position changes constantly, and only the first needs a full state.
+
+With deltas carrying motion, `MinTimeBetweenResyncRequests` rose 20 s → 60 s. A full state
+is now purely a structure refresh.
+
+### One hypothesis disproved, recorded so nobody re-tries it
+
+`Design.CalculateAdvancedTechScore` is still the one root cause escaping into the task
+guards, and it reads `Empire.Policy.ComponentSelectionFactors` — which looked like the same
+shape of problem as `Ship.Summary`: derived state `ReadFromStream` does not restore. A probe
+at adoption reports:
+
+```
+# apply: 0 of 10 empires have a null Policy after adoption
+```
+
+**Policy is not the null.** It is somewhere deeper in that method — the component or
+design-template lookups are the remaining candidates. `ConstructionSystem.DoTasks` was added
+to the task guards on evidence, being the path that carried this root to the client.

@@ -53,6 +53,7 @@ public static class NetSession
         Command = 3,       // MessagePacket bytes — the STEADY-STATE channel
         StateSummary = 4,  // host -> client: tick + structural fingerprint. Tens of bytes.
         ResyncRequest = 5, // client -> host: "my structure disagrees, send me a full state"
+        Delta = 6,         // host -> client: ship motion, applied IN PLACE. Hundreds of bytes.
     }
 
     public enum NetRole { Off, Host, Client }
@@ -473,6 +474,10 @@ public static class NetSession
                         break;
                     }
 
+                    case Msg.Delta when Role == NetRole.Client:
+                        _inboundDeltas.Enqueue(payload);
+                        break;
+
                     case Msg.StateSummary when Role == NetRole.Client:
                         OnStateSummary(payload);
                         break;
@@ -549,6 +554,15 @@ public static class NetSession
     {
         if (Role != NetRole.Host || !_connected) return;
 
+        // Deltas first, and often: this is now the channel that makes the client's world
+        // move. A few hundred bytes against 4.37 MB, and applied in place so it costs no
+        // adoption at all.
+        if (tick - _lastDeltaTick >= DeltaEveryTicks)
+        {
+            _lastDeltaTick = tick;
+            SendDelta(galaxy, tick);
+        }
+
         // Cheap heartbeat first: it is the thing that makes rare full states safe.
         if (tick - _lastSummaryTick >= SummaryEveryTicks)
         {
@@ -579,6 +593,11 @@ public static class NetSession
             if (superseded is not null) Interlocked.Increment(ref _statesDropped);
             _outboundReady.Set();
 
+            // The full state IS the new baseline: after the client adopts it, both sides
+            // agree, so every ship counts as unchanged until it next moves. Not resetting
+            // would leave the host suppressing updates the client no longer has.
+            StateDelta.ResetBaseline();
+
             _syncsSent++;
             _log($"# net[host]: full state #{_syncsSent} tick={tick} " +
                  $"({(asked ? "client asked" : "safety interval")}) raw={raw.LongLength:N0}B " +
@@ -592,6 +611,39 @@ public static class NetSession
         }
     }
 
+
+    private static long _lastDeltaTick;
+    private static long _deltasSent;
+    private static long _deltaBytes;
+
+    /// <summary>
+    /// How often the client's world moves. 30 ticks is 3 s of simulated time at the
+    /// fixed step, which is frequent enough to look continuous and rare enough that the
+    /// per-ship change threshold still filters most ships out of most deltas.
+    /// </summary>
+    private const long DeltaEveryTicks = 30;
+
+    /// <summary>Host: send what moved. Nothing moved means nothing is sent.</summary>
+    private static void SendDelta(object galaxy, long tick)
+    {
+        try
+        {
+            var payload = StateDelta.Build(galaxy, out int changed, out int total);
+            if (payload is null) return;
+
+            Send(Msg.Delta, payload);
+            _deltasSent++;
+            _deltaBytes += payload.Length;
+
+            if (_deltasSent % 50 == 1)
+                _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed}/{total} ships " +
+                     $"({payload.Length:N0}B; {_deltaBytes:N0}B total, vs {_syncsSent} full state(s))");
+        }
+        catch (Exception ex)
+        {
+            _log("# net[host]: delta failed " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
     /// <summary>
     /// Tick plus a structural fingerprint. Tens of bytes, computed by reading two fields
     /// per ship — against 24 MB of serialisation and ~100 ms for a full state.
@@ -630,13 +682,28 @@ public static class NetSession
     private static bool _loggedHold;
 
     /// <summary>
+    /// Deltas waiting for the main thread. Unlike full states these are NOT superseded --
+    /// each one carries only what changed since the last, so dropping one loses those ships'
+    /// movement permanently until they next move. They are tiny, so draining all of them is
+    /// cheap; the queue exists only to get off the network thread.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _inboundDeltas = new();
+
+    private static long _deltasApplied;
+    private static long _deltaShipsApplied;
+
+    /// <summary>
     /// Main-thread pump. Applies at most one state per frame, and drops any backlog:
     /// with full-state syncs an older snapshot has no value once a newer one has arrived,
     /// and applying them in sequence would just stutter through stale worlds.
     /// </summary>
     private static void OnMainThreadUpdate()
     {
-        if (Role != NetRole.Client || _inbound.IsEmpty) return;
+        if (Role != NetRole.Client) return;
+
+        DrainDeltas();
+
+        if (_inbound.IsEmpty) return;
 
         // HOLD, do not drop. The host starts syncing on its own schedule, and its first
         // frame routinely beats the client's game into existence. Dropping it left the
@@ -803,8 +870,17 @@ public static class NetSession
     /// </summary>
     private const int MismatchesBeforeResync = 3;
 
-    /// <summary>A floor on resync frequency, so a persistent disagreement cannot become a firehose.</summary>
-    private static readonly TimeSpan MinTimeBetweenResyncRequests = TimeSpan.FromSeconds(20);
+    /// <summary>
+    /// A floor on how often a full state can be requested — and now, in practice, the
+    /// structure-refresh rate.
+    ///
+    /// 60 s rather than 20 s because deltas took over the job the full state used to do.
+    /// The client's world MOVES continuously on a few hundred bytes; a full state is now
+    /// only how it learns about ships that came into existence since the last one. Being a
+    /// minute behind on newly-built ships costs far less than a 4.4 MB adoption every 20 s,
+    /// and adoption is the thing that costs ~30 MB of unreleasable native memory.
+    /// </summary>
+    private static readonly TimeSpan MinTimeBetweenResyncRequests = TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Client: compare the host's structural fingerprint with our own and decide whether we
@@ -882,5 +958,39 @@ public static class NetSession
 
         Send(Msg.ResyncRequest, Array.Empty<byte>());
         _log($"# net[client]: requested full state #{_resyncsRequested} — {reason}");
+    }
+
+    /// <summary>
+    /// Apply queued deltas to the live galaxy, on the main thread.
+    ///
+    /// Main thread because the renderer reads these same ship positions every frame, and a
+    /// Vector3 written field-by-field from another thread can be read half-updated. The
+    /// client's own simulation is stopped, so nothing else is writing them.
+    ///
+    /// A delta that does not fit -- unknown ship, disagreeing count -- is a structural
+    /// divergence, not a bad packet. The rest of the queue is discarded (it is all relative
+    /// to a galaxy we evidently do not have) and a full state is requested.
+    /// </summary>
+    private static void DrainDeltas()
+    {
+        if (_inboundDeltas.IsEmpty) return;
+
+        var galaxy = ApplyState.CurrentGalaxy;
+        if (galaxy is null) return;
+
+        while (_inboundDeltas.TryDequeue(out var payload))
+        {
+            if (StateDelta.Apply(galaxy, payload, out var info))
+            {
+                _deltasApplied++;
+                if (_deltasApplied % 50 == 1)
+                    _log($"# net[client]: delta #{_deltasApplied} applied — {info}");
+                continue;
+            }
+
+            while (_inboundDeltas.TryDequeue(out _)) { }
+            RequestResync($"a delta did not fit: {info}");
+            return;
+        }
     }
 }

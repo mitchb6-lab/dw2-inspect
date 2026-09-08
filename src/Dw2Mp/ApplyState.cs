@@ -171,6 +171,7 @@ public static class ApplyState
 
             RebuildPathData(incoming);
             RegenerateShipSummaries(incoming);
+            CheckEmpirePolicies(incoming);
 
             // Mirror the game's own load sequence. DW2 deserialises galaxies constantly --
             // every save load -- and it does three things around it that StartGameExisting
@@ -862,6 +863,9 @@ public static class ApplyState
             ("DistantWorlds.Types.Orb",     "DoTasks"),
             ("DistantWorlds.Types.Colony",  "DoTasks"),
             ("DistantWorlds.Types.Fleet",   "DoTasks"),
+            // Added on evidence: the Design.CalculateAdvancedTechScore root reached the
+            // client through ConstructionSystem, which the first guard list missed.
+            ("DistantWorlds.Types.ConstructionSystem", "DoTasks"),
         };
 
         var finalizer = new HarmonyMethod(typeof(ApplyState).GetMethod(
@@ -1002,5 +1006,44 @@ public static class ApplyState
             // go unnoticed. Empty compares unequal to any real fingerprint.
             return "";
         }
+    }
+
+    private static bool _loggedPolicyCheck;
+
+    /// <summary>
+    /// Count empires arriving with a null Policy.
+    ///
+    /// Diagnostic, not a fix. Design.CalculateAdvancedTechScore reads
+    /// Empire.Policy.ComponentSelectionFactors and is the one root cause still escaping into
+    /// the task guards, and a null Policy would be the same shape of problem as Ship.Summary:
+    /// derived state that ReadFromStream does not restore. If this reports zero, the null is
+    /// somewhere else and that is worth knowing before anyone patches Policy.
+    /// </summary>
+    private static void CheckEmpirePolicies(object galaxy)
+    {
+        if (_loggedPolicyCheck) return;
+
+        try
+        {
+            var empires = AccessTools.Field(galaxy.GetType(), "Empires")?.GetValue(galaxy);
+            if (empires is null) return;
+
+            var count = AccessTools.PropertyGetter(empires.GetType(), "Count")?.Invoke(empires, null) is int c ? c : 0;
+            var item = AccessTools.Method(empires.GetType(), "get_Item", new[] { typeof(int) });
+            if (item is null || count == 0) return;
+
+            int nullPolicies = 0;
+
+            for (int i = 0; i < count; i++)
+            {
+                var empire = item.Invoke(empires, new object[] { i });
+                if (empire is null) continue;
+                if (AccessTools.Field(empire.GetType(), "Policy")?.GetValue(empire) is null) nullPolicies++;
+            }
+
+            _loggedPolicyCheck = true;
+            _log($"# apply: {nullPolicies} of {count} empires have a null Policy after adoption");
+        }
+        catch { /* diagnostic only */ }
     }
 }
