@@ -1380,3 +1380,80 @@ at adoption reports:
 **Policy is not the null.** It is somewhere deeper in that method — the component or
 design-template lookups are the remaining candidates. `ConstructionSystem.DoTasks` was added
 to the task guards on evidence, being the path that carried this root to the client.
+
+---
+
+## CalculateAdvancedTechScore — root cause found and fixed, 2026-09-08
+
+The last root cause escaping the task guards. **Two consecutive 240-second two-instance
+runs now produce 0 crash dumps and 0 guard hits**, where every previous run produced one to
+three.
+
+### What it is
+
+`Design.CalculateAdvancedTechScore` reads, on one line:
+
+```
+newobj   Component::.ctor(Int16, Byte)     // built from (componentId, researched level)
+callvirt Component::get_Definition()
+ldfld    ComponentDefinition.Category      // <-- no null check
+```
+
+and `Component.Definition` is:
+
+```csharp
+if (_wrDefinition.TryGetTarget(out d) && d.ComponentId == ComponentId) return d;
+d = Galaxy.ComponentsStatic.GetByComponentId(ComponentId);   // can return null
+_wrDefinition = new Weak<ComponentDefinition>(d);
+return d;
+```
+
+A **weak reference cached over a mutable, process-wide static table**. On a weak-reference
+miss it re-resolves from `Galaxy.ComponentsStatic`.
+
+`ShipComponent.GetComponentLevel` null-checks `Definition` twice on adjacent lines.
+`CalculateAdvancedTechScore` does not — and `Empire`, `Empire.Research`,
+`ResearchedComponents` and its own `GetHighestComponent` result are all null-checked either
+side of it. It is one missing check in otherwise careful code.
+
+### Why adoption triggers it, and why it is a race
+
+`Galaxy.ReadFromStream` calls `CopyGalaxyInstanceToStaticBaseData`, which **rewrites the
+static definition tables**. DW2 only ever does this at load time, when nothing else is
+running. We do it on a live process, so a worker thread resolving a component mid-rewrite
+gets a null.
+
+That it is a race and not corrupt data is what two failed hypotheses established:
+
+| Hypothesis | Probe | Result |
+|---|---|---|
+| `Empire.Policy` is null after adoption | count null policies at adoption | ❌ **0 of 10** |
+| A ship's component id does not resolve | resolve every ship component id | ❌ **all 77 resolve** |
+| A *design's* component id does not resolve | extend the probe to `Galaxy.Designs` | ❌ **all 83–98 resolve** |
+
+Every id always resolved, while the crash kept happening once or twice a run. Persistent
+data problems do not behave like that; a race does.
+
+The second probe is worth its own note: ships alone reported a clean bill of health because
+the crash arrives through `Ship.ShouldRetrofitTechScore(Empire, Design)`, which passes the
+**design's** component list. A retrofit is evaluated against a design the ship does not yet
+carry, so the ids that mattered were the ones no ship was using. Reading the stack properly
+was worth more than another probe.
+
+### The fix
+
+**Quiesce before deserialising, not just before the swap.** `QuiesceBeforeSwap()` moved to
+the top of `ApplyBytes`, ahead of `ReadFromStream`. It was already being called — but after
+the statics had been rewritten, which is the wrong side of the thing it protects.
+
+The task guards stay as the backstop. This is a missing null check in code we cannot edit,
+reachable whenever the static tables are swapped on a live process; shrinking the window to
+near zero is the fix available to us, and the guard is what makes the residual harmless.
+
+### State of the run
+
+```
+0 crash dumps, 0 guard hits (two consecutive runs)
+5 full states, 1,501 deltas, 383 KB of delta traffic
+client memory flat, both processes alive for the full 240 s
+```

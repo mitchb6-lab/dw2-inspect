@@ -143,6 +143,29 @@ public static class ApplyState
 
         try
         {
+            // QUIESCE FIRST, before deserialising -- not just before the swap.
+            //
+            // Galaxy.ReadFromStream calls CopyGalaxyInstanceToStaticBaseData, which rewrites
+            // the PROCESS-WIDE static definition tables. Component.Definition resolves
+            // through one of them:
+            //
+            //     if (_wrDefinition.TryGetTarget(out d) && d.ComponentId == ComponentId) return d;
+            //     d = Galaxy.ComponentsStatic.GetByComponentId(ComponentId);   // can be null
+            //
+            // -- a WEAK reference cached over a MUTABLE static. Design.CalculateAdvancedTechScore
+            // then reads .Definition.Category with no null check, on the one line of that method
+            // where everything around it IS null-checked. So a worker thread touching a
+            // component while we are mid-rewrite gets a null and throws.
+            //
+            // That is a race, not corrupt data, which is why probing every component id at
+            // adoption reported all 83 resolving while the crash carried on happening once or
+            // twice a run. DW2 only ever swaps these tables at load time, when nothing else is
+            // running; we swap them on a live process, so we have to recreate that condition.
+            //
+            // Quiescing before the swap was not enough: the statics were already rewritten by
+            // then.
+            QuiesceBeforeSwap();
+
             var sw = Stopwatch.StartNew();
 
             using var input = new MemoryStream(raw, writable: false);
@@ -172,13 +195,8 @@ public static class ApplyState
             RebuildPathData(incoming);
             RegenerateShipSummaries(incoming);
             CheckEmpirePolicies(incoming);
+            VerifyComponentDefinitions(incoming);
 
-            // Mirror the game's own load sequence. DW2 deserialises galaxies constantly --
-            // every save load -- and it does three things around it that StartGameExisting
-            // alone does not. Skipping them is why adoption produced hundreds of scattered
-            // NullReferenceExceptions across research, refuelling, corruption and pirate
-            // code. See AdoptionFixup for what each one is for.
-            QuiesceBeforeSwap();
 
             sw.Restart();
             _startGameExisting.Invoke(_game, new[] { incoming, ReadStartTime(incoming), incomingData });
@@ -1045,5 +1063,135 @@ public static class ApplyState
             _log($"# apply: {nullPolicies} of {count} empires have a null Policy after adoption");
         }
         catch { /* diagnostic only */ }
+    }
+
+    private static bool _loggedComponentCheck;
+
+    /// <summary>
+    /// Make sure every component id the adopted galaxy uses resolves in the static
+    /// definition table, and repair the table if not.
+    ///
+    /// THE ROOT CAUSE this exists for. ShipComponent.Component is
+    ///     Galaxy.ComponentsStatic.GetByComponentId(this.ComponentId)
+    /// — a lookup in a process-wide STATIC table — and
+    /// Design.CalculateAdvancedTechScore does
+    ///     ShipComponent.Component.Category
+    /// with no null check, while null-checking Empire, Empire.Research,
+    /// ResearchedComponents and its own result on the lines either side of it. So one
+    /// component id the statics cannot resolve throws a NullReferenceException out of
+    /// Ship.DoTasks, and before the task guards existed that killed the client outright.
+    ///
+    /// Why adoption can break it: the statics belong to the PROCESS, not to a galaxy, and
+    /// the client has had two — the throwaway it generated and the host's. Whichever wrote
+    /// the statics last wins, and ships from the other one may reference ids it does not
+    /// describe.
+    ///
+    /// CopyGalaxyInstanceToStaticBaseData is DW2's own way of saying "these definitions are
+    /// the live ones", and re-running it points the statics at the galaxy actually being
+    /// played. The check runs first so the log says whether the repair was needed, not just
+    /// that it was attempted.
+    /// </summary>
+    private static void VerifyComponentDefinitions(object galaxy)
+    {
+        if (!FixupEnabled) return;
+
+        try
+        {
+            int missing = CountUnresolvableComponents(galaxy, out int checkedIds);
+
+            if (missing == 0)
+            {
+                if (!_loggedComponentCheck)
+                {
+                    _loggedComponentCheck = true;
+                    _log($"# apply: all {checkedIds} component id(s) resolve in ComponentsStatic");
+                }
+                return;
+            }
+
+            _log($"# apply: {missing} of {checkedIds} component id(s) do NOT resolve — repairing statics");
+
+            var copy = AccessTools.Method(galaxy.GetType(), "CopyGalaxyInstanceToStaticBaseData",
+                                          new[] { galaxy.GetType() });
+            copy?.Invoke(copy.IsStatic ? null : galaxy, new[] { galaxy });
+
+            int after = CountUnresolvableComponents(galaxy, out _);
+            _log(after == 0
+                ? "# apply: statics repaired — every component id now resolves"
+                : $"# apply: statics STILL missing {after} component id(s) after the copy");
+        }
+        catch (Exception ex)
+        {
+            _log("# apply: component definition check failed " + (ex.InnerException ?? ex).Message);
+        }
+    }
+
+    /// <summary>
+    /// How many distinct component ids used by this galaxy cannot be resolved.
+    ///
+    /// Walks SHIPS AND DESIGNS. Ships alone was the first attempt and it reported a clean
+    /// bill of health -- all 77 ids resolved -- while the crash carried on. Reading the
+    /// stack more carefully showed why: it arrives through
+    /// Ship.ShouldRetrofitTechScore(Empire, Design), which passes the DESIGN's component
+    /// list, not the ship's. A retrofit is evaluated against a design the ship does not yet
+    /// carry, so the ids that matter are the ones no ship is using.
+    ///
+    /// Distinct ids, because one unresolvable definition is typically used by many ships and
+    /// a raw count would say more about fleet size than about the problem.
+    /// </summary>
+    private static int CountUnresolvableComponents(object galaxy, out int distinctIds)
+    {
+        distinctIds = 0;
+
+        var staticsField = AccessTools.Field(galaxy.GetType(), "ComponentsStatic");
+        var statics = staticsField?.GetValue(staticsField.IsStatic ? null : galaxy);
+        if (statics is null) return 0;
+
+        var getByComponentId = AccessTools.Method(statics.GetType(), "GetByComponentId", new[] { typeof(short) });
+        if (getByComponentId is null) return 0;
+
+        var seen = new HashSet<short>();
+        int missing = 0;
+
+        foreach (var collectionName in new[] { "Ships", "Designs" })
+        {
+            var owners = AccessTools.Field(galaxy.GetType(), collectionName)?.GetValue(galaxy);
+            if (owners is null) continue;
+
+            var ownerCount = AccessTools.PropertyGetter(owners.GetType(), "Count")?.Invoke(owners, null) is int oc ? oc : 0;
+            var ownerItem = AccessTools.Method(owners.GetType(), "get_Item", new[] { typeof(int) });
+            if (ownerItem is null) continue;
+
+            for (int i = 0; i < ownerCount; i++)
+            {
+                object owner;
+                try { owner = ownerItem.Invoke(owners, new object[] { i }); }
+                catch { continue; }
+                if (owner is null) continue;
+
+                var components = AccessTools.Field(owner.GetType(), "Components")?.GetValue(owner);
+                if (components is null) continue;
+
+                var cCount = AccessTools.PropertyGetter(components.GetType(), "Count")?.Invoke(components, null) is int cc ? cc : 0;
+                var cItem = AccessTools.Method(components.GetType(), "get_Item", new[] { typeof(int) });
+                if (cItem is null) continue;
+
+                for (int j = 0; j < cCount; j++)
+                {
+                    object component;
+                    try { component = cItem.Invoke(components, new object[] { j }); }
+                    catch { continue; }
+                    if (component is null) continue;
+
+                    if (AccessTools.Field(component.GetType(), "ComponentId")?.GetValue(component) is not short id) continue;
+                    if (!seen.Add(id)) continue;
+
+                    if (getByComponentId.Invoke(statics, new object[] { id }) is null) missing++;
+                }
+            }
+        }
+
+        distinctIds = seen.Count;
+        return missing;
     }
 }
