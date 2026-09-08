@@ -342,3 +342,46 @@ This is the same class of gap found earlier: `IsPlayer` set on a `GameStartSetti
 does not survive `Galaxy.Generate`, so other fields may not either. The next step is to
 read the generated `Galaxy.Empires` back and compare against the session — a small check
 that settles it either way.
+
+### Empire identity check — RESULT 2026-09-08: configured empires are NOT used
+
+Read the generated `Galaxy.Empires` back and compared against the session:
+
+```
+[0] name='Independent'                          race=255 gov=-1
+[1] name='Najarca Empire'                       race=1   gov=6
+[2] name='Atuuk Commonwealth'                   race=9   gov=4
+[3] name='Ikkuro Serenity'                      race=5   gov=11
+[4] name='Ancient Mortalen Planet Destroyer AI' race=248 gov=32765
+[5] name='The Hive'                             race=249 gov=32766
+[6..8] Hidden Council / Red Dagger Clan / Harmonious Void  gov=32767
+
+session asked for:  'Terran Union' race=0 gov=0  |  'Ackdarian Compact' race=1 gov=2
+```
+
+**Two defects, both real:**
+
+1. **`GameStartSettings.Empires` is ignored.** No generated empire carries `gov=0` or
+   `gov=2`. The three standard empires were auto-generated from
+   `OtherEmpiresAutoGenerateAmount`; our configured entries were not used. Consistent with
+   `IsPlayer` not surviving `Galaxy.Generate` — the settings' empire list is not the input
+   we assumed. `GameStartSettings.EmpireAutoGenerationState` is the obvious suspect and has
+   never been set.
+
+2. **Promotion picks the wrong empire.** Index 0 is `Independent` — DW2's neutral
+   pseudo-empire (`race=255`, `gov=-1`) — and indices 4–8 are pirates and monsters
+   (`gov` 32765–32767). "Promote index N" must skip non-playable empires or the player ends
+   up commanding the independents.
+
+#### A measurement bug produced a confident wrong answer first
+
+The initial run reported every empire with an empty name and blank race, and concluded
+names did not survive. **That was the probe, not the game.** `Empire.Name` is a PROPERTY
+(`get_Name`/`set_Name`), and the race field is `DominantRaceId`, not `RaceId` —
+`AccessTools.Field` returned null for both and `?.` printed empty. Only `GovernmentId`
+read correctly, because it is genuinely a field.
+
+The conclusion happened to survive re-measurement, but it was reached on invalid evidence,
+and the corrected read is what revealed the `Independent` promotion bug — which the broken
+probe had hidden behind an empty string. The probe now reports `<missing>` for an absent
+member rather than printing nothing.

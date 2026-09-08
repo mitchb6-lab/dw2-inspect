@@ -131,6 +131,8 @@ public static class MakeSave
 
             var item = empires.GetType().GetMethod("get_Item", new[] { typeof(int) });
 
+            DumpGeneratedEmpires(empires, item, count);
+
             // WHICH empire this machine plays. In competitive each player drives their own,
             // so it is their lobby slot; in co-op both drive slot 0. This is the payoff of
             // slot exchange -- StartGameExisting binds the entire UI to whichever empire
@@ -173,6 +175,85 @@ public static class MakeSave
         // output is a flavour blurb that a throwaway test save does not need.
         __result = "";
         return false;
+    }
+
+    /// <summary>
+    /// Reads the GENERATED empires back and compares them to the session.
+    ///
+    /// Worth doing because a settings field surviving Galaxy.Generate cannot be assumed:
+    /// IsPlayer demonstrably does not, which is why EnsurePlayerEmpire exists at all. If
+    /// names, races and governments do not survive either, they have to be written onto
+    /// the generated empires here — the same place the IsPlayer promotion already happens.
+    /// </summary>
+    private static void DumpGeneratedEmpires(object empires, System.Reflection.MethodInfo item, int count)
+    {
+        try
+        {
+            _log($"# verify: galaxy generated {count} empire(s)");
+
+            for (int i = 0; i < count; i++)
+            {
+                var empire = item?.Invoke(empires, new object[] { i });
+                if (empire is null) { _log($"# verify:   [{i}] <null>"); continue; }
+
+                _log($"# verify:   [{i}] name='{EmpireName(empire)}' race={Member(empire, "DominantRaceId")} " +
+                     $"gov={Member(empire, "GovernmentId")} isPlayer={Member(empire, "IsPlayer")}");
+            }
+
+            if (Session is null) return;
+
+            _log("# verify: session asked for —");
+            foreach (var p in Session.Players)
+                _log($"# verify:   slot {p.Slot}: '{p.Empire.Name}' race={p.Empire.RaceId} gov={p.Empire.GovernmentId}");
+
+            // The decisive question, stated as a verdict rather than left to be eyeballed.
+            bool namesSurvived = Session.Players.Any(p =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var e = item?.Invoke(empires, new object[] { i });
+                    if (e is not null && EmpireName(e) == p.Empire.Name) return true;
+                }
+                return false;
+            });
+
+            _log(namesSurvived
+                ? "# verify: RESULT — configured empire names DID survive generation"
+                : "# verify: RESULT — configured names did NOT survive; they must be applied post-generation");
+        }
+        catch (Exception ex) { _log("# verify: failed " + (ex.InnerException ?? ex).Message); }
+    }
+
+    /// <summary>
+    /// Empire.Name is a PROPERTY (get_Name/set_Name), not a field. Reading it with
+    /// AccessTools.Field returns null, which silently prints as an empty name and looks
+    /// exactly like "generation discarded the configured name" — a wrong conclusion this
+    /// probe reached once already.
+    /// </summary>
+    private static string EmpireName(object empire)
+    {
+        try
+        {
+            var getter = AccessTools.PropertyGetter(empire.GetType(), "Name");
+            if (getter is not null) return getter.Invoke(empire, null) as string ?? "";
+
+            return AccessTools.Field(empire.GetType(), "<Name>k__BackingField")?.GetValue(empire) as string ?? "";
+        }
+        catch { return "<unreadable>"; }
+    }
+
+    /// <summary>Field or property, whichever exists — member kinds are not guessable here.</summary>
+    private static object Member(object target, string name)
+    {
+        try
+        {
+            var t = target.GetType();
+            var field = AccessTools.Field(t, name);
+            if (field is not null) return field.GetValue(target);
+
+            return AccessTools.PropertyGetter(t, name)?.Invoke(target, null) ?? "<missing>";
+        }
+        catch { return "<unreadable>"; }
     }
 
     private static void OnUpdate(object __instance)
