@@ -567,3 +567,39 @@ Constraints carried from earlier milestones, none optional:
   once a newer one has arrived; applying them in order would stutter through dead worlds.
 - **Both ends need `FixedStep`.** Without it `GameServer.Now` never advances and the host
   sits inert, resending identical state forever.
+
+### Making a small save (`MakeSave.cs`)
+
+Two DW2 instances will not fit in 32 GB on the late-game save (~15 GB working set each),
+so the two-process test needs a small one. `DW2MP_MAKE_SAVE=1` generates and saves one
+without anyone touching the New Game screen.
+
+Result: **`data/SavedGames/MPTestSmall.DWGame`, 21 MB** (vs 37.5 MB). The game's own log
+for the generated galaxy:
+
+```
+Dimensions: 6 x 6 sectors, Star Systems: 16, Total Stars/Planets/Moons/Asteroids: 1026,
+Standard Empires: 3, Total Colonies: 2, Total Ships and Bases: 99, Total Creatures: 41
+```
+
+Its header matches a known-good save byte for byte (same version stamp and magic).
+
+Four obstacles, each of which had to be read out of the game rather than guessed:
+
+1. **`--new-game` cannot be used.** It reads the stub `GameStartSettings` the game writes
+   on first run (234 bytes, no empires) and dies in `InitializeSinglePlayerGame` because
+   `playerEmpire` is null. So the settings are built in-process and passed to
+   `StartGameNew` directly.
+2. **`IsPlayer` on a `GameStartSettingsEmpire` does not survive `Galaxy.Generate`.**
+   `StartGameExisting` resolves the player through `Galaxy.Empires.GetPlayer()`, which
+   returns the first `Empire` with `IsPlayer` set and null otherwise. Fixing the *input*
+   does not work; a prefix that promotes the first empire when `GetPlayer()` is null does.
+   It is a no-op for every save-loading path, so it cannot disturb M3/M4.
+3. **`EndGenerateGame` then dies in `Empire.GenerateSituationDescription`.** Generation
+   itself succeeds; this is the flavour blurb, and it dereferences a null *field* inside a
+   non-null settings entry (our hand-built empire leaves several strings null). Skipped
+   unconditionally — it only runs when MakeSave is active and a test save does not need it.
+4. **`DWGame.SaveGame(String)` takes a PATH, not a save name.** A bare name writes
+   `data/<name>` with no extension, where the load screen will never see it. Found by
+   searching the filesystem for the file after `SaveGame` returned "successfully" and
+   `SavedGames` was still empty — a silent success is the worst kind.

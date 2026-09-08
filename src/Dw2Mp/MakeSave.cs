@@ -153,10 +153,13 @@ public static class MakeSave
     /// Returns an empty description instead of throwing when the settings entry is null.
     /// Returning false skips the original.
     /// </summary>
-    private static bool SkipSituationDescription(object[] __args, ref string __result)
+    private static bool SkipSituationDescription(ref string __result)
     {
-        if (__args is { Length: > 0 } && __args[0] is not null) return true;   // normal path
-
+        // Unconditional. The first attempt only skipped when the settings entry was null,
+        // and it still threw — so the null is a FIELD inside a non-null entry (our
+        // hand-built empire leaves several strings null). Rather than guess which, skip
+        // the whole thing: this is only ever reached because MakeSave is active, and the
+        // output is a flavour blurb that a throwaway test save does not need.
         __result = "";
         return false;
     }
@@ -241,9 +244,14 @@ public static class MakeSave
     {
         _saved = true;
 
-        _log($"# makesave: saving as '{SaveName}'");
+        // SaveGame takes a PATH relative to the working directory, not a save name.
+        // Passing a bare name writes "data/<name>" with no extension, which the game's
+        // own load screen will not see. Discovered by finding the file in the wrong place.
+        var path = Path.Combine("data", "SavedGames", SaveName + ".DWGame");
+
+        _log($"# makesave: saving to '{path}'");
         AccessTools.Method(_game.GetType(), "CheckCreateSaveGameFolder")?.Invoke(_game, null);
-        _saveGame.Invoke(_game, new object[] { SaveName });
+        _saveGame.Invoke(_game, new object[] { path });
 
         _log("# makesave: SaveGame returned; exiting shortly");
 
