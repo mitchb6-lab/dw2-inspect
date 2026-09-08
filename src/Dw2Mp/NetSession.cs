@@ -501,6 +501,8 @@ public static class NetSession
 
     // -------------------------------------------------------------- client
 
+    private static bool _loggedHold;
+
     /// <summary>
     /// Main-thread pump. Applies at most one state per frame, and drops any backlog:
     /// with full-state syncs an older snapshot has no value once a newer one has arrived,
@@ -509,6 +511,21 @@ public static class NetSession
     private static void OnMainThreadUpdate()
     {
         if (Role != NetRole.Client || _inbound.IsEmpty) return;
+
+        // HOLD, do not drop. The host starts syncing on its own schedule, and its first
+        // frame routinely beats the client's game into existence. Dropping it left the
+        // client running its own throwaway galaxy for the whole session -- two people in
+        // two universes, which is the one outcome this design exists to prevent. Keeping
+        // the frame queued costs one buffer and resolves itself within a few frames.
+        if (!ApplyState.CanApply)
+        {
+            if (!_loggedHold)
+            {
+                _loggedHold = true;
+                _log("# net[client]: state arrived before the game was ready — holding it");
+            }
+            return;
+        }
 
         byte[] newest = null;
         int dropped = -1;

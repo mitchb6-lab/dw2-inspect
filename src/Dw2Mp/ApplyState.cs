@@ -52,6 +52,17 @@ public static class ApplyState
 
     public static bool Ready => _startGameExisting is not null;
 
+    /// <summary>
+    /// Ready means the PATH is resolved. CanApply means there is actually a DWGame to
+    /// adopt into — which is later, and is the distinction the client got wrong: the
+    /// host's first sync arrived before the client had finished creating its throwaway
+    /// game, the frame was dropped as unappliable, and the client then spent the whole
+    /// run in its own divergent galaxy.
+    /// </summary>
+    public static bool CanApply => _startGameExisting is not null
+                                && _readFromStream is not null
+                                && _game is not null;
+
     public static bool HasCapture => _capturedBytes is not null;
 
     public static bool Applied => _applied;

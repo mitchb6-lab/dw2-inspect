@@ -972,3 +972,35 @@ relay at the expected size. Both sides generated their configured empires.
 **The relay stopped at 3 frames** with `game=False` on both ends afterwards, which is
 consistent with the games dropping their local sockets after the failed apply. Worth
 re-checking once (1) is fixed rather than chasing separately.
+
+### Both defects fixed, re-run 2026-09-08 — the client adopts the host's universe
+
+```
+CLIENT  # net[client]: state received ... (queued)              x4, before the game existed
+CLIENT  # net[client]: state arrived before the game was ready — holding it
+CLIENT  # makesave: player empire already set by generation — 'Ackdarian Compact' (slot 1)
+CLIENT  # net[client]: APPLIED sync #1  24,042,942B  read=159ms  apply=9ms  ships=54 empires=10
+```
+
+**Crash dumps went 523 → 1**, and the one that remains is a UI popup
+(`EmpireMessageDialog.BindData` via `ShowInvestigationDecisionMessage`), not the
+simulation — a message dialog whose subject was swapped out from under it.
+
+That 523 → 1 is also the **experimental confirmation of the corrected diagnosis above**:
+the only change touching crashes was removing the unrequested self-apply, and the pathing
+family vanished with it. The swap causes them; `Independent` never did.
+
+| Defect | Fix |
+|---|---|
+| Client dropped state that arrived before it had a `DWGame` | `ApplyState.CanApply` distinguishes "path resolved" from "there is a game to adopt into"; the client now **holds** the frame instead of dropping it |
+| M3b self-apply ran during live sessions | Gated on `DW2MP_MEASURE_APPLY` alone. `ApplyState` is still installed when `NetSession` is active — the transport needs `ApplyBytes` — but the measurement no longer fires |
+
+**Still open, and the top item is now client throughput.** The client managed 2 server
+cycles to the host's 8 and applied only sync #1 while later frames queued behind it. Two
+DW2 instances on one machine is part of it, but a post-apply stall has not been ruled out
+and the relay showed the client's traffic flat-lining afterwards. Measure before assuming
+it is only contention.
+
+**Same seed, different galaxies** remains true and remains harmless: the host generated 10
+empires and the client 10 with different auto-generated names, and the client's copy is
+overwritten by the sync. It does mean the seed alone is not a shared input.

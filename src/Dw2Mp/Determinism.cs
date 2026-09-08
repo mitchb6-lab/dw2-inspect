@@ -44,6 +44,18 @@ public static class Determinism
 
     private static readonly bool PinBlocks = Env("DW2MP_PIN_BLOCKS", "1") == "1";
 
+    /// <summary>
+    /// The M3b self-apply MEASUREMENT: capture the galaxy, then re-apply it to this same
+    /// process later to prove adoption is real.
+    ///
+    /// It must never run during a live session. ApplyState is installed whenever
+    /// NetSession is active, because the transport needs ApplyBytes -- but the measurement
+    /// was gated on ApplyState.Ready, so a networked run performed an unrequested galaxy
+    /// swap at cycle 1600 on BOTH machines. That swap produced 518 pathing exceptions in
+    /// the 2026-09-08 two-instance run and made its results unreadable.
+    /// </summary>
+    private static readonly bool MeasureApply = Env("DW2MP_MEASURE_APPLY", "0") == "1";
+
     private static readonly long CaptureAtCycles = EnvLong("DW2MP_CAPTURE_AT_CYCLES", 400);
 
     private static readonly long ApplyAfterCycles = EnvLong("DW2MP_APPLY_AFTER_CYCLES", 1600);
@@ -113,7 +125,7 @@ public static class Determinism
         // share a save file at all.
         if (MakeSave.Active || MakeSave.Session is not null) MakeSave.Install(harmony, Log);
 
-        if (Env("DW2MP_MEASURE_APPLY", "0") == "1" || NetSession.Active)
+        if (MeasureApply || NetSession.Active)
             ApplyState.Install(harmony, _writeToStream, _galaxyDataType, Log);
 
         var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
@@ -157,7 +169,7 @@ public static class Determinism
             NetSession.HostTick(galaxy, n);
             NetSession.ClientHeartbeatTick(n);
 
-            if (ApplyState.Ready)
+            if (MeasureApply && ApplyState.Ready)
             {
                 // Capture early, apply late, then watch. The gap between capture and
                 // apply is what makes adoption falsifiable: the live clock must jump
