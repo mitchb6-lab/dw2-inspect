@@ -1516,3 +1516,85 @@ choice: deltas then describe changes since the snapshot the client is starting f
 a collection whose members appear and disappear — which is structure, and structure is what
 full states are for. The same reasoning excludes fleets, characters and diplomacy: each is a
 collection rather than a set of scalars on an object that already exists on both sides.
+
+---
+
+## Creation and removal, client-side — 2026-09-08
+
+Deltas now carry **structure** as well as change, for ships and colonies.
+
+### The objection was real and the answer was to look harder
+
+This was documented as out of scope on the grounds that constructing a DW2 `Ship` from
+outside would mean reproducing a constructor we cannot read, and getting it subtly wrong
+would corrupt the client's galaxy silently. That reasoning was sound. It was also beside
+the point, because **the game already knows how**:
+
+```
+Ship.WriteToStream(BinaryWriter)
+Ship.ReadFromStream(Galaxy, BinaryReader)
+```
+
+and `ShipList.ReadFromStream` — DW2's own save loader — does exactly:
+
+```csharp
+var ship = new Ship(galaxy);
+ship = ship.ReadFromStream(galaxy, reader);
+list.Add(ship);
+```
+
+`Colony` exposes the identical pair and its list deserialiser the identical idiom. So a
+created object is built by DW2's constructor and populated by DW2's field reading; nothing
+here knows what a Ship contains. **The limitation was in the approach, not the game.**
+
+### What it fixes
+
+Before, the client could never gain an object, so its sets drifted from the host's
+indefinitely and every update naming an unknown id was skipped forever:
+
+```
+have 38 of host's 46 ships
+have 72 of host's 78 ships
+```
+
+After, across a 240-second run:
+
+| Ship-count gap | Samples |
+|---:|---:|
+| **1** | 12 |
+| 2–4 | 8 |
+| 5–8 | 5 |
+
+A gap of 1 is a ship built between the host's snapshot and the client's apply — inherent
+latency, not drift. The run ends at 97 of 98.
+
+### Measured
+
+| | Update-only | **+ creation and removal** |
+|---|---:|---:|
+| Full-state adoptions | 5 | **5** |
+| Delta traffic | 564 KB | **523 KB** |
+| Crash dumps | 0 | **0** |
+| Guard hits | 0 | **0** |
+| Client memory | flat | **flat** |
+
+Traffic went *down*: an added ship costs its serialised bytes once, where before the client
+never got it at all and the host re-sent an update for it on every delta forever.
+
+### One detail that would have been a silent corruption
+
+`RegenerateSummary()` is called on every created object that has one. `ShipSummary` is
+derived and **not** serialised — established earlier when adopting a full state left 64 of
+64 ships with a null `Summary`. A per-object deserialise is the same code path, so a newly
+created ship would have arrived with the same hole and crashed the first thing that read
+it. Knowing that from the earlier work is what made this safe first time.
+
+### Still not carried, and why
+
+- **Research projects** are created and removed with an empire rather than during play, so
+  they stay update-only.
+- **Anything behind a nested collection** — `Colony.Population` is per-race, plus fleets,
+  characters, diplomacy — is left to full states. Those are collections whose *members*
+  come and go, which is the same problem one level down.
+
+Full states remain the repair path when a delta does not fit.

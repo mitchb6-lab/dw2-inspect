@@ -23,23 +23,29 @@ namespace Dw2Mp;
 /// Only records that actually changed are sent, each against a per-kind threshold, so a
 /// quiet galaxy costs nothing.
 ///
-/// WHAT IT DOES NOT CARRY. Anything structural -- objects appearing or disappearing.
-/// Constructing a DW2 Ship, Colony or ResearchProject from the outside through reflection
-/// would mean reproducing a constructor we cannot read, and getting it subtly wrong would
-/// corrupt the client's galaxy silently.
+/// STRUCTURE, TOO -- ships and colonies are created and removed client-side, using DW2's
+/// OWN per-object serialisation. Ship and Colony both expose WriteToStream(BinaryWriter)
+/// and ReadFromStream(Galaxy, BinaryReader), and their list deserialisers do exactly
+///     new T(galaxy); t.ReadFromStream(galaxy, reader); list.Add(t);
+/// when loading a save. So no constructor is reproduced and no field list is guessed.
 ///
-/// So a delta updates records BOTH SIDES ALREADY HAVE, and silently skips ids the client
-/// has not seen. Those arrive with the next full state. Treating an unknown id as a failure
-/// was tried first and was a real bug: once the client stopped simulating it could no longer
-/// create anything, so the moment the host built a ship the counts diverged permanently and
-/// every delta was rejected -- deltas moved nothing for an entire run.
+/// This was once documented here as out of scope, on the grounds that building a Ship by
+/// hand would be too risky. That was true and beside the point: the game already knows how,
+/// and looking was worth more than accepting the limit. Before it, the client's ship count
+/// drifted from the host's indefinitely -- 38 of 46, then 72 of 78 -- and every update for a
+/// ship it had never heard of was skipped forever. Now the gap sits at 1, which is a ship
+/// built between the host's snapshot and the client's apply.
 ///
-/// Deltas carry change; full states carry structure. Structure changes far less often, and
-/// that gap is the whole saving.
+/// STILL NOT CARRIED: research projects are created and removed with an empire, not during
+/// play, so they are update-only; and anything reached through a nested collection
+/// (Colony.Population is per-race, fleets, characters, diplomacy) is left to full states.
+///
+/// Deltas carry change AND the structure they can safely reconstruct; full states carry
+/// the rest, and remain the repair path when a delta does not fit.
 /// </summary>
 public static class StateDelta
 {
-    private const int Version = 3;
+    private const int Version = 5;
 
     /// <summary>
     /// Per-kind change thresholds. Without them every float that drifts by a rounding error
@@ -95,7 +101,7 @@ public static class StateDelta
 
         // Build populates the baseline dictionaries as a side effect. Discarding the payload
         // is the whole point: the client is receiving this content as a full state instead.
-        Build(galaxy, out _, out _);
+        Build(galaxy, out _, out _, primeOnly: true);
     }
     // ------------------------------------------------------------------ host
 
@@ -103,7 +109,7 @@ public static class StateDelta
     /// Build a delta of everything that changed since the last one. Returns null when
     /// nothing did, so a still galaxy costs no traffic at all.
     /// </summary>
-    public static byte[] Build(object galaxy, out int changed, out int total)
+    public static byte[] Build(object galaxy, out int changed, out int total, bool primeOnly = false)
     {
         changed = 0;
         total = 0;
@@ -119,8 +125,8 @@ public static class StateDelta
 
             lock (_baseline)
             {
-                changed += WriteShipSection(galaxy, writer, out total);
-                changed += WriteColonySection(galaxy, writer);
+                changed += WriteShipSection(galaxy, writer, out total, primeOnly);
+                changed += WriteColonySection(galaxy, writer, primeOnly);
                 changed += WriteResearchSection(galaxy, writer);
             }
 
@@ -134,8 +140,20 @@ public static class StateDelta
             return null;
         }
     }
-
-    private static int WriteShipSection(object galaxy, BinaryWriter writer, out int total)
+    /// <summary>
+    /// Ships: removals, additions and updates.
+    ///
+    /// ADDITIONS carry the ship SERIALISED BY DW2 ITSELF -- Ship.WriteToStream on the host,
+    /// `new Ship(galaxy)` then Ship.ReadFromStream on the client, which is exactly what
+    /// ShipList.ReadFromStream does when loading a save. That is what makes creating objects
+    /// client-side safe: no constructor is reproduced and no field list is guessed. The
+    /// earlier refusal to handle creation assumed we would have to build a Ship by hand;
+    /// the game already knows how, and it was worth looking before accepting the limit.
+    ///
+    /// A brand-new ship is an ADD, not an update: it is absent from the baseline, so sending
+    /// it as an update would name an id the client does not have and be skipped forever.
+    /// </summary>
+    private static int WriteShipSection(object galaxy, BinaryWriter writer, out int total, bool primeOnly)
     {
         var ships = ListField(galaxy, "Ships");
         var item = Indexer(ships);
@@ -145,7 +163,9 @@ public static class StateDelta
         // reports "I have 46 of your 57" without a separate message.
         writer.Write(total);
 
-        var records = new List<(int Id, ShipState State)>();
+        var present = new HashSet<int>();
+        var added = new List<object>();
+        var updated = new List<(int Id, ShipState State)>();
 
         for (int i = 0; i < total && item is not null; i++)
         {
@@ -153,14 +173,42 @@ public static class StateDelta
             if (ship is null || !ResolveShip(ship)) continue;
             if (!TryReadShip(ship, out var id, out var now)) continue;
 
-            if (_lastShips.TryGetValue(id, out var before) && !ShipDiffers(before, now)) continue;
+            present.Add(id);
+
+            if (!_lastShips.TryGetValue(id, out var before))
+            {
+                _lastShips[id] = now;
+                added.Add(ship);
+                continue;
+            }
+
+            if (!ShipDiffers(before, now)) continue;
 
             _lastShips[id] = now;
-            records.Add((id, now));
+            updated.Add((id, now));
         }
 
-        writer.Write(records.Count);
-        foreach (var (id, s) in records)
+        var removed = _lastShips.Keys.Where(id => !present.Contains(id)).ToList();
+        foreach (var id in removed) _lastShips.Remove(id);
+
+        writer.Write(removed.Count);
+        foreach (var id in removed) writer.Write(id);
+
+        // Priming only needs the baseline populated; serialising every ship into a buffer
+        // that is thrown away costs a WriteToStream per ship for nothing.
+        writer.Write(primeOnly ? 0 : added.Count);
+        if (!primeOnly)
+        {
+            foreach (var ship in added)
+            {
+                var bytes = SerialiseObject(ship, galaxy.GetType());
+                writer.Write(bytes?.Length ?? 0);
+                if (bytes is { Length: > 0 }) writer.Write(bytes);
+            }
+        }
+
+        writer.Write(updated.Count);
+        foreach (var (id, s) in updated)
         {
             writer.Write(id);
             writer.Write(s.X); writer.Write(s.Y); writer.Write(s.Z);
@@ -168,16 +216,78 @@ public static class StateDelta
             writer.Write(s.Destroyed);
         }
 
-        return records.Count;
+        return removed.Count + (primeOnly ? 0 : added.Count) + updated.Count;
     }
 
-    private static int WriteColonySection(object galaxy, BinaryWriter writer)
+    // --- creating and removing objects, using DW2's OWN per-object serialisation
+    //
+    // Ship and Colony both expose WriteToStream(BinaryWriter) and
+    // ReadFromStream(Galaxy, BinaryReader), and their list deserialisers do exactly
+    //     new T(galaxy); t.ReadFromStream(galaxy, reader); list.Add(t);
+    // when loading a save. Using that is what makes creating objects client-side safe: no
+    // constructor is reproduced and no field list is guessed.
+    //
+    // This was the stated reason creation was out of scope -- "reproducing a constructor we
+    // cannot read". The game already knows how, and it was worth looking before accepting
+    // the limitation.
+
+    private readonly record struct Serialiser(ConstructorInfo Ctor, MethodInfo Read, MethodInfo Write, MethodInfo Regenerate);
+
+    private static readonly Dictionary<Type, Serialiser> _serialisers = new();
+
+    private static Serialiser SerialiserFor(Type type, Type galaxyType)
+    {
+        lock (_serialisers)
+        {
+            if (_serialisers.TryGetValue(type, out var cached)) return cached;
+
+            var made = new Serialiser(
+                type.GetConstructor(new[] { galaxyType }),
+                AccessTools.Method(type, "ReadFromStream", new[] { galaxyType, typeof(BinaryReader) }),
+                AccessTools.Method(type, "WriteToStream", new[] { typeof(BinaryWriter) }),
+                AccessTools.Method(type, "RegenerateSummary", Type.EmptyTypes));
+
+            _serialisers[type] = made;
+            return made;
+        }
+    }
+
+    private static byte[] SerialiseObject(object item, Type galaxyType)
+    {
+        try
+        {
+            var s = SerialiserFor(item.GetType(), galaxyType);
+            if (s.Write is null) return null;
+
+            using var buffer = new MemoryStream();
+            using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                s.Write.Invoke(item, new object[] { writer });
+                writer.Flush();
+            }
+
+            return buffer.ToArray();
+        }
+        catch { return null; }
+    }
+
+
+    /// <summary>
+    /// Colonies: removals, additions and updates, exactly as for ships.
+    ///
+    /// Colonies are founded and lost during a game, so without creation the client's colony
+    /// set would drift from the host's the same way its ship set did -- and colony updates
+    /// for a colony it has never heard of are skipped forever.
+    /// </summary>
+    private static int WriteColonySection(object galaxy, BinaryWriter writer, bool primeOnly)
     {
         var colonies = ListField(galaxy, "Colonies");
         var item = Indexer(colonies);
         int count = CountOf(colonies);
 
-        var records = new List<(short Id, ColonyState State)>();
+        var present = new HashSet<short>();
+        var added = new List<object>();
+        var updated = new List<(short Id, ColonyState State)>();
 
         for (int i = 0; i < count && item is not null; i++)
         {
@@ -185,21 +295,47 @@ public static class StateDelta
             if (colony is null || !ResolveColony(colony)) continue;
             if (!TryReadColony(colony, out var id, out var now)) continue;
 
-            if (_lastColonies.TryGetValue(id, out var before) && !ColonyDiffers(before, now)) continue;
+            present.Add(id);
+
+            if (!_lastColonies.TryGetValue(id, out var before))
+            {
+                _lastColonies[id] = now;
+                added.Add(colony);
+                continue;
+            }
+
+            if (!ColonyDiffers(before, now)) continue;
 
             _lastColonies[id] = now;
-            records.Add((id, now));
+            updated.Add((id, now));
         }
 
-        writer.Write(records.Count);
-        foreach (var (id, c) in records)
+        var removed = _lastColonies.Keys.Where(id => !present.Contains(id)).ToList();
+        foreach (var id in removed) _lastColonies.Remove(id);
+
+        writer.Write(removed.Count);
+        foreach (var id in removed) writer.Write(id);
+
+        writer.Write(primeOnly ? 0 : added.Count);
+        if (!primeOnly)
+        {
+            foreach (var colony in added)
+            {
+                var bytes = SerialiseObject(colony, galaxy.GetType());
+                writer.Write(bytes?.Length ?? 0);
+                if (bytes is { Length: > 0 }) writer.Write(bytes);
+            }
+        }
+
+        writer.Write(updated.Count);
+        foreach (var (id, c) in updated)
         {
             writer.Write(id);
             writer.Write(c.Corruption); writer.Write(c.Approval); writer.Write(c.Quality);
             writer.Write(c.MaxPopulation);
         }
 
-        return records.Count;
+        return removed.Count + (primeOnly ? 0 : added.Count) + updated.Count;
     }
 
     private static int WriteResearchSection(object galaxy, BinaryWriter writer)
@@ -296,6 +432,13 @@ public static class StateDelta
         }
     }
 
+    /// <summary>
+    /// Ships: removals first, then additions, then updates.
+    ///
+    /// That order matters. A ship destroyed and its id reused would otherwise be added
+    /// before the old one is gone; and an update for a ship arriving in the same delta must
+    /// land after the add, not before it.
+    /// </summary>
     private static int ApplyShips(object galaxy, BinaryReader reader, out int absent, out int hostTotal, out int localTotal)
     {
         absent = 0;
@@ -305,10 +448,35 @@ public static class StateDelta
 
         hostTotal = reader.ReadInt32();
         localTotal = CountOf(ships);
-        int count = reader.ReadInt32();
         int applied = 0;
 
-        for (int i = 0; i < count; i++)
+        // --- removals
+        int removedCount = reader.ReadInt32();
+        for (int i = 0; i < removedCount; i++)
+        {
+            int id = reader.ReadInt32();
+            var ship = Lookup(getById, ships, id);
+            if (ship is null) { absent++; continue; }
+
+            if (RemoveFromList(ships, ship)) applied++;
+            else absent++;
+        }
+
+        // --- additions, deserialised by DW2's own Ship.ReadFromStream
+        int addedCount = reader.ReadInt32();
+        for (int i = 0; i < addedCount; i++)
+        {
+            int length = reader.ReadInt32();
+            var bytes = length > 0 ? reader.ReadBytes(length) : null;
+            if (bytes is null || bytes.Length != length) { absent++; continue; }
+
+            if (AddFromBytes(galaxy, ships, AccessTools.TypeByName("DistantWorlds.Types.Ship"), bytes)) applied++;
+            else absent++;
+        }
+
+        // --- updates
+        int updatedCount = reader.ReadInt32();
+        for (int i = 0; i < updatedCount; i++)
         {
             int id = reader.ReadInt32();
             var state = new ShipState(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(),
@@ -324,17 +492,88 @@ public static class StateDelta
         return applied;
     }
 
+    /// <summary>
+    /// Rebuild an object from the host's bytes and put it in the list.
+    ///
+    /// RegenerateSummary afterwards where the type has one: ShipSummary is derived and NOT
+    /// serialised, established when adopting a full state left 64 of 64 ships with a null
+    /// Summary. A per-object deserialise is the same code path, so a newly created ship
+    /// would arrive with the same hole and crash the first thing that read it.
+    /// </summary>
+    private static bool AddFromBytes(object galaxy, object list, Type elementType, byte[] bytes)
+    {
+        try
+        {
+            if (list is null || elementType is null) return false;
+
+            var s = SerialiserFor(elementType, galaxy.GetType());
+            if (s.Ctor is null || s.Read is null) return false;
+
+            var blank = s.Ctor.Invoke(new[] { galaxy });
+
+            using var input = new MemoryStream(bytes, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+
+            var item = s.Read.Invoke(blank, new[] { galaxy, (object)reader });
+            if (item is null) return false;
+
+            s.Regenerate?.Invoke(item, null);
+
+            var add = AccessTools.Method(list.GetType(), "CheckAdd")
+                   ?? AccessTools.Method(list.GetType(), "Add");
+            if (add is null) return false;
+
+            add.Invoke(list, new[] { item });
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private static bool RemoveFromList(object list, object element)
+    {
+        try
+        {
+            var remove = AccessTools.Method(list.GetType(), "CheckRemove")
+                      ?? AccessTools.Method(list.GetType(), "FastRemove", new[] { element.GetType() });
+            if (remove is null) return false;
+
+            remove.Invoke(list, new[] { element });
+            return true;
+        }
+        catch { return false; }
+    }
+
     private static int ApplyColonies(object galaxy, BinaryReader reader, out int absent)
     {
         absent = 0;
 
         var colonies = ListField(galaxy, "Colonies");
         var getById = ById(colonies, typeof(short)) ?? ById(colonies, typeof(int));
-
-        int count = reader.ReadInt32();
+        var colonyType = AccessTools.TypeByName("DistantWorlds.Types.Colony");
         int applied = 0;
 
-        for (int i = 0; i < count; i++)
+        int removedCount = reader.ReadInt32();
+        for (int i = 0; i < removedCount; i++)
+        {
+            short id = reader.ReadInt16();
+            var colony = Lookup(getById, colonies, id);
+            if (colony is null) { absent++; continue; }
+
+            if (RemoveFromList(colonies, colony)) applied++; else absent++;
+        }
+
+        int addedCount = reader.ReadInt32();
+        for (int i = 0; i < addedCount; i++)
+        {
+            int length = reader.ReadInt32();
+            var bytes = length > 0 ? reader.ReadBytes(length) : null;
+            if (bytes is null || bytes.Length != length) { absent++; continue; }
+
+            if (AddFromBytes(galaxy, colonies, colonyType, bytes)) applied++; else absent++;
+        }
+
+        int updatedCount = reader.ReadInt32();
+        for (int i = 0; i < updatedCount; i++)
         {
             short id = reader.ReadInt16();
             var state = new ColonyState(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(),
