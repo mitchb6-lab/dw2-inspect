@@ -756,3 +756,64 @@ either mode ships, because it points at derived state that a state-swap does not
 **Process note:** M4 was reported as working on the strength of our own log without
 checking the game's own `SessionLog.txt`. That was the right result but an incomplete
 check — the game's log should be read on every run from here.
+
+---
+
+## Decisions 2026-09-08
+
+- **Co-op = one shared empire.** Both players issue orders to the same empire. No empire
+  assignment, no fog concern, works on the architecture already proven. Fastest path to
+  something playable.
+- **Competitive stays gated on evidence** — investigate DW2's fog model before committing.
+- **Target is internet play**, so `SteamNetworkingSockets` eventually replaces raw TCP
+  (`Facepunch.Steamworks` is already loaded in-process).
+
+## Fog investigation — RESULT: competitive is a milestone, not a rewrite
+
+**DW2 has a real, serialised, per-empire knowledge model.** `Empire` owns it directly:
+
+```
+f  VisibilityMap            VisibilityMap
+f  ExplorationMap           ExplorationMap
+f  ResourceQuantityList     ResourcesKnown
+f  PrioritizedTargetList    KnownFuelSources
+f  EmpireList               _EmpiresWithSharedVisibility
+```
+
+`VisibilityMap` is a genuine knowledge store, **with its own `ReadFromStream` /
+`WriteToStream`** — so it persists per empire rather than being derived at render time:
+
+- `VisibilityStatus { Undefined, Unexplored, Explored, Visible }` per system
+- Per-system arrays: `ColonyInvasion[]`, `InBattle[]`, `PlagueIdInSystem[]`,
+  `PotentialColonyInSystem[]`, plus dictionaries for colony events and ruins
+- Queries already exist: `CheckBaseKnown(Ship)`, `CalculateLocationVisibilityLevel(Location,
+  Empire, out bool)`, `CalculateSystemVisibility(int, Galaxy, Empire)`
+
+And `ShipVisibility` carries **`ApparentEmpireId`** and **`ApparentRole`** — the game
+models what an observer *believes* a ship is, separately from what it actually is. That is
+proper fog-of-war modelling, not a display filter.
+
+### What this changes
+
+**Correction to the earlier framing.** Competitive play was described as blocked by
+information disclosure. That overstated it:
+
+- **A competitive session would work and display correctly today.** Each client's UI
+  filters through *its own* empire's `VisibilityMap`, so a player sees what their empire
+  knows, not the whole galaxy.
+- **The leak is a cheat-resistance problem, not a correctness one.** The unfiltered data
+  sits in client memory, exploitable by someone reading process memory or writing their own
+  mod — not by playing normally.
+
+*(Strongly indicated by the API shape rather than proven: the render path has not been
+traced. Worth confirming before relying on it.)*
+
+**Hardening is a milestone.** Redacting before send means walking the galaxy and blanking
+what the recipient does not know — and the predicates for "does empire E know about X"
+already exist. The costs are real (a redacted copy per recipient per sync, or a custom
+serialiser instead of `Galaxy.WriteToStream`) but this is ordinary work, not the
+open-ended problem that closed lockstep.
+
+**`_EmpiresWithSharedVisibility` is a gift for co-op.** The game already models empires
+sharing visibility, which is exactly what allied co-op needs — should allied empires be
+wanted later.
