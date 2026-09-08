@@ -49,7 +49,16 @@ looks for the mod beside itself first.
 | **This PC's LAN address** | `192.168.1.166` |
 | **Port** | `47800` (TCP) |
 
-Re-check the address before a session — it can change:
+**You do not need to look this up.** The lobby lists every address a joiner could use
+under **Your address**, labelled by what it actually is, with a **Copy** button. It also
+detects Tailscale, ZeroTier, Hamachi and Radmin adapters and marks those as working over
+the internet.
+
+It warns about full-tunnel VPNs (NordVPN and similar) because those break peer
+connections, and it ignores adapters that are down or failed DHCP — so the list only
+contains addresses that could actually work.
+
+If you want to check by hand anyway:
 
 ```powershell
 Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' }
@@ -73,9 +82,12 @@ process, so port 47800 is already permitted — nothing to configure.
 5. Configure your empire — name, race, government, colour.
 6. Choose **Mode**: *Co-op — shared empire* (both drive one empire) or *Competitive*.
 7. Leave **Port** at `47800`.
-8. Click **Host and launch**. DW2 starts; wait until you are actually in the galaxy.
-9. **Tell the joiner to connect only once you are in-game.** The host does not listen until
-   it has loaded.
+8. **Pick your address** from **Your address** and click **Copy**. Send it to the joiner.
+   Choose the LAN entry if you are on the same network, or the Tailscale/ZeroTier/Hamachi
+   entry for internet play.
+9. Click **Host and launch**. DW2 starts; wait until you are actually in the galaxy.
+10. **Tell the joiner to connect only once you are in-game.** The host does not listen until
+    it has loaded.
 
 ## Step by step — them (joining)
 
@@ -83,10 +95,13 @@ process, so port 47800 is already permitted — nothing to configure.
    `...\Distant Worlds 2\data\SavedGames\`.
 2. **Run `Dw2MpLobby.exe`.** It should report finding their game and loading 23 races.
 3. Set **Role → Join a session**.
-4. Enter **Host address** `192.168.1.166` and **Port** `47800`.
-5. Configure their empire (see [Limitations](#limitations) — this does not reach you yet).
-6. Click **Join and launch**.
-7. Their game loads, connects, and begins receiving the galaxy.
+4. Paste the **Host address** you sent them, and leave **Port** at `47800`.
+5. Click **Test connection**. It answers in a couple of seconds and tells them whether the
+   host is listening — far better than discovering a typo after a four-minute game load.
+   *(Expect "no answer" until the host is actually in-game.)*
+6. Configure their empire (see [Limitations](#limitations) — this does not reach you yet).
+7. Click **Join and launch**.
+8. Their game loads, connects, and begins receiving the galaxy.
 
 ## Confirming it worked
 
@@ -137,9 +152,18 @@ ends.
 Setup:
 
 1. Both players install the same tool and join the same network.
-2. The host finds its virtual address (Tailscale: `100.x.y.z`; Hamachi: `25.x.y.z`).
-3. The joiner enters **that** address in the lobby instead of `192.168.1.166`.
-4. Everything else is unchanged.
+2. **The host opens the lobby and picks the virtual adapter from "Your address."** It is
+   detected and labelled automatically — no need to work out which address is which —
+   and sorted above the LAN entry, because a virtual address works in strictly more
+   situations.
+3. **Copy** it and send it over.
+4. The joiner pastes it, clicks **Test connection** to confirm, then launches.
+
+Detection is by adapter name first and IP range second. Ranges alone are ambiguous —
+Tailscale uses `100.64/10`, which is also the carrier-grade NAT range, and ZeroTier's
+range is configurable. Naming also keeps Tailscale from being mistaken for a
+"turn this off" VPN, since it is WireGuard-based like the ones that genuinely do break
+peer connections.
 
 > **Do not run NordVPN at the same time.** It is installed on this PC and, like any
 > full-tunnel VPN, it will fight a virtual-LAN adapter and break the connection. Turn it
@@ -235,3 +259,6 @@ Things that will surprise you if you do not know them:
 - **2026-09-08** — Added "Playing over the internet": virtual LAN (Tailscale/ZeroTier/
   Hamachi) as the no-code path, with measured per-sync bandwidth showing that payload size,
   not NAT, is the binding constraint over the internet.
+- **2026-09-08** — Lobby now discovers and labels every connectable address (LAN,
+  Tailscale, ZeroTier, Hamachi, Radmin), warns about full-tunnel VPNs, offers Copy for the
+  host and Test connection for the joiner. No more hunting for the right IP.

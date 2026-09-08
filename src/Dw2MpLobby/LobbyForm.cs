@@ -31,6 +31,11 @@ public sealed class LobbyForm : Form
     private readonly TextBox _address = new() { Text = "127.0.0.1" };
     private readonly NumericUpDown _port = new() { Minimum = 1024, Maximum = 65535, Value = 47800 };
 
+    private readonly ComboBox _myAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly Button _copyAddress = new() { Text = "Copy" };
+    private readonly Button _testConnection = new() { Text = "Test connection" };
+    private List<LocalAddress> _localAddresses = new();
+
     private readonly Button _launch = new() { Text = "Launch", Height = 34 };
     private readonly TextBox _status = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Height = 90 };
 
@@ -85,7 +90,8 @@ public sealed class LobbyForm : Form
         root.Controls.Add(Section("Session", Grid(
             ("Role", Stack(_roleHost, _roleJoin)),
             ("Mode", _mode),
-            ("Host address", _address),
+            ("Your address", Stack(_myAddress, _copyAddress)),
+            ("Host address", Stack(_address, _testConnection)),
             ("Port", _port))));
 
         root.Controls.Add(Section("Galaxy (host only)", Grid(
@@ -117,8 +123,50 @@ public sealed class LobbyForm : Form
         _roleHost.CheckedChanged += (_, _) => UpdateRoleEnabled();
         _launch.Click += (_, _) => Launch();
 
+        _copyAddress.Click += (_, _) =>
+        {
+            if (_myAddress.SelectedItem is not LocalAddress a) return;
+            Clipboard.SetText(a.Ip.ToString());
+            Log($"Copied {a.Ip} — send this to whoever is joining.");
+        };
+
+        _testConnection.Click += async (_, _) =>
+        {
+            _testConnection.Enabled = false;
+            Log($"Testing {_address.Text.Trim()}:{(int)_port.Value} ...");
+            Log(await NetworkDiscovery.TestConnection(_address.Text.Trim(), (int)_port.Value));
+            _testConnection.Enabled = true;
+        };
+
         SetColour(_races.FirstOrDefault()?.DefaultColor ?? Color.SteelBlue);
+        RefreshLocalAddresses();
         UpdateRoleEnabled();
+    }
+
+    /// <summary>
+    /// Lists every address a joiner could use, labelled by what it actually is, so the
+    /// host is not left guessing which of five to send. Without this they would run
+    /// ipconfig and pick wrong, and a wrong pick fails as a silent refused connection.
+    /// </summary>
+    private void RefreshLocalAddresses()
+    {
+        _localAddresses = NetworkDiscovery.FindLocalAddresses();
+
+        _myAddress.Items.Clear();
+        foreach (var a in _localAddresses) _myAddress.Items.Add(a);
+        if (_myAddress.Items.Count > 0) _myAddress.SelectedIndex = 0;
+
+        foreach (var a in _localAddresses)
+        {
+            if (a.Kind == AddressKind.FullTunnelVpn)
+                Log($"WARNING: {a.Adapter} is connected. A full-tunnel VPN will break peer connections — turn it off.");
+        }
+
+        var internetCapable = _localAddresses.Count(a => a.ReachableOverInternet && a.Kind != AddressKind.OtherVirtual);
+
+        Log(internetCapable > 0
+            ? $"{internetCapable} internet-capable address(es) found — internet play should work with no port forwarding."
+            : "No virtual-LAN adapter found. LAN play works as-is; for internet play install Tailscale or ZeroTier on both machines.");
     }
 
     private void UpdateRoleEnabled()
@@ -129,7 +177,12 @@ public sealed class LobbyForm : Form
         // to a joining player would imply their values matter, and they do not.
         _stars.Enabled = _aiEmpires.Enabled = _seed.Enabled = host;
         _mode.Enabled = host;
-        _address.Enabled = !host;
+
+        // The host advertises an address; the joiner types one. Only one of those is ever
+        // the relevant control.
+        _myAddress.Enabled = _copyAddress.Enabled = host;
+        _address.Enabled = _testConnection.Enabled = !host;
+
         _launch.Text = host ? "Host and launch" : "Join and launch";
     }
 
