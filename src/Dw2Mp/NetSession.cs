@@ -49,8 +49,10 @@ public static class NetSession
     private enum Msg : byte
     {
         Hello = 1,
-        FullState = 2,   // deflate-compressed galaxy bytes
-        Command = 3,     // MessagePacket bytes (M4b)
+        FullState = 2,     // deflate-compressed galaxy bytes — the CORRECTION channel
+        Command = 3,       // MessagePacket bytes — the STEADY-STATE channel
+        StateSummary = 4,  // host -> client: tick + structural fingerprint. Tens of bytes.
+        ResyncRequest = 5, // client -> host: "my structure disagrees, send me a full state"
     }
 
     public enum NetRole { Off, Host, Client }
@@ -62,7 +64,6 @@ public static class NetSession
     private static Action<string> _log;
     private static int _port;
     private static string _hostAddress;
-    private static long _syncEveryTicks;
 
     // --------------------------------------------------- outbound (host only)
 
@@ -123,18 +124,12 @@ public static class NetSession
         // and remote port are the launcher's business now.
         _port = int.TryParse(Environment.GetEnvironmentVariable("DW2MP_LOCAL_PORT"), out var p) ? p : 47810;
         _hostAddress = "127.0.0.1";
-        // 1800, not 600. Each adoption costs ~25-36 MB of NATIVE memory that is never
-        // returned -- measured, adoption-driven, and not a managed leak (see multiplayer.md).
-        // DW2 was never built to swap galaxies repeatedly, so StartGameExisting acquires
-        // resources for the new galaxy without releasing the old one's.
-        //
-        // This is a STOPGAP that lowers the rate, not a fix. The real answer is to stop
-        // using full-state adoption as the steady-state channel: it should bootstrap a join
-        // and repair a divergence, with commands carrying everything in between. That is
-        // what the command relay exists for.
-        _syncEveryTicks = long.TryParse(Environment.GetEnvironmentVariable("DW2MP_SYNC_EVERY_TICKS"), out var s) ? s : 1800;
-
-        log($"# net: role={Role} launcher=127.0.0.1:{_port} syncEvery={_syncEveryTicks} ticks");
+        // Full state is no longer sent on a timer at all -- see HostTick. It bootstraps a
+        // join and repairs a divergence; commands carry everything in between. The old
+        // DW2MP_SYNC_EVERY_TICKS knob is gone rather than left inert, because an env var
+        // that silently does nothing is worse than one that does not exist.
+        log($"# net: role={Role} launcher=127.0.0.1:{_port} — commands carry the steady state, " +
+            $"full state on join/divergence (safety net every {MaxTicksBetweenFullStates} ticks)");
 
         // The client drains its queue on the main thread. The host does not need this
         // patch, but installing it in both roles keeps one code path.
@@ -478,6 +473,18 @@ public static class NetSession
                         break;
                     }
 
+                    case Msg.StateSummary when Role == NetRole.Client:
+                        OnStateSummary(payload);
+                        break;
+
+                    // The host does not send a state here: HostTick owns serialisation,
+                    // because it must run on the simulation thread to get a coherent
+                    // snapshot. This only raises the flag it watches.
+                    case Msg.ResyncRequest when Role == NetRole.Host:
+                        _resyncRequested = true;
+                        _log("# net[host]: client requested a resync");
+                        break;
+
                     case Msg.Command when Role == NetRole.Host:
                         InjectCommand(payload);
                         break;
@@ -496,16 +503,67 @@ public static class NetSession
         finally { _connected = false; _log($"# net[{Role}]: disconnected from launcher"); }
     }
 
+    // --------------------------------------------- host: what goes on the wire, and why
+    //
+    // Commands are the steady state. Full galaxy state is a CORRECTION, sent when the
+    // client asks for one and otherwise not at all.
+    //
+    // It used to be the other way round: a 4.4 MB full state every 1,200 ticks, carrying
+    // the consequences of the client's own actions back to it. That cost ~25-36 MB of
+    // unreleasable native memory per adoption (StartGameExisting acquires resources for the
+    // incoming galaxy without releasing the outgoing one's), so the client grew until it
+    // died. Lowering the interval only slowed it: any design that adopts on a timer leaks
+    // by construction.
+    //
+    // What replaces it:
+    //
+    //   every SummaryEveryTicks   a StateSummary — tick plus a structural fingerprint, tens
+    //                             of bytes, ~50,000x smaller than a full state.
+    //   client disagrees          the client asks for a resync and the host sends one.
+    //   MaxTicksBetweenFullStates a safety net, so a client whose fingerprint somehow keeps
+    //                             matching while its world is wrong still gets corrected.
+    //
+    // The summary is STRUCTURAL on purpose — see ApplyState.StructuralFingerprint. It
+    // notices ships appearing and disappearing, not the positional drift that DW2's
+    // non-determinism guarantees between two independently simulating processes.
+
+    private static long _lastSummaryTick;
+    private static long _summariesSent;
+    private static volatile bool _resyncRequested;
+    private static long _resyncsServed;
+
+    private const long SummaryEveryTicks = 300;
+
+    private static long MaxTicksBetweenFullStates =>
+        long.TryParse(Environment.GetEnvironmentVariable("DW2MP_MAX_TICKS_BETWEEN_STATES"), out var v)
+            ? v : 36000;
+
     /// <summary>
-    /// Called from the simulation thread each tick. Serialises and sends every N ticks.
-    /// This is where the host hitches: ~370 ms of serialise plus ~340 ms of compression,
-    /// inline. Deliberate for M4a — correctness first, then move it off-thread.
+    /// Called from the simulation thread each tick.
+    ///
+    /// Serialising a full state still costs ~100 ms of simulation thread, so it happens only
+    /// when a state is actually going to be sent. The SEND itself is handed to SenderLoop —
+    /// writing to the socket from here once deadlocked the host for good.
     /// </summary>
     public static void HostTick(object galaxy, long tick)
     {
         if (Role != NetRole.Host || !_connected) return;
-        if (tick - _lastSyncTick < _syncEveryTicks) return;
+
+        // Cheap heartbeat first: it is the thing that makes rare full states safe.
+        if (tick - _lastSummaryTick >= SummaryEveryTicks)
+        {
+            _lastSummaryTick = tick;
+            SendStateSummary(galaxy, tick);
+        }
+
+        bool asked = _resyncRequested;
+        bool overdue = tick - _lastSyncTick >= MaxTicksBetweenFullStates;
+
+        if (!asked && !overdue) return;
+
+        _resyncRequested = false;
         _lastSyncTick = tick;
+        if (asked) _resyncsServed++;
 
         try
         {
@@ -517,25 +575,53 @@ public static class NetSession
             byte[] packed = Compress(raw);
             double packMs = sw.Elapsed.TotalMilliseconds;
 
-            // HAND OFF, do not send. Writing to the socket from the simulation thread is
-            // what froze the host in the 2026-09-08 run: the client stopped reading, the
-            // relay's buffer filled, the relay stopped reading from us, and Send blocked
-            // forever with the sim thread inside it. The host stopped at tick 15,600 --
-            // sync #13 -- having logged sync #12, and no amount of unpausing helped
-            // because the thread was not paused, it was stuck in a socket write.
             var superseded = Interlocked.Exchange(ref _outbound, packed);
             if (superseded is not null) Interlocked.Increment(ref _statesDropped);
             _outboundReady.Set();
 
             _syncsSent++;
-            _log($"# net[host]: sync #{_syncsSent} tick={tick} raw={raw.LongLength:N0}B " +
+            _log($"# net[host]: full state #{_syncsSent} tick={tick} " +
+                 $"({(asked ? "client asked" : "safety interval")}) raw={raw.LongLength:N0}B " +
                  $"packed={packed.Length:N0}B serialise={serialiseMs:N0}ms pack={packMs:N0}ms queued" +
                  (superseded is null ? "" : $" (superseded 1, {Interlocked.Read(ref _statesDropped)} total)"));
         }
         catch (Exception ex)
         {
-            _log("# net[host]: sync failed " + ex.GetType().Name + ": " + ex.Message);
+            _log("# net[host]: full state failed " + ex.GetType().Name + ": " + ex.Message);
             _connected = false;
+        }
+    }
+
+    /// <summary>
+    /// Tick plus a structural fingerprint. Tens of bytes, computed by reading two fields
+    /// per ship — against 24 MB of serialisation and ~100 ms for a full state.
+    /// </summary>
+    private static void SendStateSummary(object galaxy, long tick)
+    {
+        try
+        {
+            var fingerprint = ApplyState.StructuralFingerprint(galaxy);
+
+            using var buffer = new MemoryStream();
+            using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                writer.Write(tick);
+                writer.Write(fingerprint ?? "");
+                writer.Flush();
+            }
+
+            Send(Msg.StateSummary, buffer.ToArray());
+            _summariesSent++;
+
+            // One line every 20 summaries: often enough to see the channel is alive, rare
+            // enough not to bury the full states, which are the interesting events now.
+            if (_summariesSent % 20 == 1)
+                _log($"# net[host]: summary #{_summariesSent} tick={tick} fp={fingerprint} " +
+                     $"({buffer.Length}B) — full states so far: {_syncsSent} ({_resyncsServed} on request)");
+        }
+        catch (Exception ex)
+        {
+            _log("# net[host]: summary failed " + ex.GetType().Name + ": " + ex.Message);
         }
     }
 
@@ -696,5 +782,105 @@ public static class NetSession
                 _connected = false;
             }
         }
+    }
+
+    // ------------------------------------------ client: deciding when a full state is due
+
+    private static long _summariesSeen;
+    private static int _consecutiveMismatches;
+    private static long _resyncsRequested;
+    private static string _lastHostFingerprint = "";
+    private static DateTime _lastResyncRequest = DateTime.MinValue;
+
+    /// <summary>
+    /// How many summaries in a row must disagree before asking for 4.4 MB.
+    ///
+    /// Not one. The two sides sample at different instants — the host fingerprints as it
+    /// ticks, the client compares whenever the packet lands — so a ship built or destroyed
+    /// on the host legitimately shows as a single mismatch that resolves itself. Requiring a
+    /// run of them means we react to a genuine structural divergence and not to the seam
+    /// between two clocks.
+    /// </summary>
+    private const int MismatchesBeforeResync = 3;
+
+    /// <summary>A floor on resync frequency, so a persistent disagreement cannot become a firehose.</summary>
+    private static readonly TimeSpan MinTimeBetweenResyncRequests = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Client: compare the host's structural fingerprint with our own and decide whether we
+    /// need a correction.
+    ///
+    /// Runs on the network thread. It only READS galaxy structure, which is why it can:
+    /// the alternative, marshalling to the main thread, would make the check as expensive
+    /// as the thing it exists to avoid.
+    /// </summary>
+    private static void OnStateSummary(byte[] payload)
+    {
+        try
+        {
+            using var input = new MemoryStream(payload, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+
+            long hostTick = reader.ReadInt64();
+            string hostFingerprint = reader.ReadString();
+
+            _summariesSeen++;
+            _lastHostFingerprint = hostFingerprint;
+
+            var galaxy = ApplyState.CurrentGalaxy;
+
+            // JOIN BOOTSTRAP. A client that has adopted nothing yet is not "in agreement",
+            // it is empty — its galaxy is the throwaway it generated to have something for
+            // StartGameExisting to replace. Ask immediately rather than waiting for a
+            // mismatch run, because there is nothing meaningful to compare against.
+            if (_syncsApplied == 0)
+            {
+                RequestResync(galaxy is null ? "no galaxy yet" : "joined, no state adopted yet");
+                return;
+            }
+
+            if (galaxy is null) return;
+
+            var mine = ApplyState.StructuralFingerprint(galaxy);
+
+            if (mine == hostFingerprint)
+            {
+                if (_consecutiveMismatches > 0)
+                    _log($"# net[client]: structure back in agreement after {_consecutiveMismatches} mismatch(es)");
+                _consecutiveMismatches = 0;
+                return;
+            }
+
+            _consecutiveMismatches++;
+            if (_consecutiveMismatches < MismatchesBeforeResync) return;
+
+            // Report the divergence whether or not we act on it: the rate floor lives in
+            // RequestResync, so a run of mismatches we decline to serve still shows up.
+            if (_consecutiveMismatches == MismatchesBeforeResync)
+                _log($"# net[client]: structure diverged — host {hostFingerprint} vs mine {mine} " +
+                     $"at host tick {hostTick}");
+
+            RequestResync($"structure diverged for {_consecutiveMismatches} summaries");
+        }
+        catch (Exception ex)
+        {
+            _log("# net[client]: summary read failed " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Ask the host for a full state, subject to the rate floor. One place, so the join
+    /// bootstrap and the divergence path cannot drift apart on their limiting.
+    /// </summary>
+    private static void RequestResync(string reason)
+    {
+        if (DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
+
+        _lastResyncRequest = DateTime.UtcNow;
+        _consecutiveMismatches = 0;
+        _resyncsRequested++;
+
+        Send(Msg.ResyncRequest, Array.Empty<byte>());
+        _log($"# net[client]: requested full state #{_resyncsRequested} — {reason}");
     }
 }

@@ -103,6 +103,26 @@ public static class ApplyState
     /// <summary>The live DWGame, captured from Update. Null until the game has ticked once.</summary>
     public static object Game => _game;
 
+    /// <summary>
+    /// The galaxy the game is actually running, read live from DWGame rather than cached.
+    ///
+    /// Cached would be wrong: adoption replaces it, and a stale reference would have the
+    /// client comparing the host's fingerprint against a galaxy it no longer plays.
+    /// </summary>
+    public static object CurrentGalaxy
+    {
+        get
+        {
+            try
+            {
+                return _game is null
+                    ? null
+                    : AccessTools.PropertyGetter(_game.GetType(), "Galaxy")?.Invoke(_game, null);
+            }
+            catch { return null; }
+        }
+    }
+
     /// <summary>Serialise a galaxy to bytes. Used by the host to produce a state sync.</summary>
     public static byte[] SerialiseGalaxy(object galaxy) => Serialise(galaxy).Bytes;
 
@@ -906,4 +926,81 @@ public static class ApplyState
 
     /// <summary>Total task failures swallowed, for end-of-run reporting.</summary>
     public static long TaskFailures => Interlocked.Read(ref _taskFailureCount);
+
+    /// <summary>
+    /// A cheap STRUCTURAL summary of a galaxy: which ships exist, and how many of the big
+    /// collections there are. Deliberately NOT positions, health or any continuous value.
+    ///
+    /// This is what decides when the client needs a full state, so what it does and does
+    /// not notice IS the policy:
+    ///
+    ///   noticed     — a ship built, destroyed or removed; an empire eliminated. The client's
+    ///                 view is then materially wrong and no amount of local simulation will
+    ///                 repair it.
+    ///   NOT noticed — every ship being a few metres from where the host has it. DW2 is not
+    ///                 deterministic, so the client's own simulation diverges continuously
+    ///                 from the host's. A fingerprint that included positions would mismatch
+    ///                 within a tick or two and demand a resync every time, which is the
+    ///                 fixed timer again wearing a smarter hat.
+    ///
+    /// Sorted by ShipId so the two sides compare the same set regardless of list order.
+    /// Cost is one pass over the ship list reading two fields — a few thousand reflection
+    /// calls, against 24 MB of serialisation for a full state.
+    /// </summary>
+    public static string StructuralFingerprint(object galaxy)
+    {
+        if (galaxy is null) return "";
+
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            var type = galaxy.GetType();
+
+            sb.Append("e=").Append(ListCount(galaxy, "Empires"))
+              .Append(";o=").Append(ListCount(galaxy, "Orbs"))
+              .Append(";s=");
+
+            var ships = AccessTools.Field(type, "Ships")?.GetValue(galaxy);
+            var count = ListCount(galaxy, "Ships");
+            sb.Append(count).Append(';');
+
+            if (ships is not null && count > 0)
+            {
+                var item = ships.GetType().GetMethod("get_Item", new[] { typeof(int) });
+                FieldInfo idField = null, destroyedField = null;
+                var ids = new List<long>(count);
+
+                for (int i = 0; i < count; i++)
+                {
+                    object ship;
+                    try { ship = item?.Invoke(ships, new object[] { i }); }
+                    catch { continue; }
+                    if (ship is null) continue;
+
+                    idField ??= AccessTools.Field(ship.GetType(), "ShipId");
+                    destroyedField ??= AccessTools.Field(ship.GetType(), "IsDestroyedCached");
+                    if (idField is null) break;
+
+                    var id = Convert.ToInt64(idField.GetValue(ship));
+                    var dead = destroyedField?.GetValue(ship) is true;
+
+                    // Fold "destroyed" into the key so a ship dying is a structural change,
+                    // not merely a field the summary happens not to read.
+                    ids.Add(dead ? -id - 1 : id);
+                }
+
+                ids.Sort();
+                foreach (var id in ids) sb.Append(id).Append(',');
+            }
+
+            var bytes = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+            return Convert.ToHexString(SHA256.HashData(bytes))[..16];
+        }
+        catch
+        {
+            // An unreadable galaxy must not look like a MATCHING one, or divergence would
+            // go unnoticed. Empty compares unequal to any real fingerprint.
+            return "";
+        }
+    }
 }

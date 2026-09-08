@@ -1260,3 +1260,63 @@ It is also not a licence to stop fixing roots. Every **distinct** failure — me
 exception type and throwing frame — is logged once with a running count, so a new root
 cause is visible the first time it happens instead of being absorbed silently.
 `Design.CalculateAdvancedTechScore` is the one known outstanding root.
+
+---
+
+## Commands carry the steady state — 2026-09-08
+
+**Full galaxy state is no longer sent on a timer.** Commands carry what players do; a full
+state bootstraps a join and repairs a divergence, and nothing else.
+
+### The protocol now
+
+| Message | Direction | Size | When |
+|---|---|---|---|
+| `Command` | client → host | ~39 B | continuously, as the player acts |
+| `StateSummary` | host → client | **25 B** | every 300 ticks |
+| `ResyncRequest` | client → host | 0 B | on join, or on sustained structural divergence |
+| `FullState` | host → client | **4.37 MB** | only in answer to a request, plus a long safety net |
+
+A summary is ~175,000× smaller than a full state.
+
+### Measured, one 240-second two-instance run
+
+| | Result |
+|---|---|
+| Commands sent → injected | **100 → 100** — every one crossed and was accepted into the host's `InputQueue` |
+| Full states | 12, **all on request**; none on a timer |
+| Client memory across the run | **+67 MB**, against +400–800 MB under timer syncing |
+| Crash dumps | **0** |
+
+### Why the fingerprint is structural, and why that decision is the design
+
+`ApplyState.StructuralFingerprint` hashes which ships exist (id, plus destroyed folded into
+the key) and the sizes of the big collections. It deliberately excludes positions, health
+and every other continuous value.
+
+That is not an optimisation, it is the policy. **DW2 is not deterministic**, and the client
+runs its own simulation between corrections, so a fingerprint including positions would
+mismatch within a tick or two and demand a resync every time — the fixed timer again,
+wearing a smarter hat. What we want to notice is a ship built or destroyed on one side and
+not the other, because that is a difference no amount of local simulation will repair.
+
+A run of `MismatchesBeforeResync` (3) summaries must disagree before asking. The two sides
+sample at different instants, so a single mismatch is often just the seam between two
+clocks resolving itself.
+
+### The honest limit: the client still asks about every 20 seconds
+
+The client diverges structurally within a few summaries and then requests a correction as
+often as the rate floor allows. **That is real divergence, not a false positive** — it runs
+its own non-deterministic simulation and builds and loses different ships from the host.
+
+So the effective correction rate is now set by `MinTimeBetweenResyncRequests` (20 s) rather
+than by a tick interval. That is a better place for it — it is a bound on cost rather than a
+guess at a period, and it degrades gracefully: a client that happens to agree pays nothing.
+
+The tension worth stating plainly: **the client simulates for visual continuity between
+corrections, and simulating is exactly what makes it diverge.** Stopping the client's
+simulation would make divergence impossible by construction, but then its world would be
+frozen between corrections, so it would need MORE state, not less. The way out is delta
+updates rather than full galaxies — which is a much larger piece of work, and is the next
+architectural step whenever adoption cost matters again.
