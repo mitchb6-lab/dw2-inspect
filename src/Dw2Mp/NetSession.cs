@@ -593,10 +593,12 @@ public static class NetSession
             if (superseded is not null) Interlocked.Increment(ref _statesDropped);
             _outboundReady.Set();
 
-            // The full state IS the new baseline: after the client adopts it, both sides
-            // agree, so every ship counts as unchanged until it next moves. Not resetting
-            // would leave the host suppressing updates the client no longer has.
-            StateDelta.ResetBaseline();
+            // The full state IS the new baseline: the client is about to adopt exactly this
+            // galaxy, so nothing in it has changed as far as that client is concerned, and
+            // the next delta should carry only what happens after it. Priming rather than
+            // clearing is what stops the first delta after every full state from re-sending
+            // the entire galaxy the client just received.
+            StateDelta.PrimeBaseline(galaxy);
 
             _syncsSent++;
             _log($"# net[host]: full state #{_syncsSent} tick={tick} " +
@@ -636,7 +638,8 @@ public static class NetSession
             _deltaBytes += payload.Length;
 
             if (_deltasSent % 50 == 1)
-                _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed}/{total} ships " +
+                _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed} record(s) changed " +
+                     $"across ships/colonies/research ({total} ships total) " +
                      $"({payload.Length:N0}B; {_deltaBytes:N0}B total, vs {_syncsSent} full state(s))");
         }
         catch (Exception ex)

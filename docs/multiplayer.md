@@ -1457,3 +1457,62 @@ near zero is the fix available to us, and the guard is what makes the residual h
 5 full states, 1,501 deltas, 383 KB of delta traffic
 client memory flat, both processes alive for the full 240 s
 ```
+
+---
+
+## Deltas extended to colonies and research — 2026-09-08
+
+Deltas now carry three sections instead of one:
+
+| Section | Fields | What it is |
+|---|---|---|
+| ships | position, hull damage, destroyed | what moves on screen |
+| colonies | corruption, approval, quality boost, max population | what changes on the map |
+| research | per-project progress and researched flag | what changes in the UI |
+
+Each field has its own change threshold, and only records that crossed it are sent, so a
+quiet galaxy still costs nothing.
+
+```
+# net[client]: delta applied — 15 ship(s) +6 absent, 1 colony, 6 project(s), 461B
+```
+
+### Measured, 240-second two-instance run
+
+| | Ships only | **+ colonies and research** |
+|---|---:|---:|
+| Full-state adoptions | 5 | **4** |
+| Delta traffic | 383 KB | **564 KB** |
+| Crash dumps | 0 | **0** |
+| Client memory | flat | **flat** |
+
+Roughly 180 KB buys colony and research state for the whole run — against 4.33 MB for a
+single full state.
+
+### Two bugs found on the way, both worth recording
+
+**`Empire.EmpireId` is `Int16`, not `Int32`.** The pattern `is not int empireId` therefore
+failed for *every* empire, and the research section came out empty in every delta — silently,
+because an empty section is indistinguishable from a quiet one. Same class of mistake as
+reading `Empire.Name` as a field when it is a property: reflection type assumptions fail
+quietly and produce a plausible-looking nothing. Colonies worked immediately, which made the
+gap easy to see only because they were being tested side by side.
+
+**`ResetBaseline` after a full state was re-sending the entire galaxy.** Clearing the
+baseline means every record counts as changed, so the first delta after each full state was a
+complete dump: 9,270 research projects and 103 KB, five times a run — about half of all delta
+traffic, all of it re-sending what the client had just received in the state itself.
+
+`PrimeBaseline` records the galaxy as it is at serialisation time without emitting anything.
+The client is about to adopt exactly that galaxy, so nothing in it has changed as far as that
+client is concerned. Priming at serialisation time rather than adoption time is the correct
+choice: deltas then describe changes since the snapshot the client is starting from.
+
+**Traffic halved: 1,054 KB → 564 KB.**
+
+### What is deliberately still absent
+
+`Colony.Population` is a per-race `PopulationList`, not a number. Carrying it means carrying
+a collection whose members appear and disappear — which is structure, and structure is what
+full states are for. The same reasoning excludes fleets, characters and diplomacy: each is a
+collection rather than a set of scalars on an object that already exists on both sides.
