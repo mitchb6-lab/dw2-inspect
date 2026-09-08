@@ -124,37 +124,68 @@ public static class MakeSave
             if (empires is null) return;
 
             var getPlayer = empires.GetType().GetMethod("GetPlayer", Type.EmptyTypes);
-            if (getPlayer?.Invoke(empires, null) is not null) return;   // already fine
-
             int count = empires.GetType().GetProperty("Count")?.GetValue(empires) is int c ? c : 0;
             if (count == 0) { _log("# makesave: galaxy has no empires at all"); return; }
 
             var item = empires.GetType().GetMethod("get_Item", new[] { typeof(int) });
 
+
             DumpGeneratedEmpires(empires, item, count);
-
-            // WHICH empire this machine plays. In competitive each player drives their own,
-            // so it is their lobby slot; in co-op both drive slot 0. This is the payoff of
-            // slot exchange -- StartGameExisting binds the entire UI to whichever empire
-            // carries IsPlayer, so setting it here decides what this player commands.
-            int wanted = Math.Clamp(Session?.PlayableEmpireIndex ?? 0, 0, count - 1);
-
-            for (int offset = 0; offset < count; offset++)
+            // Nothing to promote means EmpireAutoGenerationState did its job: DW2 honoured
+            // our Empires list, IsPlayer survived Galaxy.Generate, and the player is already
+            // the empire the lobby chose. Say so -- silence here used to be indistinguishable
+            // from this hook never running.
+            if (getPlayer?.Invoke(empires, null) is { } existing)
             {
-                int i = (wanted + offset) % count;   // preferred first, then any valid one
-
-                var empire = item?.Invoke(empires, new object[] { i });
-                var isPlayer = empire is null ? null : AccessTools.Field(empire.GetType(), "IsPlayer");
-                if (isPlayer is null) continue;
-
-                isPlayer.SetValue(empire, true);
-                var name = AccessTools.Field(empire.GetType(), "Name")?.GetValue(empire);
-
-                _log(i == wanted
-                    ? $"# makesave: playing empire[{i}] '{name}' (slot {Session?.MySlot ?? 0}, mode {Session?.Mode ?? "solo"})"
-                    : $"# makesave: empire[{wanted}] unusable; fell back to empire[{i}] '{name}'");
+                _log($"# makesave: player empire already set by generation — '{EmpireName(existing)}' " +
+                     $"gov={Member(existing, "GovernmentId")} race={Member(existing, "DominantRaceId")} " +
+                     $"(slot {Session?.MySlot ?? 0}, mode {Session?.Mode ?? "solo"})");
                 return;
             }
+
+
+            // Prefer the empire whose NAME matches this player's configured one. Index is a
+            // poor identifier: generation mixes our specified empires in with AI empires,
+            // Independent and the pirates, in an order we do not control.
+            string wantedName = Session is null ? null
+                : Session.Players.FirstOrDefault(p => p.Slot == Session.PlayableEmpireIndex)?.Empire.Name;
+
+            int chosen = -1;
+
+            if (!string.IsNullOrWhiteSpace(wantedName))
+            {
+                for (int i = 0; i < count && chosen < 0; i++)
+                {
+                    var e = item?.Invoke(empires, new object[] { i });
+                    if (e is not null && EmpireName(e) == wantedName) chosen = i;
+                }
+            }
+
+            // Fall back to the first PLAYABLE empire. Index 0 is 'Independent' -- DW2's
+            // neutral pseudo-empire, race 255 / government -1 -- and the high government
+            // ids are pirates and monsters. Promoting blindly hands the player the
+            // independents, which is what the previous version did.
+            if (chosen < 0)
+            {
+                for (int i = 0; i < count && chosen < 0; i++)
+                {
+                    var e = item?.Invoke(empires, new object[] { i });
+                    if (e is not null && IsPlayable(e)) chosen = i;
+                }
+            }
+
+            if (chosen < 0) { _log("# makesave: no playable empire found; leaving as generated"); return; }
+
+            var target = item?.Invoke(empires, new object[] { chosen });
+            var isPlayerField = target is null ? null : AccessTools.Field(target.GetType(), "IsPlayer");
+            if (isPlayerField is null) { _log("# makesave: chosen empire has no IsPlayer"); return; }
+
+            isPlayerField.SetValue(target, true);
+
+            _log($"# makesave: playing empire[{chosen}] '{EmpireName(target)}' " +
+                 $"gov={Member(target, "GovernmentId")} race={Member(target, "DominantRaceId")} " +
+                 $"(slot {Session?.MySlot ?? 0}, mode {Session?.Mode ?? "solo"}, " +
+                 $"{(wantedName is null ? "no session" : EmpireName(target) == wantedName ? "matched by name" : "NAME NOT FOUND — fell back")})");
         }
         catch (Exception ex)
         {
@@ -242,6 +273,26 @@ public static class MakeSave
         catch { return "<unreadable>"; }
     }
 
+    /// <summary>
+    /// Is this an empire a human could actually play?
+    ///
+    /// Observed from a generated galaxy: index 0 is 'Independent' with race 255 and
+    /// government -1, and governments in the 32700+ range are pirates and monsters
+    /// ('The Hive', 'Red Dagger Clan', 'Ancient Mortalen Planet Destroyer AI'). Normal
+    /// empires sit in single or low double digits.
+    /// </summary>
+    private static bool IsPlayable(object empire)
+    {
+        try
+        {
+            if (Member(empire, "GovernmentId") is not short gov) return false;
+            if (Member(empire, "DominantRaceId") is byte race && race == 255) return false;   // Independent
+
+            return gov >= 0 && gov < 32700;
+        }
+        catch { return false; }
+    }
+
     /// <summary>Field or property, whichever exists — member kinds are not guessable here.</summary>
     private static object Member(object target, string name)
     {
@@ -304,7 +355,20 @@ public static class MakeSave
         SetField(settings, "OtherEmpiresAutoGenerateAmount", ai);
         SetField(settings, "RandomSeed", seed);
 
-        if (Session is { Players.Count: > 0 }) AddSessionEmpires(settings);
+        if (Session is { Players.Count: > 0 })
+        {
+            AddSessionEmpires(settings);
+
+            // THE reason our configured empires were ignored. EmpireAutoGenerationState is
+            // a FLAGS enum read through DataHelpers.GetFlag:
+            //   SpecifiedEmpiresOnly=0, AutoGenerated=1, SpecifiedEmpires=2,
+            //   SpecifiedAndAutoGenerated=3
+            // It defaulted to AutoGenerated, so bit 2 -- "use the Empires list" -- was never
+            // set and generation built its own empires instead. 3 means: use ours AND fill
+            // the rest with AI, which is exactly what a session wants.
+            SetField(settings, "EmpireAutoGenerationState", (byte)3);
+            _log("# makesave: EmpireAutoGenerationState = SpecifiedAndAutoGenerated (3)");
+        }
         else AddPlayerEmpire(settings);
 
         _log($"# makesave: generating — stars={stars}, {ai} AI empire(s), seed={seed}");

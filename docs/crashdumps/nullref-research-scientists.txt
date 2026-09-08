@@ -1,0 +1,20 @@
+﻿Distant Worlds - Crash Dump - Version 1.3.6.3
+Stride Version 4.2.0.28-CodeForce
+
+23:56:52 Monday, 07 September 2026
+
+
+System.NullReferenceException: Object reference not set to an instance of an object.
+
+   at CharacterList DistantWorlds.Types.CharacterList.GetScientistsAtResearchStations(Galaxy galaxy, bool includeTransferring)+0x70
+   at float DistantWorlds.Types.Empire.CalculateResearchPointsMaximumUltraGeniusBonus()+0x6
+   at float DistantWorlds.Types.Empire.CalculateResearchPointsMaximum(bool includeBonuses, bool applyBonusesToPopulationLabs, out float researchFromPopulation, out float researchFromLabs)+0x4C
+   at float DistantWorlds.Types.Empire.CalculateMaximumResearchFunding(out float maximumResearchPoints, out float researchFromPopulation, out float researchFromLabs)+0x0
+   at void DistantWorlds.Types.Empire.CalculateResearchFundingAvailableAndActualAmounts(bool canUseCachedValues, out float researchFundingAvailable, out float researchFundingUsed)+0x9
+   at float DistantWorlds.Types.Empire.CalculateResearchPoints(bool includeBonuses, bool canUseCachedValues, out float researchFromPopulation, out float researchFromLabs, out float researchFundingAmount, out float researchFundingMaximumCanUse, out float researchFundingAvailable)+0xD
+   at void DistantWorlds.Types.Empire.PerformResearch(float timePassed, long starDate)+0x0
+   at void DistantWorlds.Types.Empire.DoTasksHighPriority(DateTime time, Galaxy galaxy)+0x80
+
+
+
+--- COMPLETE ---

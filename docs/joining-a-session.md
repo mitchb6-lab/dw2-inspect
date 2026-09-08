@@ -262,3 +262,14 @@ Things that will surprise you if you do not know them:
 - **2026-09-08** — Lobby now discovers and labels every connectable address (LAN,
   Tailscale, ZeroTier, Hamachi, Radmin), warns about full-tunnel VPNs, offers Copy for the
   host and Test connection for the joiner. No more hunting for the right IP.
+
+### 2026-09-08 — empire selection works end to end
+
+- Both players now choose their empire (name, race, government, colour) in the client, and
+  the host generates a galaxy containing both. Previously the chosen empires were ignored
+  and the joining player was silently given DW2's neutral `Independent` pseudo-empire.
+- If you ran an earlier build, **check `data\Logs` in your game folder**. The old bug made
+  DW2 write a crash dump per tick; a few thousand files there will make the game hang or
+  fail to start. Deleting `DW2_CrashDump*` and `SENT_DW2_CrashDump*` is safe.
+- Also delete `data\SessionActive` if the game was force-killed — a stale one can block
+  startup.

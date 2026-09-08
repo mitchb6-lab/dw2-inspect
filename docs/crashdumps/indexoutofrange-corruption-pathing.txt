@@ -1,0 +1,18 @@
+﻿Distant Worlds - Crash Dump - Version 1.3.6.3
+Stride Version 4.2.0.28-CodeForce
+
+23:14:24 Monday, 07 September 2026
+
+
+System.IndexOutOfRangeException: Index was outside the bounds of the array.
+
+   at SystemPathTimeList DistantWorlds.Types.SystemPathTimeSet.GetPathTimesForSystem(Galaxy galaxy, Empire empire, int systemId, float jumpRange, bool forceImmediatePathing, StarSystem system)+0x0
+   at float DistantWorlds.Types.SystemPathTimeSet.GetPathTimeDelayed(int startSystemId, int destinationSystemId, Galaxy galaxy, Empire empire, long starDate, float jumpRange, StarSystem startSystem, StarSystem destinationSystem)+0x0
+   at StellarObject DistantWorlds.Types.StellarObjectList.FindNearestCapitalByCorruptionReductionRatio(Galaxy galaxy, Empire empire, StellarObject mainEmpireCapital, int systemId, int galaxyX, int galaxyY, List<float> corruptionReductionProjectionRangeOverrides, StellarObject stellarObjectToExclude, out float nearestDistanceRatio)+0xB7
+   at float DistantWorlds.Types.Colony.CalculateCorruption(Galaxy galaxy, Orb colonyOrb, Empire empire, StellarObjectList capitals, List<float> corruptionReductionProjectionRangeOverrides, bool includePirateInfluence)+0x9F
+   at void DistantWorlds.Types.Colony.DoTasks(DateTime time, float timePassed, Galaxy galaxy, Location location, bool inView)+0x265
+   at void DistantWorlds.Types.Orb.DoTasks(DateTime time, Galaxy galaxy, bool inView)+0x72
+
+
+
+--- COMPLETE ---
