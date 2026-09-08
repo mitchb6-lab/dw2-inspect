@@ -123,7 +123,16 @@ public static class NetSession
         // and remote port are the launcher's business now.
         _port = int.TryParse(Environment.GetEnvironmentVariable("DW2MP_LOCAL_PORT"), out var p) ? p : 47810;
         _hostAddress = "127.0.0.1";
-        _syncEveryTicks = long.TryParse(Environment.GetEnvironmentVariable("DW2MP_SYNC_EVERY_TICKS"), out var s) ? s : 600;
+        // 1800, not 600. Each adoption costs ~25-36 MB of NATIVE memory that is never
+        // returned -- measured, adoption-driven, and not a managed leak (see multiplayer.md).
+        // DW2 was never built to swap galaxies repeatedly, so StartGameExisting acquires
+        // resources for the new galaxy without releasing the old one's.
+        //
+        // This is a STOPGAP that lowers the rate, not a fix. The real answer is to stop
+        // using full-state adoption as the steady-state channel: it should bootstrap a join
+        // and repair a divergence, with commands carrying everything in between. That is
+        // what the command relay exists for.
+        _syncEveryTicks = long.TryParse(Environment.GetEnvironmentVariable("DW2MP_SYNC_EVERY_TICKS"), out var s) ? s : 1800;
 
         log($"# net: role={Role} launcher=127.0.0.1:{_port} syncEvery={_syncEveryTicks} ticks");
 

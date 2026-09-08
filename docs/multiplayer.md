@@ -1176,3 +1176,87 @@ the run — 3.6 GB → 8.4 GB over 26 adoptions — and the process is killed at
 is far more than our own buffers can account for (26 × 24 MB ≈ 0.6 GB), so **old galaxies
 are being retained**. `Galaxy.CopyGalaxyInstanceToStaticBaseData` is the first place to
 look: there is static state holding galaxy data, and every adoption creates another galaxy.
+
+---
+
+## The client's memory growth — measured 2026-09-08, and it is NOT a leak in the assumed sense
+
+The previous section closed by predicting a managed leak, with old galaxies retained via
+`CopyGalaxyInstanceToStaticBaseData`. **That prediction was wrong.** What follows is what
+the instrumentation actually showed.
+
+Every adoption now logs three numbers, chosen because they separate three different causes:
+
+| Number | Meaning if it grows |
+|---|---|
+| `managed` | GC heap — objects RETAINED |
+| `afterGC` | managed after a forced blocking collect — a real leak, not just uncollected garbage |
+| `private` | whole process — native memory, or Large Object Heap fragmentation |
+
+```
+managed=740MB private=8,293MB afterGC=603MB afterLOHCompact=8,162MB
+managed=725MB private=8,413MB afterGC=604MB afterLOHCompact=8,341MB
+managed=727MB private=8,656MB afterGC=605MB afterLOHCompact=8,576MB
+```
+
+**`afterGC` is flat to within 2 MB across the whole run.** Nothing is retained. Three
+hypotheses were tested and all three are eliminated:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Retained galaxies (managed) | forced blocking collect each checkpoint | ❌ `afterGC` flat at 603–605 MB |
+| LOH fragmentation from 24 MB state buffers | `LargeObjectHeapCompactionMode.CompactOnce` | ❌ reclaims ~80–100 MB, floor still rises |
+| Facility textures reloaded per adoption | patched `LoadImagesForFacilities` to load once | ❌ growth unchanged, and it caused 6 crashes — reverted |
+
+### What it actually is
+
+**Native memory, ~25–36 MB per adoption, and adoption-driven rather than time-driven.**
+Established by halving the sync rate:
+
+| Sync interval | Adoptions in 210 s | Growth |
+|---:|---:|---:|
+| 1,200 ticks | ~30 | ~800 MB |
+| 2,400 ticks | ~15 | ~420 MB |
+
+Halving the adoptions halved the growth. DW2 was never built to swap galaxies repeatedly:
+`StartGameExisting` acquires native resources for the incoming galaxy without releasing
+the outgoing one's, and nothing in the game's own lifecycle ever asks it to.
+
+### What was done, and what it does not do
+
+The default sync interval is raised from 600 to 1,800 ticks. **That is a stopgap that
+lowers the rate, not a fix**, and the comment at `NetSession._syncEveryTicks` says so.
+
+The real answer is architectural and was always the plan: **full-state adoption should
+bootstrap a join and repair a divergence, not carry the steady state.** Commands should
+carry everything in between — which is exactly what the M4b command relay exists for. At
+~30 MB per adoption, any design that adopts on a timer leaks by construction, however
+often the timer fires.
+
+## Unhandled task exceptions no longer kill the client
+
+Separately, and this is what was actually killing the client at ~180 s: DW2 runs
+Empire/Ship/Orb/Colony/Fleet tasks across worker threads and guards MOST of them itself —
+which is why hundreds of `NullReferenceException`s were survivable, each writing a dump and
+continuing. The paths it does not guard take the process with them, because an unhandled
+exception on a .NET background thread terminates the process.
+
+Harmony finalizers now guard those six task entry points. Caught live:
+
+```
+# apply: SURVIVED a task failure in Ship.DoTasks — NullReferenceException
+  at Design.CalculateAdvancedTechScore (distinct #1, 3 total)
+```
+
+That is the identical exception that killed the client in the previous run. It fired three
+times and the client survived all three, finishing the run.
+
+**Swallowing is defensible here specifically because of host-authoritative design**: the
+host owns the truth and re-syncs the whole galaxy, so a skipped tick for one ship on the
+client is corrected by the next sync. It would NOT be defensible on the host, and it would
+not be defensible in peer-to-peer lockstep, where a skipped tick is a divergence.
+
+It is also not a licence to stop fixing roots. Every **distinct** failure — method,
+exception type and throwing frame — is logged once with a running count, so a new root
+cause is visible the first time it happens instead of being absorbed silently.
+`Design.CalculateAdvancedTechScore` is the one known outstanding root.

@@ -95,6 +95,7 @@ public static class ApplyState
             nameof(OnUpdate), BindingFlags.NonPublic | BindingFlags.Static)));
 
         GuardMessageDialog(harmony, log);
+        GuardSimulationTasks(harmony, log);
 
         log("# apply: armed on DWGame.Update (main thread)");
     }
@@ -165,7 +166,8 @@ public static class ApplyState
 
             _incoming = incoming;
             var fp = Fingerprint(incoming);
-            info = $"{raw.LongLength:N0}B  read={readMs:N0}ms  apply={applyMs:N0}ms  {fp.Summary}";
+            _applyCount++;
+            info = $"{raw.LongLength:N0}B  read={readMs:N0}ms  apply={applyMs:N0}ms  {fp.Summary}  {MemoryReport()}";
             return true;
         }
         catch (Exception ex)
@@ -756,4 +758,152 @@ public static class ApplyState
             _log("# apply: ship summary rebuild failed " + (ex.InnerException ?? ex).Message);
         }
     }
+
+    private static int _applyCount;
+
+    /// <summary>
+    /// Memory after an adoption, so a leak can be characterised instead of guessed at.
+    ///
+    /// Three numbers, because they separate three different causes:
+    ///   managed  — the GC heap. Growing here means objects are RETAINED (old galaxies).
+    ///   private  — the whole process. Growing while managed is flat means native memory
+    ///              (Stride/graphics) or Large Object Heap fragmentation, since a full
+    ///              state is a 24 MB byte[] and every one of those goes straight to the LOH.
+    ///   afterGC  — managed after a forced blocking collect. If this returns to baseline the
+    ///              growth was uncollected garbage, not a leak.
+    ///
+    /// The forced collect runs occasionally rather than every time: it is expensive, and the
+    /// point is to characterise the trend, not to paper over it by collecting.
+    /// </summary>
+    private static string MemoryReport()
+    {
+        try
+        {
+            var managed = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
+            var privateMb = Process.GetCurrentProcess().PrivateMemorySize64 / (1024.0 * 1024.0);
+
+            var line = $"managed={managed:N0}MB private={privateMb:N0}MB";
+
+            if (_applyCount % 5 == 0)
+            {
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+                var afterGc = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
+
+                // Does a COMPACTING collect give memory back to the OS? Every sync is a
+                // ~24 MB byte[], which goes straight to the Large Object Heap, and the LOH
+                // is not compacted by default -- so committed segments grow while live
+                // objects do not. That is exactly the shape observed: managed flat at
+                // ~543 MB, private climbing 3.5 -> 8.1 GB. This distinguishes LOH
+                // fragmentation from native (graphics) growth.
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+                    System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+
+                var privateAfter = Process.GetCurrentProcess().PrivateMemorySize64 / (1024.0 * 1024.0);
+                line += $" afterGC={afterGc:N0}MB afterLOHCompact={privateAfter:N0}MB";
+            }
+
+            return line;
+        }
+        catch { return "memory unavailable"; }
+    }
+
+    /// <summary>
+    /// Keeps one unlucky object from killing the whole client.
+    ///
+    /// DW2 runs Empire/Ship/Orb/Colony tasks across worker threads, and it guards MOST of
+    /// them itself — that is why hundreds of NullReferenceExceptions were survivable, each
+    /// writing a dump and continuing. The paths it does NOT guard take the process with
+    /// them: an unhandled exception on a .NET background thread terminates the process. One
+    /// such escape, in Ship.DoTasks -> BasesCheckForRetrofitNotAtColony ->
+    /// Design.CalculateAdvancedTechScore, killed the client at ~180s having applied 18
+    /// syncs, with everything else healthy.
+    ///
+    /// Swallowing here is defensible SPECIFICALLY because of host-authoritative design: the
+    /// host owns the truth and re-syncs the whole galaxy every 1,200 ticks, so a skipped
+    /// tick for one ship on the client is corrected by the next sync. It would NOT be
+    /// defensible on the host, and it would not be defensible in a peer-to-peer lockstep
+    /// design, where a skipped tick is a divergence.
+    ///
+    /// This is not a licence to stop fixing roots. Every DISTINCT failure — method,
+    /// exception type and throwing frame — is logged once, so new ones stay visible instead
+    /// of being silently absorbed. The counts are reported so a rare escape is not confused
+    /// with a storm.
+    /// </summary>
+    private static void GuardSimulationTasks(Harmony harmony, Action<string> log)
+    {
+        var targets = new (string Type, string Method)[]
+        {
+            ("DistantWorlds.Types.Empire",  "DoTasks"),
+            ("DistantWorlds.Types.Empire",  "DoTasksHighPriority"),
+            ("DistantWorlds.Types.Ship",    "DoTasks"),
+            ("DistantWorlds.Types.Orb",     "DoTasks"),
+            ("DistantWorlds.Types.Colony",  "DoTasks"),
+            ("DistantWorlds.Types.Fleet",   "DoTasks"),
+        };
+
+        var finalizer = new HarmonyMethod(typeof(ApplyState).GetMethod(
+            nameof(SurviveTaskFailure), BindingFlags.NonPublic | BindingFlags.Static));
+
+        var guarded = new List<string>();
+
+        foreach (var (typeName, methodName) in targets)
+        {
+            try
+            {
+                var type = AccessTools.TypeByName(typeName);
+                var method = type is null ? null : AccessTools.Method(type, methodName);
+                if (method is null) continue;
+
+                harmony.Patch(method, finalizer: finalizer);
+                guarded.Add($"{typeName.Split('.')[^1]}.{methodName}");
+            }
+            catch (Exception ex)
+            {
+                log($"# apply: could not guard {typeName}.{methodName} ({ex.GetType().Name})");
+            }
+        }
+
+        log(guarded.Count == 0
+            ? "# apply: NO simulation-task guard installed — one bad object can kill the client"
+            : "# apply: guarded simulation tasks (" + string.Join(", ", guarded) + ")");
+    }
+
+    private static readonly HashSet<string> _seenTaskFailures = new();
+    private static long _taskFailureCount;
+
+    /// <summary>
+    /// Harmony finalizer. Returns null to swallow. Logs each DISTINCT failure once, keyed
+    /// by the guarded method, the exception type and the frame that actually threw — so a
+    /// new root cause is visible the first time it happens rather than hidden in a count.
+    /// </summary>
+    private static Exception SurviveTaskFailure(Exception __exception, MethodBase __originalMethod)
+    {
+        if (__exception is null) return null;
+
+        try
+        {
+            Interlocked.Increment(ref _taskFailureCount);
+
+            var cause = __exception.InnerException ?? __exception;
+            var frame = cause.StackTrace?.Split('\n').FirstOrDefault()?.Trim() ?? "<no stack>";
+            var key = $"{__originalMethod?.Name}|{cause.GetType().Name}|{frame}";
+
+            bool isNew;
+            lock (_seenTaskFailures) isNew = _seenTaskFailures.Add(key);
+
+            if (isNew)
+                _log?.Invoke($"# apply: SURVIVED a task failure in {__originalMethod?.DeclaringType?.Name}." +
+                             $"{__originalMethod?.Name} — {cause.GetType().Name} at {frame} " +
+                             $"(distinct #{_seenTaskFailures.Count}, {Interlocked.Read(ref _taskFailureCount)} total)");
+        }
+        catch { /* a guard must never throw */ }
+
+        return null;
+    }
+
+    /// <summary>Total task failures swallowed, for end-of-run reporting.</summary>
+    public static long TaskFailures => Interlocked.Read(ref _taskFailureCount);
 }
