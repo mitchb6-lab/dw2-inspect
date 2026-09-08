@@ -162,6 +162,40 @@ two machines to agree on.
 
 So the three risks listed above are really one: **DW2 does not have a simulation tick.**
 
+#### M2b RESULT — measured 2026-09-07: **not deterministic**
+
+Two runs, same 37.5 MB save, fixed 100 ms timestep, `AdjustClientBlockSizes` disabled,
+compared at equal tick counts with raw bytes dumped for diffing.
+
+| tick | size Δ | differing bytes | first diff offset |
+|---:|---:|---:|---:|
+| 1 | 0 | 475 | 2,547,330 |
+| 1001 | +5,510 | 13,554,512 | 7,634 |
+| 2001 | +7,151 | 12,664,066 | 7,634 |
+| 3001 | +12,520 | 12,729,764 | 7,634 |
+
+**Tick 1 is effectively identical.** The few hundred differing bytes are lazily-computed
+caches — verified by diffing the bytes: one run holds computed values while the other
+holds `0x7F7FFFFF` (`float.MaxValue`), preceded by a `00`/`01` dirty flag. A flag plus
+six floats is a bounding box that had not been computed yet. Not simulation state.
+
+**By tick 1001 roughly a third of the galaxy differs**, the serialised sizes no longer
+match, and the size gap widens every tick. That is comprehensive structural divergence:
+different numbers of entities, not drifting values.
+
+**A fixed timestep is necessary but nowhere near sufficient.** The speed and scale of the
+divergence point at thread completion order rather than float rounding. Pure floating
+point drift starts tiny and amplifies gradually; this is immediate and total, which is
+the signature of parallel workers processing entities in different orders — and of any
+shared RNG being consumed in a different order as a result.
+
+**What remains untested:** forcing the parallel block processing (`Task.Run` /
+`MaxDegreeOfParallelism` in `UpdateGameAsClient`) to run sequentially. That is the last
+cheap lever. If sequential execution reproduces, lockstep is viable but requires running
+the simulation single-threaded — a serious performance cost on a large galaxy, and a
+design decision rather than a patch. If it still diverges, the cause is float arithmetic
+and the intervention needed is a rewrite, not a mod.
+
 #### The redesigned experiment (M2b)
 
 Make one, and test determinism inside it:

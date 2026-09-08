@@ -6,23 +6,25 @@ using HarmonyLib;
 namespace Dw2Mp;
 
 /// <summary>
-/// M2: the determinism experiment.
+/// M2b: the determinism experiment.
 ///
 /// Lockstep multiplayer requires that two machines, given the same state and the same
-/// commands, compute identical results. DW2 is hostile to that in three ways (floats
-/// throughout, a multithreaded simulation, and work partitioning derived from measured
-/// wall-clock time). Whether any of it actually changes OUTCOMES is an empirical
-/// question, and this measures it.
+/// commands, compute identical results.
 ///
-/// Method: hook the server cycle, and at fixed GAME-time intervals serialise the whole
-/// galaxy through the game's own Galaxy.WriteToStream and hash the bytes. Run the same
-/// scenario twice and compare the hash sequences.
+/// The first version of this experiment sampled at equal GAME TIME and was invalid:
+/// DW2's clock is a wall-clock stopwatch (GameServer.Now = _StopwatchStartTime +
+/// _Stopwatch.Elapsed), so two runs reach the same game time having executed DIFFERENT
+/// NUMBERS of update steps. A perfectly deterministic build would have failed that test.
 ///
-/// The snapshot is taken TWICE back to back each time. That is the control: the
-/// simulation runs on background threads, so a naive single hash could differ between
-/// runs because of a torn read rather than because the simulation diverged. If the two
-/// back-to-back hashes disagree, the measurement is unstable at that instant and the
-/// row must not be read as evidence about the simulation.
+/// M2b fixes the methodology by fixing the game. FixedStep pins the clock to a fixed
+/// increment per server cycle and freezes work partitioning, so the server cycle becomes
+/// a real simulation tick. State is then compared at equal TICK COUNTS, which is a valid
+/// comparison: identical step sequences, so any divergence is genuinely the arithmetic.
+///
+/// Each snapshot is taken twice back to back. The simulation runs on background threads,
+/// so a single hash could differ between runs from a torn read rather than a real
+/// divergence; two agreeing hashes mean the instant is stable and a cross-run difference
+/// is real.
 /// </summary>
 public static class Determinism
 {
@@ -31,83 +33,76 @@ public static class Determinism
         "Dw2Mp",
         $"determinism-{Env("DW2MP_RUN_LABEL", "run")}.log");
 
-    /// <summary>Game-days between snapshots.</summary>
-    private static readonly double IntervalDays = EnvDouble("DW2MP_SNAPSHOT_DAYS", 5);
+    /// <summary>Server cycles between snapshots. The cycle IS the tick under FixedStep.</summary>
+    private static readonly long SnapshotEveryCycles = EnvLong("DW2MP_SNAPSHOT_CYCLES", 2000);
 
-    /// <summary>Stop after this many snapshots, so runs are bounded and comparable.</summary>
-    private static readonly int MaxSnapshots = EnvInt("DW2MP_MAX_SNAPSHOTS", 6);
+    private static readonly int MaxSnapshots = EnvInt("DW2MP_MAX_SNAPSHOTS", 5);
 
-    /// <summary>Exit the process once the run is complete, so a script can drive it.</summary>
     private static readonly bool ExitWhenDone = Env("DW2MP_EXIT_WHEN_DONE", "1") == "1";
+
+    private static readonly double StepMilliseconds = EnvDouble("DW2MP_STEP_MS", 100);
+
+    private static readonly bool PinBlocks = Env("DW2MP_PIN_BLOCKS", "1") == "1";
+
+    /// <summary>When set, raw snapshot bytes are written here for byte-level diffing.</summary>
+    private static readonly string DumpDir = Env("DW2MP_DUMP_DIR", "");
 
     private static readonly object Gate = new();
 
     private static Type _galaxyType;
     private static FieldInfo _timeField;
-    private static FieldInfo _timeStartField;
     private static FieldInfo _seedField;
     private static MethodInfo _writeToStream;
     private static Type _galaxyDataType;
 
     private static int _snapshotsTaken;
-    private static double _nextSnapshotDay;
+    private static long _nextSnapshotCycle;
     private static bool _finished;
-
     private static long _cycleCount;
+
     private const long HeartbeatEvery = 2000;
 
-    /// <summary>
-    /// Fires regardless of whether the game is running, so an empty log can be
-    /// diagnosed. "0 cycles" means the patch never fires (wrong hook, or no game
-    /// started); "N cycles, elapsedDays flat" means the game is paused.
-    /// </summary>
     private static Timer _watchdog;
 
     public static void Install(Harmony harmony)
     {
         var serverType = AccessTools.TypeByName("DistantWorlds.Types.GameServer");
-        if (serverType is null) { Log("SETUP FAILED: GameServer type not found"); return; }
-
-        // UpdateGameAsServer(Galaxy, DateTime) is the server's per-cycle entry point and
-        // is handed the Galaxy directly, which is exactly what we need and saves us
-        // hunting for a global.
-        var target = AccessTools.Method(serverType, "UpdateGameAsServer");
-        if (target is null) { Log("SETUP FAILED: UpdateGameAsServer not found"); return; }
+        var target = serverType is null ? null : AccessTools.Method(serverType, "UpdateGameAsServer");
+        if (target is null) { Log("SETUP FAILED: GameServer.UpdateGameAsServer not found"); return; }
 
         _galaxyType = AccessTools.TypeByName("DistantWorlds.Types.Galaxy");
         _galaxyDataType = AccessTools.TypeByName("DistantWorlds.Types.GameGalaxyData");
         _timeField = AccessTools.Field(_galaxyType, "Time");
-        _timeStartField = AccessTools.Field(_galaxyType, "TimeStart");
         _seedField = AccessTools.Field(_galaxyType, "_RandomSeed");
         _writeToStream = AccessTools.Method(_galaxyType, "WriteToStream");
 
-        if (_galaxyType is null || _writeToStream is null || _timeField is null)
+        if (_writeToStream is null || _timeField is null)
         {
             Log("SETUP FAILED: Galaxy.WriteToStream / Time not resolvable");
             return;
         }
 
+        Log($"# every={SnapshotEveryCycles} cycles  maxSnapshots={MaxSnapshots}  exitWhenDone={ExitWhenDone}");
+
+        // Install FixedStep FIRST: the clock must already be deterministic by the time
+        // the first cycle runs, or snapshot 0 is taken under different rules to the rest.
+        FixedStep.Install(harmony, StepMilliseconds, PinBlocks, () => Interlocked.Read(ref _cycleCount), Log);
+
         var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
         harmony.Patch(target, new HarmonyMethod(prefix));
-
-        Log($"# interval={IntervalDays}d  maxSnapshots={MaxSnapshots}  exitWhenDone={ExitWhenDone}");
         Log($"# patched {serverType.Name}.{target.Name}");
 
         var started = DateTime.UtcNow;
         _watchdog = new Timer(_ =>
         {
             if (_finished) return;
-            var seen = Interlocked.Read(ref _cycleCount);
-            Log($"# watchdog {(int)(DateTime.UtcNow - started).TotalSeconds}s: {seen} server cycle(s) seen");
-        }, null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+            Log($"# watchdog {(int)(DateTime.UtcNow - started).TotalSeconds}s: {Interlocked.Read(ref _cycleCount)} cycle(s)");
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
 
-        Log("# day  bytes  hashA  hashB  stable");
+        Log("# cycle  bytes  hashA  hashB  stable");
     }
 
-    /// <summary>
-    /// Harmony prefix. Must never throw: an exception here propagates into the game's
-    /// simulation loop.
-    /// </summary>
+    /// <summary>Harmony prefix. Must never throw: this runs inside the simulation loop.</summary>
     private static void OnServerCycle(object __instance, object[] __args)
     {
         try
@@ -117,66 +112,51 @@ public static class Determinism
             var galaxy = __args is { Length: > 0 } ? __args[0] : null;
             if (galaxy is null || !_galaxyType.IsInstanceOfType(galaxy)) return;
 
-            var now = (DateTime)_timeField.GetValue(galaxy);
-            var start = (DateTime)_timeStartField.GetValue(galaxy);
-
-            // Game time, never wall-clock. Wall-clock would sample at different points
-            // in the simulation on a faster machine, which is the very thing under test.
-            double elapsedDays = (now - start).TotalDays;
-
-            // Heartbeat. Without this, "no snapshot rows" is ambiguous between three very
-            // different failures: the patch never fired, it fired but game time is frozen
-            // (the game starts paused), or time is advancing too slowly for the interval.
             long n = Interlocked.Increment(ref _cycleCount);
 
-            // A loaded save arrives PAUSED. The server cycles happily (194k cycles in
-            // 900s was the first measurement) while Galaxy.Time never moves, so nothing
-            // is ever simulated. Resume it, once.
+            // A loaded save arrives PAUSED: the server cycles happily while Galaxy.Time
+            // never moves, so nothing is ever simulated.
             if (n == 1) StartTheClock(__instance);
 
             if (n == 1 || n % HeartbeatEvery == 0)
-                Log($"# cycle {n}: gameTime={now:yyyy-MM-dd HH:mm:ss} elapsedDays={elapsedDays:F4}");
+            {
+                var t = (DateTime)_timeField.GetValue(galaxy);
+                Log($"# cycle {n}: gameTime={t:yyyy-MM-dd HH:mm:ss.fff}");
+            }
 
-            if (elapsedDays < _nextSnapshotDay) return;
+            if (n < _nextSnapshotCycle) return;
 
             lock (Gate)
             {
-                if (_finished || elapsedDays < _nextSnapshotDay) return;
-                _nextSnapshotDay = elapsedDays + IntervalDays;
-                Snapshot(galaxy, elapsedDays);
+                if (_finished || n < _nextSnapshotCycle) return;
+                _nextSnapshotCycle = n + SnapshotEveryCycles;
+                Snapshot(galaxy, n);
             }
         }
         catch (Exception ex)
         {
             Log("ERROR in prefix: " + ex.GetType().Name + ": " + ex.Message);
-            _finished = true;   // stop rather than log the same failure every cycle
+            _finished = true;
         }
     }
 
     /// <summary>
-    /// Unpauses the simulation and sets a speed.
-    ///
-    /// GameServer.ResumeGame() simply calls _Stopwatch.Start(): DW2's game clock is a
-    /// wall-clock stopwatch scaled by game speed, not a tick counter. Worth stating
-    /// plainly because it bears directly on the multiplayer question -- the simulation
-    /// is not fixed-timestep, so two machines never execute the same step sequence.
+    /// Unpauses the simulation. GameServer.ResumeGame() is just _Stopwatch.Start();
+    /// under FixedStep the stopwatch no longer drives anything, but the game still gates
+    /// other work on being resumed, so it is still required.
     /// </summary>
     private static void StartTheClock(object server)
     {
         try
         {
             var type = server.GetType();
-
             var isRunning = AccessTools.PropertyGetter(type, "IsRunning")?.Invoke(server, null);
-            Log($"# clock: IsRunning={isRunning} -> resuming");
+            Log($"# clock: IsRunning={isRunning} -> resuming (fixedStep={FixedStep.Enabled}, pinBlocks={FixedStep.PinBlockSizes})");
 
             AccessTools.Method(type, "ResumeGame")?.Invoke(server, null);
 
             float speed = (float)EnvDouble("DW2MP_GAME_SPEED", 4);
             AccessTools.Method(type, "ChangeGameSpeed")?.Invoke(server, new object[] { speed });
-
-            var actual = AccessTools.Method(type, "GetGameSpeed")?.Invoke(server, null);
-            Log($"# clock: requested speed={speed}, reported={actual}");
         }
         catch (Exception ex)
         {
@@ -184,13 +164,10 @@ public static class Determinism
         }
     }
 
-    private static void Snapshot(object galaxy, double elapsedDays)
+    private static void Snapshot(object galaxy, long cycle)
     {
         if (_snapshotsTaken == 0)
-        {
-            var seed = _seedField?.GetValue(galaxy);
-            Log($"# galaxy seed = {seed}");
-        }
+            Log($"# galaxy seed = {_seedField?.GetValue(galaxy)}");
 
         var (hashA, bytes) = HashGalaxy(galaxy);
         var (hashB, _) = HashGalaxy(galaxy);
@@ -198,8 +175,8 @@ public static class Determinism
         bool stable = hashA == hashB && hashA is not null;
 
         Log(string.Format(CultureInfo.InvariantCulture,
-            "{0,7:F1}  {1,10}  {2}  {3}  {4}",
-            elapsedDays, bytes, hashA ?? "-", hashB ?? "-", stable ? "yes" : "NO"));
+            "{0,8}  {1,10}  {2}  {3}  {4}",
+            cycle, bytes, hashA ?? "-", hashB ?? "-", stable ? "yes" : "NO"));
 
         if (++_snapshotsTaken < MaxSnapshots) return;
 
@@ -208,24 +185,16 @@ public static class Determinism
 
         if (!ExitWhenDone) return;
 
-        // Exit hard. A clean shutdown would run save prompts and teardown we do not
-        // want, and the process has already produced everything we need.
         Log("# exiting");
         Environment.Exit(0);
     }
 
-    /// <summary>
-    /// Serialises the galaxy through the game's own writer and hashes the bytes.
-    /// Returns (null, 0) if serialisation throws, which is itself a finding worth
-    /// seeing in the log rather than a reason to crash the game.
-    /// </summary>
     private static (string Hash, long Bytes) HashGalaxy(object galaxy)
     {
         try
         {
-            // A fresh GameGalaxyData: it carries view position and stopwatch values,
-            // which vary run to run and would fake a divergence. Zeroed, it contributes
-            // a constant.
+            // Fresh GameGalaxyData: it carries ViewPosition and stopwatch values which
+            // vary every run and would manufacture a divergence out of nothing.
             var galaxyData = Activator.CreateInstance(_galaxyDataType);
 
             using var buffer = new MemoryStream();
@@ -236,9 +205,24 @@ public static class Determinism
             }
 
             byte[] raw = buffer.ToArray();
-            byte[] digest = SHA256.HashData(raw);
 
-            return (Convert.ToHexString(digest)[..16], raw.LongLength);
+            // Optionally keep the bytes. A hash tells you THAT two runs differ; only the
+            // bytes tell you WHERE, which is the difference between "a timestamp field
+            // in the header" and "float drift scattered through every entity". Those
+            // need completely different responses.
+            if (DumpDir is { Length: > 0 })
+            {
+                try
+                {
+                    Directory.CreateDirectory(DumpDir);
+                    var name = $"{Env("DW2MP_RUN_LABEL", "run")}-cycle{Interlocked.Read(ref _cycleCount)}.bin";
+                    var path = Path.Combine(DumpDir, name);
+                    if (!File.Exists(path)) File.WriteAllBytes(path, raw);
+                }
+                catch (Exception ex) { Log("# dump failed: " + ex.Message); }
+            }
+
+            return (Convert.ToHexString(SHA256.HashData(raw))[..16], raw.LongLength);
         }
         catch (Exception ex)
         {
@@ -265,6 +249,9 @@ public static class Determinism
 
     private static int EnvInt(string name, int fallback) =>
         int.TryParse(Env(name, ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    private static long EnvLong(string name, long fallback) =>
+        long.TryParse(Env(name, ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
     private static double EnvDouble(string name, double fallback) =>
         double.TryParse(Env(name, ""), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : fallback;

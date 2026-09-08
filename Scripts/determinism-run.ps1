@@ -34,9 +34,25 @@
 [CmdletBinding()]
 param(
     [int]    $Runs = 2,
-    [double] $IntervalDays = 5,
-    [int]    $Snapshots = 6,
-    [int]    $TimeoutMinutes = 10,
+
+    # Server cycles between snapshots. Under the fixed-step patch the server cycle IS
+    # the simulation tick, so comparing at equal cycle counts compares identical step
+    # sequences. Comparing at equal GAME TIME would not: DW2's clock is a wall-clock
+    # stopwatch, so two runs reach the same time having taken different numbers of steps.
+    [long]   $EveryCycles = 2000,
+
+    [int]    $Snapshots = 5,
+    [int]    $TimeoutMinutes = 12,
+
+    # Simulated milliseconds per server cycle. 0 leaves the wall-clock clock in place,
+    # which makes the comparison invalid -- only use it to demonstrate that.
+    [double] $StepMs = 100,
+
+    # Freeze ship/location/creature block sizes. AdjustClientBlockSizes derives them from
+    # MEASURED milliseconds, so leaving it on means two runs divide the same work
+    # differently and the comparison is invalid for a second reason.
+    [bool]   $PinBlocks = $true,
+
     [string] $GamePath,
     [switch] $SkipBuild,
 
@@ -90,12 +106,12 @@ function Parse-RunLog {
     foreach ($line in Get-Content $Path) {
         if ($line -match '^\s*#' -or -not $line.Trim()) { continue }
 
-        # day  bytes  hashA  hashB  stable
+        # cycle  bytes  hashA  hashB  stable
         $parts = $line -split '\s+' | Where-Object { $_ }
         if ($parts.Count -lt 5) { continue }
 
         $rows += [pscustomobject]@{
-            Day    = [double] $parts[0]
+            Cycle  = [long]   $parts[0]
             Bytes  = [long]   $parts[1]
             Hash   = $parts[2]
             HashB  = $parts[3]
@@ -146,11 +162,13 @@ for ($i = 1; $i -le $Runs; $i++) {
     Write-Host ''
     Write-Host "--- Run $i of $Runs ---"
 
-    $env:DW2MP_DETERMINISM    = '1'
-    $env:DW2MP_RUN_LABEL      = $label
-    $env:DW2MP_SNAPSHOT_DAYS  = $IntervalDays.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-    $env:DW2MP_MAX_SNAPSHOTS  = $Snapshots
-    $env:DW2MP_EXIT_WHEN_DONE = '1'
+    $env:DW2MP_DETERMINISM      = '1'
+    $env:DW2MP_RUN_LABEL        = $label
+    $env:DW2MP_SNAPSHOT_CYCLES  = $EveryCycles
+    $env:DW2MP_MAX_SNAPSHOTS    = $Snapshots
+    $env:DW2MP_EXIT_WHEN_DONE   = '1'
+    $env:DW2MP_STEP_MS          = $StepMs.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    $env:DW2MP_PIN_BLOCKS       = if ($PinBlocks) { '1' } else { '0' }
 
     $startFlag = if ($Mode -eq 'continue') { '--continue' } else { '--new-game' }
     $args = @('--skip-splash', $startFlag, '--low-level-inject', $modDll)
@@ -186,7 +204,7 @@ if ($unstable -gt 0) {
     Write-Warning 'Rows marked unstable are not evidence about the simulation.'
 }
 
-$header = "{0,7}  {1,10}" -f 'day', 'bytes'
+$header = "{0,8}  {1,10}" -f 'cycle', 'bytes'
 for ($i = 1; $i -le $Runs; $i++) { $header += "  {0,-18}" -f "run$i" }
 Write-Host $header
 
@@ -195,7 +213,7 @@ $firstDivergence = $null
 
 for ($r = 0; $r -lt $baseline.Count; $r++) {
     $row = $baseline[$r]
-    $line = "{0,7:F1}  {1,10}" -f $row.Day, $row.Bytes
+    $line = "{0,8}  {1,10}" -f $row.Cycle, $row.Bytes
     $match = $true
 
     for ($i = 1; $i -le $Runs; $i++) {
@@ -207,7 +225,7 @@ for ($r = 0; $r -lt $baseline.Count; $r++) {
 
     if (-not $match) {
         $allMatch = $false
-        if ($null -eq $firstDivergence) { $firstDivergence = $row.Day }
+        if ($null -eq $firstDivergence) { $firstDivergence = $row.Cycle }
         $line += '  <-- DIVERGED'
     }
 
@@ -215,17 +233,25 @@ for ($r = 0; $r -lt $baseline.Count; $r++) {
 }
 
 Write-Host ''
-if ($allMatch) {
-    Write-Host 'VERDICT: identical across all runs on this machine.' -ForegroundColor Green
-    Write-Host 'Lockstep is viable here. Next question is cross-machine.'
-} elseif ($firstDivergence -eq $baseline[0].Day) {
+if ($Runs -lt 2) {
+    # With one run the comparison is against itself and always "matches". Saying
+    # anything else here would be a vacuous green light.
+    Write-Host 'NO VERDICT: a single run compares against itself. Use -Runs 2 or more.' -ForegroundColor Yellow
+} elseif ($allMatch) {
+    Write-Host 'VERDICT: identical at every tick, across all runs on this machine.' -ForegroundColor Green
+    Write-Host 'With a fixed timestep and pinned block sizes, DW2 simulates deterministically.'
+    Write-Host 'Lockstep is viable in principle. Next question is cross-machine, which is'
+    Write-Host 'the harder half -- float results can differ across CPU models and JIT versions.'
+} elseif ($firstDivergence -eq $baseline[0].Cycle) {
     Write-Host 'VERDICT: diverged at the FIRST snapshot.' -ForegroundColor Yellow
-    Write-Host 'Galaxy generation is not reproducible across runs. Seed control has to be'
-    Write-Host 'solved before simulation determinism can be tested at all.'
+    Write-Host 'Even loading the same save does not reproduce. Suspect the harness or load'
+    Write-Host 'order before blaming the simulation -- check the "stable" column first.'
 } else {
-    Write-Host "VERDICT: identical at first, diverged at day $firstDivergence." -ForegroundColor Yellow
-    Write-Host 'The SIMULATION is non-deterministic. Next: establish which of the three'
-    Write-Host 'causes it is (float, thread ordering, or wall-clock block sizing).'
+    Write-Host "VERDICT: identical at first, diverged at cycle $firstDivergence." -ForegroundColor Yellow
+    Write-Host 'The simulation is non-deterministic EVEN WITH an identical step sequence and'
+    Write-Host 'frozen work partitioning. That leaves thread completion order or float'
+    Write-Host 'arithmetic. Next step: force the parallel block processing to run'
+    Write-Host 'sequentially and re-run. If it then matches, it is ordering, not arithmetic.'
 }
 
 Write-Host ''
