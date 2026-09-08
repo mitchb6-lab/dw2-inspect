@@ -603,3 +603,50 @@ Four obstacles, each of which had to be read out of the game rather than guessed
    `data/<name>` with no extension, where the load screen will never see it. Found by
    searching the filesystem for the file after `SaveGame` returned "successfully" and
    `SavedGames` was still empty — a silent success is the worst kind.
+
+---
+
+## M4 — TWO LIVE GAMES SHARING A UNIVERSE, measured 2026-09-07
+
+Two real DW2 instances on one machine, host and client, over loopback, on
+`MPTestSmall.DWGame`. **Seven consecutive full-state syncs, every one applied.**
+
+```
+host  : sync #1 tick=600  raw=23,140,735B packed=4,208,658B serialise=71ms pack=110ms send=2ms
+client: state received packed=4,208,658B raw=23,140,735B (queued)
+client: APPLIED sync #1  23,140,735B  read=171ms  apply=40ms  ships=90 empires=6
+...
+host  : sync #7 tick=4200 raw=23,137,898B packed=4,207,839B serialise=86ms pack=119ms send=1ms
+client: APPLIED sync #7  23,137,898B  read=93ms  apply=28ms  ships=90 empires=6
+```
+
+**A galaxy simulated in one process is now being adopted by a second live game, repeatedly
+and reliably.** That is the technical foundation of the original goal.
+
+### Costs on the small save
+
+| Stage | Small save (23 MB) | Late-game (40 MB) |
+|---|---|---|
+| Host serialise | 52–87 ms | 250–370 ms |
+| Host compress | 87–126 ms | 250–340 ms |
+| Wire | **4.2 MB (18.2 %)** | 9.2–9.5 MB (23.4 %) |
+| Client deserialise | 79–171 ms | 650–1,740 ms |
+| Client apply | 24–42 ms | 8–23 ms |
+| **Client total** | **~110–210 ms** | ~660–1,760 ms |
+
+Memory: **3.5 GB per instance** on the small save against ~15 GB on the late-game one, a
+4× reduction — which is what makes two instances possible on a 32 GB machine at all.
+
+### Honest limits
+
+- **State flows one way.** The client sees the host's universe; it cannot yet act on it.
+  Command relay (client → host `GameTask`s) is M4b and is the other half of multiplayer.
+  The channel is already open and the `Command` message type is already defined.
+- **Both instances load the same save and control the same empire.** Assigning the client
+  a different empire is part of session setup, not yet built.
+- **The host hitches** ~150–200 ms per sync on the small save (worse on a large one),
+  because serialise and compress run inline on the simulation thread.
+- **Raw sizes barely move between syncs** (23,137,898 twice in a row). Expected for a
+  small early-game galaxy over ~7 game-minutes, but it means this run did not exercise
+  heavy state change. A busier galaxy would be a better stress test.
+- The 732 → 731 round-trip fidelity gap from M3c has not been investigated.
