@@ -172,6 +172,9 @@ public static class Determinism
         if (_snapshotsTaken == 0)
             Log($"# galaxy seed = {_seedField?.GetValue(galaxy)}");
 
+        if (Env("DW2MP_MEASURE_TRANSFER", "0") == "1")
+            StateTransfer.Measure(galaxy, _writeToStream, _galaxyDataType, Log);
+
         var (hashA, bytes) = HashGalaxy(galaxy);
         var (hashB, _) = HashGalaxy(galaxy);
 

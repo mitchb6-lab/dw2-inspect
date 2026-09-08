@@ -318,3 +318,60 @@ Two candidates remain, and neither is cheap:
 What remains is not modding: it is reimplementing DW2's simulation scheduler and
 collection iteration order against an obfuscated binary. Lockstep should be treated as
 closed unless new evidence appears.
+
+---
+
+## Branch `mp/host-authoritative`
+
+Lockstep is closed (M2b/M2c). This branch pursues the one architecture that does not
+need determinism: **one machine simulates; clients send `GameTask`s and receive galaxy
+state.** The `mp/handoff` branch will explore sequential save-passing from the same base
+commit for comparison.
+
+### Why this is possible at all
+
+Two entry points make it more than theory, both verified by decompilation:
+
+| Piece | Signature | Role |
+|---|---|---|
+| Serialise | `Galaxy.WriteToStream(BinaryWriter, GameGalaxyData)` | Host produces state |
+| Deserialise | `Galaxy.ReadFromStream(BinaryReader, GameGalaxyData&, List&)` → `Galaxy` | Client parses state |
+| **Apply** | `DWGame.StartGameExisting(Galaxy, DateTime, GameGalaxyData)` | Client adopts state |
+
+`StartGameExisting` taking a ready-made `Galaxy` is the crucial one: there is an existing,
+in-memory path for "here is a galaxy, run with it". No file I/O and no process restart.
+
+### M3a RESULT — transfer cost, measured 2026-09-07
+
+Late-game save, 37.5 MB on disk, measured in-process on the dev machine:
+
+| Metric | Value |
+|---|---|
+| Raw serialised galaxy | 39,333,035 B |
+| Compressed (Deflate, Fastest) | 9,214,272 B — **23.4 %** |
+| Serialise (host cost) | **373 ms** |
+| Compress | 338 ms |
+| **Deserialise (client cost)** | **220 ms** |
+
+**Deserialising a full late-game galaxy costs 220 ms.** The multi-minute load times seen
+all evening are engine and scene setup, which an already-running client would not repeat —
+which is precisely why this had to be measured in-process rather than by timing a launch.
+
+Budget for a full sync: host ~700 ms (serialise + compress), 9.2 MB on the wire, client
+220 ms. At one full sync every 10 s that is ~920 KB/s (~7.4 Mbps) — comfortable on a LAN,
+heavy but feasible on good broadband. Deltas over short intervals should cut it sharply,
+and Deflate/Fastest was chosen precisely because a sync happens while someone waits.
+
+### The next gate, and it is NOT yet measured
+
+**Deserialising is not the same as applying.** 220 ms buys a `Galaxy` object in memory.
+What it does not cover is `StartGameExisting` — rebinding the scene, re-creating visual
+entities, rebuilding whatever caches the renderer holds. That could be the real cost, and
+it is plausibly where the minutes actually went.
+
+**M3b: measure `StartGameExisting` on an already-running client.** If applying state is
+also sub-second, host-authoritative is viable and the rest is ordinary networking. If it
+rebuilds the world every time, the design needs a cheaper application path — patching
+state into the live galaxy rather than replacing it — which is a much larger job.
+
+Do not build transport before knowing this number.
