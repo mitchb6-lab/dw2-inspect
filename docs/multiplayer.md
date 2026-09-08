@@ -817,3 +817,39 @@ open-ended problem that closed lockstep.
 **`_EmpiresWithSharedVisibility` is a gift for co-op.** The game already models empires
 sharing visibility, which is exactly what allied co-op needs — should allied empires be
 wanted later.
+
+---
+
+## M4b VERIFIED — commands cross the wire, 2026-09-08
+
+```
+client: sent synthetic command #1 tick=400 (39B)
+host  : INJECTED command #1 serial=400 tasks=0 added=True
+...     8 injected, serials 400 → 3200, every one added=True
+```
+
+Serial numbers match end to end and `GameServer.InputQueue.TryAdd` accepted every packet.
+**The full bidirectional loop is proven** between two live DW2 instances: host → client
+full-state sync, and client → host command relay, using the game's own `MessagePacket`
+format in both directions.
+
+The relayed packets carry `tasks=0` because they are synthetic — nobody is at the client's
+keyboard. A real player's orders travel this exact path with tasks attached; the transport,
+serialisation and injection are what was unproven, and they are now proven.
+
+### What made this run work
+
+Both instances loading simultaneously starved the client — 450 s with 0 cycles in the
+previous attempt. Launching the client only **after the host is confirmed ticking** fixed
+it. Worth remembering for any future two-instance test on one machine.
+
+### Session handshake
+
+`Hello` now carries protocol version, game version and mode, and **both ends check** —
+the client answers the host's Hello with its own descriptor, because a one-sided check
+only warns the person who did not choose the session.
+
+Game version matters as much as protocol version: state transfer is DW2's own serialised
+galaxy, so two players on different builds would exchange bytes that deserialise into
+nonsense or throw somewhere deep and unhelpful. `ProtocolVersion` is bumped whenever the
+wire format changes.

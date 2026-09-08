@@ -122,6 +122,73 @@ public static class NetSession
         thread.Start();
     }
 
+    // ------------------------------------------------------------ session
+
+    /// <summary>
+    /// Bumped whenever the wire format changes. Two peers with different values cannot
+    /// talk, and finding that out in the handshake is far better than finding out via a
+    /// corrupt galaxy halfway through a session.
+    /// </summary>
+    private const int ProtocolVersion = 1;
+
+    /// <summary>
+    /// The Hello payload: protocol version, game version, and mode.
+    ///
+    /// Game version matters as much as protocol version. State transfer is DW2's own
+    /// serialised galaxy, so two players on different game builds would exchange bytes
+    /// that deserialise into nonsense — or throw somewhere deep and unhelpful. Checking
+    /// it costs one string and turns an obscure crash into a clear message.
+    /// </summary>
+    private static byte[] BuildHello()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8);
+
+        writer.Write(ProtocolVersion);
+        writer.Write(GameVersion());
+        writer.Write(Environment.GetEnvironmentVariable("DW2MP_MODE") ?? "coop-shared");
+        writer.Flush();
+
+        return buffer.ToArray();
+    }
+
+    private static void ReadHello(byte[] payload)
+    {
+        try
+        {
+            using var input = new MemoryStream(payload, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+
+            int protocol = reader.ReadInt32();
+            string gameVersion = reader.ReadString();
+            string mode = reader.ReadString();
+
+            string mine = GameVersion();
+            _log($"# net: peer protocol={protocol} game={gameVersion} mode={mode}");
+
+            if (protocol != ProtocolVersion)
+                _log($"# net: *** PROTOCOL MISMATCH *** peer={protocol} ours={ProtocolVersion} — expect failure");
+
+            if (!string.Equals(gameVersion, mine, StringComparison.Ordinal))
+                _log($"# net: *** GAME VERSION MISMATCH *** peer={gameVersion} ours={mine} — " +
+                     "state transfer will not deserialise correctly");
+
+            if (protocol == ProtocolVersion && gameVersion == mine)
+                _log("# net: handshake OK — protocol and game version match");
+        }
+        catch (Exception ex) { _log("# net: malformed Hello: " + ex.Message); }
+    }
+
+    private static string GameVersion()
+    {
+        try
+        {
+            var asm = AccessTools.TypeByName("DistantWorlds.Types.Galaxy")?.Assembly;
+            return asm?.GetName().Version?.ToString() ?? "unknown";
+        }
+        catch { return "unknown"; }
+    }
+
     // ------------------------------------------------------- command relay
 
     /// <summary>
@@ -321,7 +388,7 @@ public static class NetSession
             _connected = true;
 
             _log($"# net[host]: client connected from {_peer.Client.RemoteEndPoint}");
-            Send(Msg.Hello, Array.Empty<byte>());
+            Send(Msg.Hello, BuildHello());
 
             // Host reads too, so M4b's command relay has a channel already open.
             while (_connected)
@@ -330,6 +397,7 @@ public static class NetSession
                 if (type is null) break;
 
                 if (type == Msg.Command) InjectCommand(payload);
+                else if (type == Msg.Hello) ReadHello(payload);
                 else _log($"# net[host]: received {type} ({payload.Length:N0}B)");
             }
         }
@@ -401,6 +469,15 @@ public static class NetSession
                     byte[] raw = Decompress(payload);
                     _inbound.Enqueue(raw);
                     _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued)");
+                }
+                else if (type == Msg.Hello)
+                {
+                    ReadHello(payload);
+
+                    // Answer with our own descriptor so the HOST can also detect a
+                    // mismatch. A one-sided check only warns the person who did not
+                    // choose the session.
+                    Send(Msg.Hello, BuildHello());
                 }
                 else _log($"# net[client]: received {type} ({payload.Length:N0}B)");
             }
