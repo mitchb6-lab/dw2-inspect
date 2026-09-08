@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using HarmonyLib;
@@ -44,7 +44,9 @@ public static class Determinism
 
     private static readonly bool PinBlocks = Env("DW2MP_PIN_BLOCKS", "1") == "1";
 
-    private static readonly long ApplyAfterCycles = EnvLong("DW2MP_APPLY_AFTER_CYCLES", 400);
+    private static readonly long CaptureAtCycles = EnvLong("DW2MP_CAPTURE_AT_CYCLES", 400);
+
+    private static readonly long ApplyAfterCycles = EnvLong("DW2MP_APPLY_AFTER_CYCLES", 1600);
 
     /// <summary>When set, raw snapshot bytes are written here for byte-level diffing.</summary>
     private static readonly string DumpDir = Env("DW2MP_DUMP_DIR", "");
@@ -128,10 +130,20 @@ public static class Determinism
             // sits ABOVE the _finished check on purpose: the two measurements are
             // independent, and coupling them meant a completed snapshot run silently
             // cancelled the apply measurement before it ever armed.
-            if (ApplyState.Ready && n == ApplyAfterCycles)
+            if (ApplyState.Ready)
             {
-                Log($"# apply: arming at cycle {n}");
-                ApplyState.Arm(galaxy);
+                // Capture early, apply late, then watch. The gap between capture and
+                // apply is what makes adoption falsifiable: the live clock must jump
+                // BACKWARDS to the captured time, which nothing else would cause.
+                if (n == CaptureAtCycles) ApplyState.Capture(galaxy);
+
+                if (n == ApplyAfterCycles && ApplyState.HasCapture)
+                {
+                    Log($"# apply: arming at cycle {n}");
+                    ApplyState.Arm(galaxy);
+                }
+
+                if (ApplyState.Applied) ApplyState.Observe(galaxy, n);
             }
 
             if (_finished) return;

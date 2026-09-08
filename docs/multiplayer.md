@@ -425,3 +425,39 @@ incoming galaxy — no visual or behavioural check was made, and the process was
 a timer rather than observed. **M3c should apply a state that is visibly different (a
 galaxy from a different point in time) and confirm the client actually shows it.** Do
 that before building transport.
+
+### M3c — adoption verification, measured 2026-09-07: **object swap PROVEN, contents unverified**
+
+Captured a galaxy at tick 400, ran on to tick 1600 (exactly 120.0 s of game time later),
+then applied the *older* captured state back to the running client.
+
+```
+CAPTURED 39,876,802B  hash=CAAEA4B28D512B36  time=21:48:31.159
+live time before apply = 21:50:31.159  (delta 120.0s)
+deserialise=648ms  StartGameExisting=14ms  (client total 662ms)
+verify[1601]: timeReverted=False  isIncomingObject=True  -> hash mismatch
+verify[1602..1603]: isIncomingObject=True
+```
+
+**`isIncomingObject=True` is the finding.** The galaxy that `UpdateGameAsServer` is handed
+after the apply is reference-identical to the object we deserialised. `StartGameExisting`
+swapped the running game onto received state, and the simulation continued cleanly. A
+no-op cannot produce that.
+
+**The other two checks were invalidated by our own instrumentation.** The test was designed
+around "the clock must jump backwards", while running under `FixedStep`, which computes
+time as `_StopwatchStartTime + cycleCount × StepMs`. The cycle counter is monotonic, so
+time cannot go backwards regardless of what state is loaded — `21:50:31.259` is exactly one
+100 ms tick past the pre-apply value. The hash check failed for the same reason: a
+differing `Time` field alone changes the hash of a 40 MB blob.
+
+Silver lining: it confirms `FixedStep` is exact — 1200 ticks × 100 ms = **120.0 s**, to the
+millisecond.
+
+**Still unverified: that the adopted galaxy's CONTENTS are the captured ones.** The next
+check must use a signal the clock does not touch — entity counts, a named fleet's position,
+an empire's cash — captured alongside the bytes and compared after the apply. Run that with
+`DW2MP_STEP_MS=0` so the harness clock is out of the picture entirely.
+
+Confirmed costs remain good: **~660 ms client cost** for a full 40 MB late-game galaxy,
+of which the apply itself is 14 ms.
