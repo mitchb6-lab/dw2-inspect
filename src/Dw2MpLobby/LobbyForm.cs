@@ -3,43 +3,60 @@ using System.Diagnostics;
 namespace Dw2MpLobby;
 
 /// <summary>
-/// The lobby window: pick your empire, host or join, launch.
+/// The launcher. Tabbed after the FAF client's shape:
 ///
-/// Hand-built rather than designer-generated so the whole thing is one readable file with
-/// no .resx or .Designer.cs to keep in step.
+///   Private   — direct two-player session. This is what works today.
+///   Lobby     — Phase 3 placeholder: a server listing hosted games.
+///   Mods      — what is installed and enabled, because mod mismatch breaks state sync.
+///   Log       — connection status and relay throughput.
+///
+/// Hand-built rather than designer-generated, so the whole window is one readable file
+/// with no .resx or .Designer.cs to keep in step.
 /// </summary>
 public sealed class LobbyForm : Form
 {
     private readonly string _gamePath;
     private readonly List<RaceOption> _races;
     private readonly List<GovernmentOption> _governments;
+    private List<InstalledMod> _mods = new();
 
+    // --- empire ---
     private readonly TextBox _playerName = new() { Text = Environment.UserName };
     private readonly TextBox _empireName = new() { Text = "New Empire" };
     private readonly ComboBox _race = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly ComboBox _government = new() { DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly Button _colour = new() { Text = "", FlatStyle = FlatStyle.Flat };
+    private readonly Button _colour = new() { FlatStyle = FlatStyle.Flat };
 
-    private readonly RadioButton _roleHost = new() { Text = "Host a session", Checked = true };
-    private readonly RadioButton _roleJoin = new() { Text = "Join a session" };
-
+    // --- session ---
+    private readonly RadioButton _roleHost = new() { Text = "Host", Checked = true };
+    private readonly RadioButton _roleJoin = new() { Text = "Join" };
     private readonly ComboBox _mode = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox _transport = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox _myAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly Button _copyAddress = new() { Text = "Copy" };
+    private readonly TextBox _address = new() { Text = "127.0.0.1" };
+    private readonly Button _testConnection = new() { Text = "Test" };
+    private readonly NumericUpDown _port = new() { Minimum = 1024, Maximum = 65535, Value = 47800 };
+
+    // --- galaxy ---
     private readonly NumericUpDown _stars = new() { Minimum = 10, Maximum = 200, Value = 30 };
     private readonly NumericUpDown _aiEmpires = new() { Minimum = 0, Maximum = 20, Value = 4 };
     private readonly NumericUpDown _seed = new() { Minimum = 0, Maximum = 999999, Value = 12345 };
 
-    private readonly TextBox _address = new() { Text = "127.0.0.1" };
-    private readonly NumericUpDown _port = new() { Minimum = 1024, Maximum = 65535, Value = 47800 };
+    private readonly Button _launch = new() { Text = "Host and launch", Height = 36 };
+    private readonly TextBox _log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
+    private readonly ListBox _modList = new();
+    private readonly Label _modSummary = new() { AutoSize = true };
+    private readonly StatusStrip _statusStrip = new();
+    private readonly ToolStripStatusLabel _statusLabel = new() { Text = "Idle" };
 
-    private readonly ComboBox _myAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly Button _copyAddress = new() { Text = "Copy" };
-    private readonly Button _testConnection = new() { Text = "Test connection" };
     private List<LocalAddress> _localAddresses = new();
-
-    private readonly Button _launch = new() { Text = "Launch", Height = 34 };
-    private readonly TextBox _status = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Height = 90 };
-
     private Color _empireColour = Color.SteelBlue;
+    private Relay _relay;
+    private readonly System.Windows.Forms.Timer _statusTimer = new() { Interval = 1000 };
+
+    /// <summary>Localhost port the game connects back on. Not the peer port.</summary>
+    private const int LocalGamePort = 47810;
 
     public LobbyForm(string gamePath)
     {
@@ -47,28 +64,41 @@ public sealed class LobbyForm : Form
         _races = GameData.LoadRaces(gamePath);
         _governments = GameData.LoadGovernments(gamePath);
 
-        Text = "Distant Worlds 2 — Multiplayer Lobby";
-        Width = 620;
-        Height = 720;
+        Text = "Distant Worlds 2 — Multiplayer";
+        Width = 720;
+        Height = 780;
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 9f);
 
         BuildLayout();
         WireEvents();
 
-        Log($"Game found: {gamePath}");
-        Log($"{_races.Count} races, {_governments.Count} governments loaded from the game's data files.");
+        Log($"Game: {gamePath}");
+        Log($"{_races.Count} races, {_governments.Count} governments loaded.");
+        RefreshMods();
+        RefreshLocalAddresses();
     }
+
+    // ------------------------------------------------------------- layout
 
     private void BuildLayout()
     {
-        var root = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            Padding = new Padding(12),
-            AutoScroll = true,
-        };
+        var tabs = new TabControl { Dock = DockStyle.Fill };
+        tabs.TabPages.Add(BuildPrivateTab());
+        tabs.TabPages.Add(BuildLobbyTab());
+        tabs.TabPages.Add(BuildModsTab());
+        tabs.TabPages.Add(BuildLogTab());
+
+        _statusStrip.Items.Add(_statusLabel);
+
+        Controls.Add(tabs);
+        Controls.Add(_statusStrip);
+    }
+
+    private TabPage BuildPrivateTab()
+    {
+        var page = new TabPage("Private") { Padding = new Padding(10) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoScroll = true };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
         _race.Items.AddRange(_races.ToArray());
@@ -80,6 +110,9 @@ public sealed class LobbyForm : Form
         _mode.Items.AddRange(new object[] { "Co-op — shared empire", "Competitive — separate empires" });
         _mode.SelectedIndex = 0;
 
+        _transport.Items.AddRange(new object[] { "Direct TCP (LAN, or Tailscale/ZeroTier)", "Steam networking (not yet available)" });
+        _transport.SelectedIndex = 0;
+
         root.Controls.Add(Section("Your empire", Grid(
             ("Player name", _playerName),
             ("Empire name", _empireName),
@@ -87,9 +120,10 @@ public sealed class LobbyForm : Form
             ("Government", _government),
             ("Colour", _colour))));
 
-        root.Controls.Add(Section("Session", Grid(
+        root.Controls.Add(Section("Connection", Grid(
             ("Role", Stack(_roleHost, _roleJoin)),
             ("Mode", _mode),
+            ("Transport", _transport),
             ("Your address", Stack(_myAddress, _copyAddress)),
             ("Host address", Stack(_address, _testConnection)),
             ("Port", _port))));
@@ -100,17 +134,94 @@ public sealed class LobbyForm : Form
             ("Seed", _seed))));
 
         root.Controls.Add(_launch);
-        root.Controls.Add(Section("Status", _status));
-
-        Controls.Add(root);
+        page.Controls.Add(root);
+        return page;
     }
+
+    /// <summary>
+    /// Phase 3 placeholder. Present and explicit rather than absent, so the shape of where
+    /// this is heading is visible — and so nobody wonders whether it exists and is broken.
+    /// </summary>
+    private static TabPage BuildLobbyTab()
+    {
+        var page = new TabPage("Lobby") { Padding = new Padding(10) };
+
+        var list = new ListView
+        {
+            Dock = DockStyle.Fill,
+            View = View.Details,
+            FullRowSelect = true,
+            Enabled = false,
+        };
+        list.Columns.Add("Host", 150);
+        list.Columns.Add("Mode", 120);
+        list.Columns.Add("Players", 70);
+        list.Columns.Add("Mods", 120);
+        list.Columns.Add("Galaxy", 120);
+
+        var note = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 96,
+            Text =
+                "Public lobby — not built yet (Phase 3).\r\n\r\n" +
+                "This will list sessions other people are hosting, so you can join without " +
+                "exchanging an address. It needs a small always-on server to hold the list; " +
+                "the game connections themselves stay peer-to-peer.\r\n\r\n" +
+                "Until then, use the Private tab and send someone your address directly.",
+        };
+
+        page.Controls.Add(list);
+        page.Controls.Add(note);
+        return page;
+    }
+
+    private TabPage BuildModsTab()
+    {
+        var page = new TabPage("Mods") { Padding = new Padding(10) };
+
+        _modList.Dock = DockStyle.Fill;
+
+        var note = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 110,
+            Text =
+                "Both players must have the SAME mods enabled.\r\n\r\n" +
+                "State transfer sends the game's own serialised galaxy, and mods change the " +
+                "data it is built from — components, races, governments. A mismatch corrupts " +
+                "the transfer exactly the way a version mismatch does, so the enabled set is " +
+                "checked during the handshake.\r\n\r\n" +
+                "Vanilla is the supported configuration for now. A shared mod vault would come " +
+                "with the public lobby.",
+        };
+
+        var refresh = new Button { Text = "Refresh", Dock = DockStyle.Bottom, Height = 28 };
+        refresh.Click += (_, _) => RefreshMods();
+
+        page.Controls.Add(_modList);
+        page.Controls.Add(_modSummary);
+        page.Controls.Add(note);
+        page.Controls.Add(refresh);
+        return page;
+    }
+
+    private TabPage BuildLogTab()
+    {
+        var page = new TabPage("Log") { Padding = new Padding(10) };
+        _log.Dock = DockStyle.Fill;
+        page.Controls.Add(_log);
+        return page;
+    }
+
+    // ------------------------------------------------------------- events
 
     private void WireEvents()
     {
         _race.SelectedIndexChanged += (_, _) =>
         {
-            // Adopting the race's own colour is a better default than a fixed blue, and
-            // it means a player who changes nothing still gets a sensible empire.
+            // The race's own colour is a better default than a fixed blue: a player who
+            // changes nothing still ends up with a coherent empire.
             if (_race.SelectedItem is RaceOption r) SetColour(r.DefaultColor);
         };
 
@@ -119,9 +230,6 @@ public sealed class LobbyForm : Form
             using var picker = new ColorDialog { Color = _empireColour, FullOpen = true };
             if (picker.ShowDialog(this) == DialogResult.OK) SetColour(picker.Color);
         };
-
-        _roleHost.CheckedChanged += (_, _) => UpdateRoleEnabled();
-        _launch.Click += (_, _) => Launch();
 
         _copyAddress.Click += (_, _) =>
         {
@@ -138,16 +246,44 @@ public sealed class LobbyForm : Form
             _testConnection.Enabled = true;
         };
 
+        _transport.SelectedIndexChanged += (_, _) =>
+        {
+            if (_transport.SelectedIndex != 1) return;
+
+            MessageBox.Show(this, SteamTransport.NotImplementedMessage,
+                "Steam networking", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _transport.SelectedIndex = 0;
+        };
+
+        _roleHost.CheckedChanged += (_, _) => UpdateRoleEnabled();
+        _launch.Click += (_, _) => Launch();
+
+        _statusTimer.Tick += (_, _) => UpdateStatus();
+        _statusTimer.Start();
+
+        FormClosing += (_, _) => _relay?.Dispose();
+
         SetColour(_races.FirstOrDefault()?.DefaultColor ?? Color.SteelBlue);
-        RefreshLocalAddresses();
         UpdateRoleEnabled();
     }
 
-    /// <summary>
-    /// Lists every address a joiner could use, labelled by what it actually is, so the
-    /// host is not left guessing which of five to send. Without this they would run
-    /// ipconfig and pick wrong, and a wrong pick fails as a silent refused connection.
-    /// </summary>
+    private void RefreshMods()
+    {
+        _mods = ModDetection.FindMods(_gamePath);
+
+        _modList.Items.Clear();
+        foreach (var m in _mods) _modList.Items.Add(m);
+
+        int on = _mods.Count(m => m.Enabled);
+        _modSummary.Text = on == 0
+            ? $"Vanilla — {_mods.Count} mod(s) installed, none enabled."
+            : $"{on} of {_mods.Count} mod(s) enabled. The other player must match exactly.";
+
+        Log(on == 0
+            ? "Mods: running vanilla (nothing enabled)."
+            : $"Mods: {on} enabled — the other player must have the same set.");
+    }
+
     private void RefreshLocalAddresses()
     {
         _localAddresses = NetworkDiscovery.FindLocalAddresses();
@@ -156,34 +292,36 @@ public sealed class LobbyForm : Form
         foreach (var a in _localAddresses) _myAddress.Items.Add(a);
         if (_myAddress.Items.Count > 0) _myAddress.SelectedIndex = 0;
 
-        foreach (var a in _localAddresses)
-        {
-            if (a.Kind == AddressKind.FullTunnelVpn)
-                Log($"WARNING: {a.Adapter} is connected. A full-tunnel VPN will break peer connections — turn it off.");
-        }
+        foreach (var a in _localAddresses.Where(a => a.Kind == AddressKind.FullTunnelVpn))
+            Log($"WARNING: {a.Adapter} is connected. A full-tunnel VPN breaks peer connections — turn it off.");
 
-        var internetCapable = _localAddresses.Count(a => a.ReachableOverInternet && a.Kind != AddressKind.OtherVirtual);
+        int internetCapable = _localAddresses.Count(a => a.ReachableOverInternet && a.Kind != AddressKind.OtherVirtual);
 
         Log(internetCapable > 0
-            ? $"{internetCapable} internet-capable address(es) found — internet play should work with no port forwarding."
-            : "No virtual-LAN adapter found. LAN play works as-is; for internet play install Tailscale or ZeroTier on both machines.");
+            ? $"{internetCapable} internet-capable address(es) found — no port forwarding needed."
+            : "No virtual-LAN adapter. LAN works as-is; for internet play install Tailscale or ZeroTier on both machines.");
     }
 
     private void UpdateRoleEnabled()
     {
         bool host = _roleHost.Checked;
 
-        // Galaxy settings belong to whoever generates the galaxy. Showing them as editable
-        // to a joining player would imply their values matter, and they do not.
         _stars.Enabled = _aiEmpires.Enabled = _seed.Enabled = host;
         _mode.Enabled = host;
-
-        // The host advertises an address; the joiner types one. Only one of those is ever
-        // the relevant control.
         _myAddress.Enabled = _copyAddress.Enabled = host;
         _address.Enabled = _testConnection.Enabled = !host;
-
         _launch.Text = host ? "Host and launch" : "Join and launch";
+    }
+
+    private void UpdateStatus()
+    {
+        if (_relay is null) { _statusLabel.Text = "Idle"; return; }
+
+        var s = _relay.Stats;
+        _statusLabel.Text =
+            $"Game: {(s.GameConnected ? "connected" : "waiting")}   " +
+            $"Peer: {(s.PeerConnected ? "connected" : "waiting")}   " +
+            $"{s.Frames} frames   ↑{s.ToPeer / 1024 / 1024.0:F1} MB   ↓{s.ToGame / 1024 / 1024.0:F1} MB";
     }
 
     private void SetColour(Color c)
@@ -194,19 +332,35 @@ public sealed class LobbyForm : Form
         _colour.Text = $"R{c.R} G{c.G} B{c.B}";
     }
 
+    // ------------------------------------------------------------- launch
+
     private void Launch()
     {
         try
         {
             var session = BuildSession();
             session.Save();
-
             Log($"Wrote {SessionDescriptor.DefaultPath}");
-            Log($"Mode: {session.Mode}, slot {session.MySlot}, {session.Players.Count} player slot(s).");
+
+            // The relay must be listening BEFORE the game starts, or the mod's first
+            // connection attempts fail. It retries, but starting in the right order keeps
+            // the log clean and the failure modes few.
+            _relay = new Relay(
+                LocalGamePort,
+                new TcpTransport((int)_port.Value),
+                _roleHost.Checked,
+                _address.Text.Trim(),
+                Log);
+
+            _relay.Start();
 
             StartGame(session);
+            _launch.Enabled = false;
 
-            Log("Distant Worlds 2 launched. Keep this window open for reference; you can close it once the game is up.");
+            Log("Launched. The game connects back to this launcher on 127.0.0.1:" + LocalGamePort + ".");
+            Log(_roleHost.Checked
+                ? "Tell the other player to join once you are in the galaxy."
+                : "Waiting for the host — they must be in the galaxy already.");
         }
         catch (Exception ex)
         {
@@ -248,20 +402,14 @@ public sealed class LobbyForm : Form
             },
         };
 
-        // NOTE: the joining player's empire is currently only known to their own machine.
-        // Exchanging slots over the lobby protocol is the next piece; until then the host
-        // generates using its own configuration and the client's choices apply only in
-        // competitive mode once slot exchange exists.
         session.Players.Add(mine);
-
         return session;
     }
 
     private void StartGame(SessionDescriptor session)
     {
-        var modDll = FindModDll();
-        if (modDll is null)
-            throw new FileNotFoundException(
+        var modDll = FindModDll()
+            ?? throw new FileNotFoundException(
                 "Dw2Mp.dll not found. Expected it beside this launcher, or under src\\Dw2Mp\\bin\\Debug\\.");
 
         var psi = new ProcessStartInfo
@@ -272,11 +420,10 @@ public sealed class LobbyForm : Form
         };
 
         psi.ArgumentList.Add("--skip-splash");
+        psi.ArgumentList.Add("--continue");
         psi.ArgumentList.Add("--low-level-inject");
         psi.ArgumentList.Add(modDll);
 
-        // The mod reads its configuration from the environment; session.json carries the
-        // rest. Both are needed because the harness predates the lobby.
         psi.Environment["DW2MP_DETERMINISM"] = "1";
         psi.Environment["DW2MP_STEP_MS"] = "100";
         psi.Environment["DW2MP_PIN_BLOCKS"] = "1";
@@ -284,12 +431,15 @@ public sealed class LobbyForm : Form
         psi.Environment["DW2MP_SNAPSHOT_CYCLES"] = "100000";
         psi.Environment["DW2MP_MAX_SNAPSHOTS"] = "2";
         psi.Environment["DW2MP_ROLE"] = _roleHost.Checked ? "host" : "client";
-        psi.Environment["DW2MP_HOST"] = session.HostAddress;
-        psi.Environment["DW2MP_PORT"] = session.Port.ToString();
+        psi.Environment["DW2MP_MODE"] = session.Mode;
         psi.Environment["DW2MP_RUN_LABEL"] = _roleHost.Checked ? "lobbyHost" : "lobbyClient";
         psi.Environment["DW2MP_SESSION"] = SessionDescriptor.DefaultPath;
 
-        Log($"Launching: {psi.FileName} --low-level-inject \"{modDll}\"");
+        // Phase 1: the game talks ONLY to us, on localhost. It is not told the peer
+        // address or the peer port at all.
+        psi.Environment["DW2MP_LOCAL_PORT"] = LocalGamePort.ToString();
+
+        Log($"Launching {psi.FileName}");
         Process.Start(psi);
     }
 
@@ -297,22 +447,21 @@ public sealed class LobbyForm : Form
     {
         var here = AppContext.BaseDirectory;
 
-        var candidates = new[]
+        return new[]
         {
             Path.Combine(here, "Dw2Mp.dll"),
             Path.GetFullPath(Path.Combine(here, @"..\..\..\..\Dw2Mp\bin\Debug\Dw2Mp.dll")),
             Path.GetFullPath(Path.Combine(here, @"..\..\..\..\..\src\Dw2Mp\bin\Debug\Dw2Mp.dll")),
-        };
-
-        return candidates.FirstOrDefault(File.Exists);
+        }.FirstOrDefault(File.Exists);
     }
 
     private void Log(string line)
     {
-        _status.AppendText(line + Environment.NewLine);
+        if (_log.InvokeRequired) { _log.BeginInvoke(() => Log(line)); return; }
+        _log.AppendText(line + Environment.NewLine);
     }
 
-    // ---- tiny layout helpers, so the builder above reads as structure ----
+    // ---- layout helpers, so the builders above read as structure ----
 
     private static Control Section(string title, Control content)
     {

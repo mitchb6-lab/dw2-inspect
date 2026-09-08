@@ -9,11 +9,23 @@ using HarmonyLib;
 namespace Dw2Mp;
 
 /// <summary>
-/// M4a: host-authoritative transport over TCP.
+/// Host-authoritative state sync, speaking ONLY to the launcher over localhost.
 ///
-/// The host simulates and periodically ships a full compressed galaxy to the client; the
-/// client adopts it through the M3-proven path. This is the first milestone where two
-/// DW2 processes share a universe rather than merely being measured.
+/// PHASE 1 (the FAF model): the mod no longer owns any remote networking. It connects to
+/// Dw2MpLobby on 127.0.0.1 and the launcher relays frames to the peer. This mirrors how
+/// FAF runs Supreme Commander — the game is given `/gpgnet 127.0.0.1:port` and never
+/// touches the internet itself; the client and its ICE adapter do.
+///
+/// Why it is worth the refactor:
+///   * NAT traversal, Steam sockets, reconnection and relays can change with no game code
+///     touched and no four-minute game reload to test.
+///   * The mod's networking becomes one localhost connection that cannot fail for
+///     interesting reasons.
+///   * The launcher can show connection state and throughput, because every byte passes
+///     through it.
+///
+/// The host/client ROLE still matters here — it decides whether this instance sends state
+/// or applies it — but neither role opens a listening socket any more.
 ///
 /// Three constraints from the earlier milestones shape the design, and none is optional:
 ///
@@ -95,11 +107,13 @@ public static class NetSession
         Role = role switch { "host" => NetRole.Host, "client" => NetRole.Client, _ => NetRole.Off };
         if (Role == NetRole.Off) return;
 
-        _port = int.TryParse(Environment.GetEnvironmentVariable("DW2MP_PORT"), out var p) ? p : 47800;
-        _hostAddress = Environment.GetEnvironmentVariable("DW2MP_HOST") is { Length: > 0 } h ? h : "127.0.0.1";
+        // The ONLY port the mod knows about is the launcher's local one. Remote address
+        // and remote port are the launcher's business now.
+        _port = int.TryParse(Environment.GetEnvironmentVariable("DW2MP_LOCAL_PORT"), out var p) ? p : 47810;
+        _hostAddress = "127.0.0.1";
         _syncEveryTicks = long.TryParse(Environment.GetEnvironmentVariable("DW2MP_SYNC_EVERY_TICKS"), out var s) ? s : 600;
 
-        log($"# net: role={Role} port={_port} host={_hostAddress} syncEvery={_syncEveryTicks} ticks");
+        log($"# net: role={Role} launcher=127.0.0.1:{_port} syncEvery={_syncEveryTicks} ticks");
 
         // The client drains its queue on the main thread. The host does not need this
         // patch, but installing it in both roles keeps one code path.
@@ -114,7 +128,7 @@ public static class NetSession
 
         InstallCommandRelay(harmony, log);
 
-        var thread = new Thread(Role == NetRole.Host ? HostLoop : ClientLoop)
+        var thread = new Thread(LauncherLoop)
         {
             IsBackground = true,   // must never keep the game alive on exit
             Name = "Dw2Mp.Net",
@@ -372,37 +386,81 @@ public static class NetSession
         }
     }
 
-    // ---------------------------------------------------------------- host
+    // ------------------------------------------------------------- launcher
 
-    private static void HostLoop()
+    /// <summary>
+    /// One connection, to the launcher, on localhost. Both roles do exactly this — the
+    /// difference between host and client is what they SEND, not how they connect.
+    ///
+    /// It retries, because the game takes minutes to load and the launcher may be
+    /// restarted while it does. A single failed connect at startup used to mean no
+    /// networking for the whole session with nothing in the log to explain it.
+    /// </summary>
+    private static void LauncherLoop()
     {
+        for (int attempt = 1; attempt <= 120 && !_connected; attempt++)
+        {
+            try
+            {
+                _peer = new TcpClient();
+                _peer.Connect(_hostAddress, _port);
+                _peer.NoDelay = true;
+                _stream = _peer.GetStream();
+                _connected = true;
+            }
+            catch (SocketException)
+            {
+                if (attempt == 1 || attempt % 20 == 0)
+                    _log($"# net: waiting for the launcher on 127.0.0.1:{_port} (attempt {attempt})");
+                Thread.Sleep(1000);
+            }
+        }
+
+        if (!_connected)
+        {
+            _log("# net: gave up waiting for the launcher — running single-player");
+            return;
+        }
+
         try
         {
-            _listener = new TcpListener(IPAddress.Any, _port);
-            _listener.Start();
-            _log($"# net[host]: listening on {_port}, waiting for a client");
-
-            _peer = _listener.AcceptTcpClient();
-            _peer.NoDelay = true;
-            _stream = _peer.GetStream();
-            _connected = true;
-
-            _log($"# net[host]: client connected from {_peer.Client.RemoteEndPoint}");
+            _log($"# net[{Role}]: connected to launcher on 127.0.0.1:{_port}");
             Send(Msg.Hello, BuildHello());
 
-            // Host reads too, so M4b's command relay has a channel already open.
             while (_connected)
             {
                 var (type, payload) = Receive();
                 if (type is null) break;
 
-                if (type == Msg.Command) InjectCommand(payload);
-                else if (type == Msg.Hello) ReadHello(payload);
-                else _log($"# net[host]: received {type} ({payload.Length:N0}B)");
+                switch (type)
+                {
+                    // Only the client applies state, and only the host injects commands.
+                    // Anything arriving for the wrong role means the peers disagree about
+                    // who is hosting, which is worth saying out loud.
+                    case Msg.FullState when Role == NetRole.Client:
+                    {
+                        byte[] raw = Decompress(payload);
+                        _inbound.Enqueue(raw);
+                        _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued)");
+                        break;
+                    }
+
+                    case Msg.Command when Role == NetRole.Host:
+                        InjectCommand(payload);
+                        break;
+
+                    case Msg.Hello:
+                        ReadHello(payload);
+                        break;
+
+                    default:
+                        _log($"# net[{Role}]: unexpected {type} ({payload.Length:N0}B) — role mismatch?");
+                        break;
+                }
             }
         }
-        catch (Exception ex) { _log("# net[host]: " + ex.GetType().Name + ": " + ex.Message); }
-        finally { _connected = false; _log("# net[host]: disconnected"); }
+        catch (Exception ex) { _log($"# net[{Role}]: " + ex.GetType().Name + ": " + ex.Message); }
+        finally { _connected = false; _log($"# net[{Role}]: disconnected from launcher"); }
     }
 
     /// <summary>
@@ -442,49 +500,6 @@ public static class NetSession
     }
 
     // -------------------------------------------------------------- client
-
-    private static void ClientLoop()
-    {
-        try
-        {
-            _log($"# net[client]: connecting to {_hostAddress}:{_port}");
-
-            _peer = new TcpClient();
-            _peer.Connect(_hostAddress, _port);
-            _peer.NoDelay = true;
-            _stream = _peer.GetStream();
-            _connected = true;
-
-            _log("# net[client]: connected");
-
-            while (_connected)
-            {
-                var (type, payload) = Receive();
-                if (type is null) break;
-
-                if (type == Msg.FullState)
-                {
-                    // Decompress here (background thread) so the main thread only pays
-                    // for deserialise + apply. Queue and let Update drain it.
-                    byte[] raw = Decompress(payload);
-                    _inbound.Enqueue(raw);
-                    _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued)");
-                }
-                else if (type == Msg.Hello)
-                {
-                    ReadHello(payload);
-
-                    // Answer with our own descriptor so the HOST can also detect a
-                    // mismatch. A one-sided check only warns the person who did not
-                    // choose the session.
-                    Send(Msg.Hello, BuildHello());
-                }
-                else _log($"# net[client]: received {type} ({payload.Length:N0}B)");
-            }
-        }
-        catch (Exception ex) { _log("# net[client]: " + ex.GetType().Name + ": " + ex.Message); }
-        finally { _connected = false; _log("# net[client]: disconnected"); }
-    }
 
     /// <summary>
     /// Main-thread pump. Applies at most one state per frame, and drops any backlog:

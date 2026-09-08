@@ -120,3 +120,91 @@ relation tables, and a naive scan finds 418 of them instead of 23.
   variables. Wiring `DW2MP_SESSION` through to `MakeSave`-style generation is the other
   half.
 - Flag selection (races carry `AlternateFlagFilenames`, currently unused).
+
+---
+
+## Phase 1 — transport moved into the launcher (2026-09-08)
+
+Modelled on FAF. Supreme Commander is launched with `/gpgnet 127.0.0.1:59800` and never
+touches the internet itself; the FAF client and its ICE adapter own the network, and the
+game just reports state upward over localhost.
+
+Ours now works the same way:
+
+```
+[DW2 + Dw2Mp] --localhost--> [Dw2MpLobby] --TCP/Steam--> [Dw2MpLobby] <--localhost-- [DW2 + Dw2Mp]
+```
+
+**The mod no longer opens a listening socket or dials a remote address.** It connects to
+`127.0.0.1:47810` and nothing else. `NetSession.LauncherLoop` replaced the separate
+`HostLoop`/`ClientLoop` — both roles connect identically now, and the role only decides
+what they *send*.
+
+Why it is worth the churn:
+
+- NAT traversal, Steam sockets, reconnection and relays can all change **without touching
+  game code**, and without a four-minute game reload to test each attempt.
+- The mod's networking is one localhost connection that cannot fail for interesting reasons.
+- The launcher sees every byte, so it can show connection state and throughput.
+
+`Relay` forwards **whole frames**, reading only the 5-byte header to learn the payload
+length. A byte-for-byte copy would happily split or merge frames and corrupt a galaxy in a
+way that would be very hard to trace back to the relay. It is otherwise ignorant of
+content — a protocol change in the mod needs no change here.
+
+The mod retries its connection for two minutes: the game takes minutes to load and the
+launcher may restart while it does. A single failed connect used to mean no networking for
+the whole session, with nothing in the log to say why.
+
+## Phase 2 — Steam networking: seam built, implementation deferred
+
+`IRemoteTransport` is the seam; `TcpTransport` implements it. `SteamTransport` exists,
+is selectable, and says clearly that it is not available.
+
+**Why it is not implemented rather than half-implemented:** it needs two Steam accounts on
+two machines to verify, and there is an unresolved question about which process should own
+the Steam connection — DW2's process already has Steam initialised with the correct app id,
+whereas the launcher would have to initialise it separately with someone else's app id.
+
+Shipping networking that has never carried a byte is how a feature looks finished and fails
+in someone else's hands. The design is sound: both players own DW2 on Steam, so
+`SteamNetworkingSockets` gives NAT traversal, Valve-hosted relay fallback and peer discovery
+by Steam ID — replacing the single largest piece of infrastructure FAF had to build and host
+(their ICE adapter plus TURN servers). FAF cannot do this because SupCom players are not
+guaranteed to share a platform. We are.
+
+## Client remodel
+
+Four tabs, after the FAF client's shape:
+
+| Tab | State |
+|---|---|
+| **Private** | Working — empire config, host/join, transport, galaxy settings |
+| **Lobby** | Phase 3 placeholder — a disabled game list and an explanation |
+| **Mods** | Lists installed mods and which are enabled |
+| **Log** | Connection status and relay throughput |
+
+A status bar shows game/peer connection state, frame count and MB each way.
+
+### Why a Mods tab now, when we only support vanilla
+
+**Mod mismatch breaks state sync exactly like a version mismatch.** State transfer ships
+DW2's own serialised galaxy, and mods change the data it is built from — components, races,
+governments. Two players with different mods enabled would exchange state that deserialises
+into something subtly or catastrophically wrong.
+
+`ModDetection` reads `mods\<Name>\mod.json` and treats `mods\mods.json`'s `order` array as
+the enabled set — which it is, per `DwModSupport`: `EnableModInternal` appends to it,
+`DisableModInternal` splices out of it. An empty `order` means everything installed is
+**off**, which is easy to misread from the in-game UI. `EnabledFingerprint` sorts the set so
+two players who enabled the same mods in a different order still match.
+
+Vanilla is the supported configuration. This exists so a mismatch is *detected* rather than
+discovered as strange behaviour an hour into a session.
+
+## NOT YET VERIFIED
+
+The Phase 1 refactor **has not been run end to end**. Both projects build and the client
+launches, but no session has yet gone game → launcher → launcher → game. That test needs two
+game instances and about twelve minutes. Until it passes, treat Phase 1 as written but
+unproven — the previously verified path (mod-owned TCP) no longer exists to fall back on.
