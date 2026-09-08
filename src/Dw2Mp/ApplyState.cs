@@ -86,6 +86,72 @@ public static class ApplyState
         log("# apply: armed on DWGame.Update (main thread)");
     }
 
+    /// <summary>The live DWGame, captured from Update. Null until the game has ticked once.</summary>
+    public static object Game => _game;
+
+    /// <summary>Serialise a galaxy to bytes. Used by the host to produce a state sync.</summary>
+    public static byte[] SerialiseGalaxy(object galaxy) => Serialise(galaxy).Bytes;
+
+    /// <summary>
+    /// Adopt a galaxy received from elsewhere. MUST be called on the main game thread —
+    /// StartGameExisting touches the content manager, and M3b died inside
+    /// LoadImagesForFacilities when this ran off-thread.
+    ///
+    /// This is the M3-proven sequence, extracted so the network layer reuses exactly the
+    /// path that was verified rather than a second copy that quietly drifts from it.
+    /// </summary>
+    public static bool ApplyBytes(byte[] raw, out string info)
+    {
+        info = "";
+
+        if (_game is null) { info = "no DWGame captured yet"; return false; }
+        if (_readFromStream is null || _startGameExisting is null) { info = "apply path not resolved"; return false; }
+
+        try
+        {
+            var sw = Stopwatch.StartNew();
+
+            using var input = new MemoryStream(raw, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+
+            var args = new object[_readFromStream.GetParameters().Length];
+            args[0] = reader;
+
+            // Constructor, not GetUninitializedObject: skipping it leaves the collections
+            // it allocates null, which kills StartGameExisting inside asset loading.
+            object target = _readFromStream.IsStatic ? null : NewGalaxy(_readFromStream.DeclaringType);
+
+            var incoming = _readFromStream.Invoke(target, args);
+            if (incoming is null) { info = "ReadFromStream returned null"; return false; }
+
+            double readMs = sw.Elapsed.TotalMilliseconds;
+
+            var incomingData = args.Length > 1 && args[1] is not null
+                ? args[1]
+                : Activator.CreateInstance(_galaxyDataType);
+
+            // A deserialised galaxy carries per-game state but not the static definition
+            // tables that asset loading walks.
+            var copyStatics = AccessTools.Method(incoming.GetType(), "CopyStaticBaseDataToGalaxyInstance");
+            copyStatics?.Invoke(copyStatics.IsStatic ? null : incoming, new[] { incoming });
+
+            sw.Restart();
+            _startGameExisting.Invoke(_game, new[] { incoming, ReadStartTime(incoming), incomingData });
+            double applyMs = sw.Elapsed.TotalMilliseconds;
+
+            _incoming = incoming;
+            var fp = Fingerprint(incoming);
+            info = $"{raw.LongLength:N0}B  read={readMs:N0}ms  apply={applyMs:N0}ms  {fp.Summary}";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            info = $"{cause.GetType().Name}: {cause.Message}";
+            return false;
+        }
+    }
+
     /// <summary>Step 1: keep an early galaxy to send back later.</summary>
     public static void Capture(object galaxy)
     {

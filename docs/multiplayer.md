@@ -514,3 +514,56 @@ foreign galaxy, adopts its contents, and continues simulating.
 
 The apply is nearly free; parsing dominates. Next milestone is transport (M4): loopback
 first, two processes on one machine, relaying `MessagePacket`s and full-state syncs.
+
+---
+
+## M4a — transport, measured 2026-09-07: **WORKING**
+
+`src/Dw2Mp/NetSession.cs` (host/client TCP) plus `src/Dw2MpProbe` (a stub peer).
+
+Host is a real DW2 instance; the probe connects as a client and validates the wire.
+
+```
+host : sync #1 tick=400  raw=39,993,898B packed=9,287,295B serialise=249ms pack=262ms send=4ms
+host : sync #2 tick=800  raw=41,225,825B packed=9,510,650B serialise=316ms pack=284ms send=2ms
+host : sync #3 tick=1200 raw=41,454,100B packed=9,542,733B serialise=289ms pack=246ms send=9ms
+
+probe: FullState #1 packed=9,287,295B raw=39,993,898B ratio=23.2% sha=535BD6AC9087C309
+probe: FullState #2 packed=9,510,650B raw=41,225,825B ratio=23.1% sha=17528919DD762B80
+probe: FullState #3 packed=9,542,733B raw=41,454,100B ratio=23.0% sha=FF0221D92C0D282F
+probe: OK -- received 3 full state(s); framing, compression and host sync all work
+```
+
+Byte counts agree exactly end to end. Raw sizes **grow** across syncs (39.99 → 41.23 →
+41.45 MB), which confirms the host is simulating between them — each state is genuinely
+new, not the same buffer resent.
+
+Send is 2–9 ms on loopback; the real cost is serialise (~250–320 ms) plus compress
+(~250–290 ms), both currently inline on the simulation thread, so **the host visibly
+hitches on every sync**. That is the first thing M4b should fix.
+
+### Why a stub peer instead of two game instances
+
+A DW2 instance reaches a **~15 GB working set** on the late-game save; the machine has
+31.4 GB total and 12.8 GB free. Two instances do not fit. The stub also isolates the
+variable: M3 already proved a client can adopt a galaxy, so what was unproven was
+framing, compression and the host's sync loop — and a stub tests exactly that, so a
+failure has one possible cause.
+
+The two-process test needs a small early-game save (see below).
+
+### Protocol
+
+`[int32 payload length][byte type][payload]`, types `Hello=1 FullState=2 Command=3`.
+Length-prefixed on purpose: a stream protocol that infers message boundaries is a day
+lost to intermittent corruption. `ReadExactly` loops, because one `Read` can return fewer
+bytes than asked for.
+
+Constraints carried from earlier milestones, none optional:
+
+- **Apply runs on the main thread.** The socket reader only enqueues; `DWGame.Update`
+  drains. M3b died in `LoadImagesForFacilities` when this was attempted off-thread.
+- **The pump drops stale states.** With full-state syncs an older snapshot is worthless
+  once a newer one has arrived; applying them in order would stutter through dead worlds.
+- **Both ends need `FixedStep`.** Without it `GameServer.Now` never advances and the host
+  sits inert, resending identical state forever.

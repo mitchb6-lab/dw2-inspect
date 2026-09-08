@@ -95,7 +95,12 @@ public static class Determinism
         if (Env("DW2MP_SEQUENTIAL", "0") == "1")
             Sequential.Install(harmony, Log);
 
-        if (Env("DW2MP_MEASURE_APPLY", "0") == "1")
+        // NetSession reuses the apply path, so install it for either consumer.
+        NetSession.Install(harmony, Log);
+
+        if (MakeSave.Active) MakeSave.Install(harmony, Log);
+
+        if (Env("DW2MP_MEASURE_APPLY", "0") == "1" || NetSession.Active)
             ApplyState.Install(harmony, _writeToStream, _galaxyDataType, Log);
 
         var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
@@ -130,6 +135,11 @@ public static class Determinism
             // sits ABOVE the _finished check on purpose: the two measurements are
             // independent, and coupling them meant a completed snapshot run silently
             // cancelled the apply measurement before it ever armed.
+            if (MakeSave.Active) MakeSave.OnServerCycle();
+
+            // Host: ship a full state every N ticks. No-op in client or offline roles.
+            NetSession.HostTick(galaxy, n);
+
             if (ApplyState.Ready)
             {
                 // Capture early, apply late, then watch. The gap between capture and
