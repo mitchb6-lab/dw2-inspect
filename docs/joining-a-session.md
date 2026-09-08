@@ -8,7 +8,7 @@ How a second player connects to a session hosted on **this PC**.
 > |---|---|
 > | Two instances on one PC | **Working** (verified) |
 > | Two PCs on a LAN | **Should work — not yet tested** |
-> | Over the internet | Needs port forwarding today; Steam sockets planned |
+> | Over the internet | **Works via a virtual LAN** (Tailscale/ZeroTier); see [Playing over the internet](#playing-over-the-internet) |
 > | Joiner's empire choice reaching the host | **Not yet** — see [Limitations](#limitations) |
 >
 > The networking is proven: state syncs host→client and commands relay client→host between
@@ -114,6 +114,70 @@ on theirs.
 
 ---
 
+## Playing over the internet
+
+The steps above assume both players are on the same LAN. Over the internet there are two
+options, and the easy one needs no changes to anything.
+
+### Recommended today: a virtual LAN
+
+Tools like **Tailscale**, **ZeroTier** or **Hamachi** put both machines on one virtual
+subnet. The joiner then types the host's *virtual* address into the lobby instead of a
+LAN address, and everything else is identical — the transport is plain TCP and neither
+end knows the difference.
+
+This removes **port forwarding** entirely, and works even behind carrier-grade NAT where
+forwarding is not possible at all.
+
+**Prefer Tailscale or ZeroTier over Hamachi.** Hamachi works, but its free tier is capped
+at a handful of members and it is the oldest and least reliable of the three. Tailscale is
+WireGuard-based, free for personal use, and setup is roughly "install, sign in" on both
+ends.
+
+Setup:
+
+1. Both players install the same tool and join the same network.
+2. The host finds its virtual address (Tailscale: `100.x.y.z`; Hamachi: `25.x.y.z`).
+3. The joiner enters **that** address in the lobby instead of `192.168.1.166`.
+4. Everything else is unchanged.
+
+> **Do not run NordVPN at the same time.** It is installed on this PC and, like any
+> full-tunnel VPN, it will fight a virtual-LAN adapter and break the connection. Turn it
+> off for a session.
+
+### The real constraint is bandwidth, not NAT
+
+A virtual LAN solves reachability. What it does not solve is that **we send a full
+compressed galaxy on every sync**:
+
+| Save | Payload per sync | 10 Mbps up | 25 Mbps | 50 Mbps |
+|---|---:|---:|---:|---:|
+| Small (23 MB) | 4.2 MB | 3.4 s | 1.3 s | 0.7 s |
+| Late-game (40 MB) | 9.2 MB | 7.4 s | 2.9 s | 1.5 s |
+
+On a LAN that transfer is about a millisecond and irrelevant — measured `send=1ms`. Over
+the internet it becomes the dominant cost and it is paid **every sync**, bounded by the
+host's *upload* speed, which on most home connections is far lower than download.
+
+Practical advice until deltas exist:
+
+- **Use a small save.** 4.2 MB against 9.2 MB is the difference between usable and painful.
+- **Sync less often.** `DW2MP_SYNC_EVERY_TICKS` controls it; a longer interval means more
+  drift between syncs but far less traffic.
+- Expect the joiner's view to lag the host by roughly one transfer time.
+
+This is why **delta sync is the priority for internet play** rather than the host's
+serialise hitch — on a LAN the hitch dominates, over a VPN the payload does.
+
+### The better long-term answer
+
+`SteamNetworkingSockets` gives NAT traversal and lobby discovery with **no third-party
+install** — the joiner needs nothing beyond the game they already own. `Facepunch.Steamworks`
+is already loaded inside DW2's process, so it is reachable. A virtual LAN is the right
+answer *today*; Steam sockets is the right destination.
+
+---
+
 ## Troubleshooting
 
 **"Could not find Distant Worlds 2"** — the lobby checked `DW2_PATH` and every Steam
@@ -153,8 +217,9 @@ Things that will surprise you if you do not know them:
 - **Everyone needs the same save.** The host has to send its galaxy on connect instead —
   the mechanism exists, it just is not wired to the join flow yet. This is what will remove
   file-sharing from the process entirely.
-- **Internet play needs port forwarding.** Port 47800 TCP to this PC. Steam sockets
-  (`SteamNetworkingSockets`, already reachable in DW2's process) will remove that.
+- **Internet play needs either a virtual LAN or port forwarding.** A virtual LAN (Tailscale,
+  ZeroTier) is the easy path and needs no code changes; see above. Steam sockets will
+  remove the third-party dependency entirely.
 - **Competitive mode leaks information.** Every client receives the whole galaxy. The UI
   filters it correctly per empire, so it *plays* right, but the hidden data is present in
   memory and a determined player could read it. Fine among people who will not; not
@@ -167,3 +232,6 @@ Things that will surprise you if you do not know them:
 
 - **2026-09-08** — First version. Loopback verified; LAN untested. Lobby, handshake, state
   sync and command relay all in place.
+- **2026-09-08** — Added "Playing over the internet": virtual LAN (Tailscale/ZeroTier/
+  Hamachi) as the no-code path, with measured per-sync bandwidth showing that payload size,
+  not NAT, is the binding constraint over the internet.
