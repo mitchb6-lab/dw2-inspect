@@ -88,6 +88,9 @@ public static class Determinism
         // the first cycle runs, or snapshot 0 is taken under different rules to the rest.
         FixedStep.Install(harmony, StepMilliseconds, PinBlocks, () => Interlocked.Read(ref _cycleCount), Log);
 
+        if (Env("DW2MP_SEQUENTIAL", "0") == "1")
+            Sequential.Install(harmony, Log);
+
         var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
         harmony.Patch(target, new HarmonyMethod(prefix));
         Log($"# patched {serverType.Name}.{target.Name}");

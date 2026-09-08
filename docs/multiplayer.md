@@ -281,3 +281,40 @@ Desync detection, reconnection, pause/speed negotiation, and the UI to start and
   distribution is a launcher or a documented flag, not Steam Workshop.
 - **Every claim in this document is checkable** with `dw2inspect`. Where it says
   "implemented", that means real IL was read, not inferred from a signature.
+
+#### M2c RESULT — single-threaded, measured 2026-09-07: **still not deterministic**
+
+Same save, fixed timestep, pinned block sizes, plus every `TaskHelper` parallelism knob
+forced to 1 (`BackgroundTasks`, `ForegroundTasks`, `PriorityLocations`,
+`ExclusiveLoading`, and the three integer degree properties).
+
+| tick | size Δ | differing bytes | first diff |
+|---:|---:|---:|---:|
+| 1 | 0 | **0** | none |
+| 501 | −16,496 | 9,129,550 | 7,634 |
+| 1001 | −16,547 | 13,646,145 | 7,635 |
+
+**Tick 1 is byte-identical across 39.3 MB.** That is worth stating: it confirms the
+earlier tick-1 differences were lazy caches, and it validates the harness — when two
+states genuinely match, this measurement reports exactly zero.
+
+**And the simulation still diverges within 500 ticks.** Three interventions — fixed
+timestep, frozen work partitioning, single-threaded execution — are not sufficient.
+
+Two candidates remain, and neither is cheap:
+
+1. **Residual concurrency.** `MaxDegreeOfParallelism = 1` governs `Parallel.For` and
+   `ParallelWhile`, but `UpdateGameAsClient` also calls `Task.Run` directly and hands
+   the result to `Galaxy.AddTask`. Those still run concurrently. Fully serialising would
+   mean intercepting every task spawn in the simulation.
+2. **Hash-order-dependent iteration.** .NET `Dictionary`/`HashSet` enumeration order
+   depends on hash codes, and any type using the default reference hash code varies run
+   to run with memory layout. That produces exactly this signature: identical at load,
+   massively divergent the moment iteration happens. It is also effectively unfixable
+   from outside — it would mean auditing every collection iteration across 650 types
+   whose method bodies are encrypted at rest.
+
+**Assessment.** Three cheap interventions have each been necessary and none sufficient.
+What remains is not modding: it is reimplementing DW2's simulation scheduler and
+collection iteration order against an obfuscated binary. Lockstep should be treated as
+closed unless new evidence appears.
