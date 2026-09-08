@@ -455,7 +455,10 @@ evening's runs, in two families (`docs/crashdumps/`):
   pseudo-empire that has none of the backing data.
 - 67 × `IndexOutOfRangeException` in `Colony.CalculateCorruption` →
   `FindNearestCapitalByCorruptionReductionRatio` → `SystemPathTimeSet.GetPathTimesForSystem`
-  — corruption pathing against an empire with no capital.
+  — **NOT this bug.** These are the galaxy swap, they are still open, and they were
+  briefly and wrongly filed under `Independent` here. A single instance playing a correct
+  empire with no state apply produced zero dumps in 58,000 cycles; a two-instance run
+  doing a swap produced 518. See `multiplayer.md`.
 
 **DW2 swallows these**: it writes a dump and carries on, so runs continued for 40,000
 cycles while quietly emitting thousands of dumps a minute. Nothing in the mod's own log

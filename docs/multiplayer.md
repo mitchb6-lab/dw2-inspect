@@ -753,21 +753,38 @@ are a galaxy swap leaving derived path caches keyed to the previous galaxy's sha
 synthesised `FixedStep` clock confusing a `starDate`-based cache. Worth chasing before
 either mode ships, because it points at derived state that a state-swap does not rebuild.
 
-> **CAUSE FOUND, 2026-09-08 — neither candidate above was right.** These are the
-> `Independent` pseudo-empire being promoted to the player empire. `EnsurePlayerEmpire`
-> promoted `Galaxy.Empires[0]`, and index 0 is always `Independent` (`DominantRaceId=255`,
-> `GovernmentId=-1`), so DW2 ran full empire task processing against an empire with no
-> capital and no backing data. `FindNearestCapitalByCorruptionReductionRatio` then indexed
-> an empty capital list. The same root cause produced 17,619 `NullReferenceException`s in
-> `DoTasksIndependentEmpire`, `GetScientistsAtResearchStations` and
-> `CalculateResearchPointsMaximum`. Nothing to do with galaxy swapping or the `FixedStep`
-> clock. Fixed by making promotion skip non-playable empires; full write-up and dump
-> samples in `lobby.md` and `docs/crashdumps/`.
+> **~~CAUSE FOUND, 2026-09-08 — neither candidate above was right.~~ That claim was
+> WRONG and is struck the same day. Corrected below.**
 >
-> It also raises the stakes on the process note below: **DW2 swallows these exceptions**,
-> writing a dump and continuing, so a run can look healthy in our log while emitting
-> thousands of dumps a minute. At ~17.7k accumulated dumps the game stopped launching
-> altogether.
+> The wrong version said these pathing exceptions were the `Independent` pseudo-empire
+> being promoted to the player empire, and that galaxy swapping had nothing to do with it.
+> Two exception families were being conflated, and only one of them is `Independent`'s:
+>
+> | Family | Real cause |
+> |---|---|
+> | 17,619 × `NullReferenceException` in `DoTasksIndependentEmpire`, `GetScientistsAtResearchStations`, `CalculateResearchPointsMaximum` | `Independent` promoted to player. Fixed — see `lobby.md`. |
+> | `IndexOutOfRangeException` in `SystemPathTimeSet.GetPathTimesForSystem` (67 that night, 518 in the 2026-09-08 two-instance run) | **The galaxy swap — the first candidate above, which was right.** |
+>
+> **What separates them, measured 2026-09-08.** A single instance playing a correctly
+> chosen empire, with no state apply, ran 58,000 cycles and produced **zero** dumps. The
+> two-instance run, where both sides perform a `StartGameExisting` galaxy swap at cycle
+> 1600, produced **518** — 407 of them `Colony.CalculateCorruption` →
+> `FindNearestCapitalByCorruptionReductionRatio` → `GetPathTimesForSystem`. The swap is
+> the variable.
+>
+> So the original reading stands: **a state swap leaves derived path caches keyed to the
+> previous galaxy's shape.** That matters much more than the `Independent` bug did,
+> because the swap *is* the multiplayer mechanism — this is not a bug beside the design,
+> it is a bug inside it. It is the next thing to fix.
+>
+> **Why the wrong conclusion was reached.** Both families were sitting in one directory of
+> 17,686 dumps, the `Independent` bug explained the overwhelming majority of them, and the
+> minority family was assumed to be more of the same rather than counted separately. The
+> `at` frames were grouped, the *exception types* were not cross-referenced against them.
+> A 99%-correct explanation absorbed the 1% that disproved it.
+>
+> **DW2 swallows all of these** — dump and continue — so a run looks healthy in our own log
+> while emitting them. At ~17.7k accumulated dumps the game stopped launching altogether.
 
 **Process note:** M4 was reported as working on the strength of our own log without
 checking the game's own `SessionLog.txt`. That was the right result but an incomplete
@@ -909,3 +926,49 @@ built to work around an unset flag; it is retained only for the solo/no-session 
   because the host generated it, not because the client contributed anything at
   generation time. That is correct for host-authoritative and worth stating plainly.
 - **No cross-machine run yet.** Everything above is two processes on one PC.
+
+---
+
+## Two instances, session-driven, each playing its own empire — 2026-09-08
+
+First run of the whole chain: lobby session → host generates the agreed galaxy → client
+joins → each side drives its own empire. Host slot 0, client slot 1, relay between them.
+
+**What worked.**
+
+```
+HOST    # player: slot 0 drives 'Terran Union' (GetPlayer patched)
+CLIENT  # player: slot 1 drives 'Ackdarian Compact' (GetPlayer patched)
+CLIENT  # player: GetPlayer -> 'Ackdarian Compact' at index 3 (was 'Terran Union')
+CLIENT  # net: handshake OK — protocol and game version match
+CLIENT  # net[client]: state received packed=4,364,374B raw=24,108,073B
+```
+
+Per-side perspective holds in a real two-process run, and the host's state crosses the
+relay at the expected size. Both sides generated their configured empires.
+
+**Three defects, in priority order.**
+
+1. **The client's real apply failed: `no DWGame captured yet`.** The host sent sync #1 at
+   tick 1200 before the client had a `DWGame` to adopt into, so the frame was queued and
+   then dropped. The client spent the rest of the run in its *own* throwaway galaxy —
+   which is not the host's: 10 empires against the host's 11, and different auto-generated
+   names from the same seed 4242. Two people in two universes, which is the one thing this
+   whole design exists to prevent. **This is the next thing to fix**: the client must not
+   discard a state frame that arrives before it is ready, and the host should not sync
+   until the client says it can adopt.
+
+2. **The self-apply measurement runs during a live session.** `Determinism.cs` installs
+   `ApplyState` when `NetSession.Active`, and `ApplyState` then performs its own M3b
+   capture-and-reapply at cycle 1600 — on *both* sides. That is a galaxy swap nobody
+   asked for in the middle of a networked run, and it is what produced the 518 pathing
+   exceptions. The measurement and the transport need separating.
+
+3. **Same seed, different galaxies.** Host and client generated 11 and 10 empires from
+   seed 4242. Harmless today because the client's galaxy is meant to be overwritten — but
+   it means the seed is *not* by itself a shared input, so nothing should ever be assumed
+   to match across the two without a sync.
+
+**The relay stopped at 3 frames** with `game=False` on both ends afterwards, which is
+consistent with the games dropping their local sockets after the failed apply. Worth
+re-checking once (1) is fixed rather than chasing separately.
