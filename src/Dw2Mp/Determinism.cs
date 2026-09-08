@@ -138,6 +138,9 @@ public static class Determinism
             if (MakeSave.Active) MakeSave.OnServerCycle();
 
             // Host: ship a full state every N ticks. No-op in client or offline roles.
+            // __instance is the GameServer; the host needs it to inject relayed commands
+            // into InputQueue.
+            NetSession.SetServer(__instance);
             NetSession.HostTick(galaxy, n);
 
             if (ApplyState.Ready)

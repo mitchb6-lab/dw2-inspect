@@ -65,6 +65,28 @@ public static class NetSession
     private static int _syncsApplied;
     private static volatile bool _connected;
 
+    // --- M4b command relay ---
+    private static object _server;              // host: the live GameServer
+    private static Type _messagePacketType;
+    private static MethodInfo _packetWrite;
+    private static MethodInfo _packetRead;
+    private static FieldInfo _packetSerial;
+    private static FieldInfo _packetTasks;
+    private static FieldInfo _serverInputQueue;
+    private static int _commandsSent;
+    private static int _commandsInjected;
+
+    private static long _sendCalls;
+    private static long _sendCallsWithTasks;
+
+    /// <summary>Relay an occasional empty packet so the path is testable without a player.</summary>
+    private static bool RelayHeartbeat => Environment.GetEnvironmentVariable("DW2MP_RELAY_HEARTBEAT") == "1";
+
+    private const long HeartbeatEvery = 1500;
+
+    /// <summary>Host: remember the GameServer so relayed commands can be injected.</summary>
+    public static void SetServer(object server) => _server ??= server;
+
     public static void Install(Harmony harmony, Action<string> log)
     {
         _log = log;
@@ -90,12 +112,152 @@ public static class NetSession
         }
         else log("# net: DWGame.Update not found; client cannot apply state");
 
+        InstallCommandRelay(harmony, log);
+
         var thread = new Thread(Role == NetRole.Host ? HostLoop : ClientLoop)
         {
             IsBackground = true,   // must never keep the game alive on exit
             Name = "Dw2Mp.Net",
         };
         thread.Start();
+    }
+
+    // ------------------------------------------------------- command relay
+
+    /// <summary>
+    /// M4b. The client forwards its player commands to the host, which injects them into
+    /// its own GameServer.InputQueue — the same queue the host's own client writes to in
+    /// single-player. No new command format is invented: MessagePacket already has real
+    /// ReadFromStream/WriteToStream (M0), so the game's own wire format is the protocol.
+    ///
+    /// Injection does NOT need the main thread. InputQueue is a
+    /// ConcurrentDictionary&lt;int, MessagePacket&gt; and the server drains it, so a
+    /// background thread may add to it safely — unlike state apply, which does.
+    /// </summary>
+    private static void InstallCommandRelay(Harmony harmony, Action<string> log)
+    {
+        _messagePacketType = AccessTools.TypeByName("DistantWorlds.Types.MessagePacket");
+        var clientType = AccessTools.TypeByName("DistantWorlds.Types.GameClient");
+        var serverType = AccessTools.TypeByName("DistantWorlds.Types.GameServer");
+
+        if (_messagePacketType is null || clientType is null || serverType is null)
+        {
+            log("# net: command relay unavailable (types not found)");
+            return;
+        }
+
+        _packetWrite = AccessTools.Method(_messagePacketType, "WriteToStream");
+        _packetRead = AccessTools.Method(_messagePacketType, "ReadFromStream");
+        _packetSerial = AccessTools.Field(_messagePacketType, "SerialNumber");
+        _packetTasks = AccessTools.Field(_messagePacketType, "GameTasks");
+        _serverInputQueue = AccessTools.Field(serverType, "InputQueue");
+
+        if (_packetWrite is null || _packetRead is null || _serverInputQueue is null)
+        {
+            log("# net: command relay unavailable (MessagePacket/InputQueue members not found)");
+            return;
+        }
+
+        if (Role != NetRole.Client) { log("# net: command relay ready (host side)"); return; }
+
+        // Client only: mirror every outgoing packet to the host.
+        var send = AccessTools.Method(clientType, "SendMessageToServer");
+        if (send is null) { log("# net: GameClient.SendMessageToServer not found"); return; }
+
+        harmony.Patch(send, postfix: new HarmonyMethod(typeof(NetSession).GetMethod(
+            nameof(OnClientSendMessage), BindingFlags.NonPublic | BindingFlags.Static)));
+
+        log("# net: command relay armed on GameClient.SendMessageToServer");
+    }
+
+    /// <summary>
+    /// Postfix, not prefix: the local call still runs, so the client executes its own
+    /// command immediately and the host's next sync corrects it. That is client-side
+    /// prediction, and it is free here because the client's state is overwritten anyway.
+    /// </summary>
+    private static void OnClientSendMessage(object[] __args)
+    {
+        if (Role != NetRole.Client || !_connected) return;
+
+        try
+        {
+            var packet = __args is { Length: > 0 } ? __args[0] : null;
+            if (packet is null) return;
+
+            int tasks = CountTasks(packet);
+            long calls = Interlocked.Increment(ref _sendCalls);
+            if (tasks > 0) Interlocked.Increment(ref _sendCallsWithTasks);
+
+            // Heartbeat. "No relay activity" is otherwise ambiguous between the method
+            // never being called and it being called with nothing to relay — and those
+            // need completely different responses.
+            if (calls == 1 || calls % 2000 == 0)
+                _log($"# net[client]: SendMessageToServer calls={calls} withTasks={_sendCallsWithTasks}");
+
+            // Normally only packets carrying player intent are worth relaying;
+            // SendMessageToServer runs every cycle carrying timing data. But with nobody
+            // playing the client, no task-bearing packet is ever produced, so an occasional
+            // empty one is relayed to prove the path end to end.
+            bool heartbeat = RelayHeartbeat && tasks == 0 && calls % HeartbeatEvery == 0;
+            if (tasks == 0 && !heartbeat) return;
+
+            using var buffer = new MemoryStream();
+            using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                _packetWrite.Invoke(packet, new object[] { writer });
+                writer.Flush();
+            }
+
+            Send(Msg.Command, buffer.ToArray());
+            _commandsSent++;
+            _log($"# net[client]: relayed packet #{_commandsSent} ({buffer.Length:N0}B, {tasks} task(s){(heartbeat ? ", heartbeat" : "")})");
+        }
+        catch (Exception ex) { _log("# net[client]: command relay failed " + ex.GetType().Name + ": " + ex.Message); }
+    }
+
+    private static int CountTasks(object packet)
+    {
+        try
+        {
+            var tasks = _packetTasks?.GetValue(packet);
+            if (tasks is null) return 0;
+            return tasks.GetType().GetProperty("Count")?.GetValue(tasks) is int c ? c : 0;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>Host: turn received bytes back into a MessagePacket and queue it.</summary>
+    private static void InjectCommand(byte[] payload)
+    {
+        if (_server is null) { _log("# net[host]: command arrived before the server was captured; dropped"); return; }
+
+        try
+        {
+            var packet = Activator.CreateInstance(_messagePacketType);
+
+            using var input = new MemoryStream(payload, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+            _packetRead.Invoke(packet, new object[] { reader });
+
+            var queue = _serverInputQueue.GetValue(_server);
+            if (queue is null) { _log("# net[host]: server InputQueue is null"); return; }
+
+            int serial = _packetSerial?.GetValue(packet) is int s ? s : Environment.TickCount;
+
+            var tryAdd = queue.GetType().GetMethod("TryAdd", new[] { typeof(int), _messagePacketType });
+            if (tryAdd is null) { _log("# net[host]: InputQueue has no TryAdd(int, MessagePacket)"); return; }
+
+            bool added = tryAdd.Invoke(queue, new[] { (object)serial, packet }) is true;
+            _commandsInjected++;
+
+            _log($"# net[host]: INJECTED command #{_commandsInjected} serial={serial} " +
+                 $"tasks={CountTasks(packet)} added={added}");
+        }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            _log("# net[host]: command inject failed " + cause.GetType().Name + ": " + cause.Message);
+        }
     }
 
     // ---------------------------------------------------------------- host
@@ -121,7 +283,9 @@ public static class NetSession
             {
                 var (type, payload) = Receive();
                 if (type is null) break;
-                _log($"# net[host]: received {type} ({payload.Length:N0}B)");
+
+                if (type == Msg.Command) InjectCommand(payload);
+                else _log($"# net[host]: received {type} ({payload.Length:N0}B)");
             }
         }
         catch (Exception ex) { _log("# net[host]: " + ex.GetType().Name + ": " + ex.Message); }

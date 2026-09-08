@@ -650,3 +650,54 @@ Memory: **3.5 GB per instance** on the small save against ~15 GB on the late-gam
   small early-game galaxy over ~7 game-minutes, but it means this run did not exercise
   heavy state change. A busier galaxy would be a better stress test.
 - The 732 → 731 round-trip fidelity gap from M3c has not been investigated.
+
+---
+
+## Target: BOTH co-op and competitive (decided 2026-09-08)
+
+Two modes are in scope, and they have very different requirements.
+
+### Co-op — reachable from where we are
+
+Players share a universe and may share or divide control. Full-state sync is *adequate*:
+everyone seeing everything is not a problem when everyone is on the same side.
+
+Needs: session setup, command relay (M4b), and a join flow. All within reach.
+
+### Competitive, separate empires — needs one thing we do not have
+
+Each player drives their own empire against the others. Two pieces:
+
+**1. Per-player empire assignment — SOLVED IN PRINCIPLE.** `StartGameExisting` resolves
+the player through `Galaxy.Empires.GetPlayer()` (first `Empire` with `IsPlayer`) and then
+binds the entire UI to it via `DWControl.BindGalaxy(Galaxy, Empire)` and
+`CheckBindUserInterfaceControls(Galaxy, Empire)`. A prefix that clears `IsPlayer`
+everywhere and sets it on *this client's assigned empire id* makes that client play that
+empire — UI, selection, orders, all of it. `GameClient.PlayerEmpireId` is set to match.
+
+The mechanism is already proven: `MakeSave.EnsurePlayerEmpire` flips `IsPlayer` before the
+bind and the game accepts it. Only the empire *choice* changes.
+
+**2. Per-empire state filtering — NOT SOLVED, and it is the real work.**
+
+Full-state sync ships the entire galaxy: every empire's fleets, research, colonies and
+intentions. A client adopting it holds all of that in memory. No UI hiding fixes it —
+the data is simply there. **For competitive play that is total information disclosure.**
+
+Fixing it means producing a per-recipient view of the galaxy before serialising, and
+`Galaxy.WriteToStream` writes everything. That is a per-empire projection of the whole
+data model — comparable in scale to the problem that closed the lockstep route.
+
+Options, none cheap:
+- **Filter before send.** Build a redacted `Galaxy` per recipient (strip other empires'
+  hidden state), serialise that. Needs to know exactly what DW2 considers visible, and
+  must not break the client's simulation by removing something it needs.
+- **Reuse the game's own fog model.** DW2 already computes what each empire knows; if that
+  knowledge is represented as data rather than derived at render time, filtering could
+  lean on it. Unknown — needs investigation.
+- **Accept it for now.** Ship co-op first, treat competitive as a later milestone gated on
+  this. Honest, and it keeps the working thing working.
+
+**Recommendation: build co-op first on the current foundation, and investigate DW2's fog
+representation in parallel** — that investigation decides whether competitive is a
+milestone or a rewrite, and it costs nothing but reading code.
