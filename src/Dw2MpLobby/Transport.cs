@@ -69,6 +69,39 @@ public sealed class TcpTransport : IRemoteTransport
 }
 
 /// <summary>
+/// Wraps a connection that is ALREADY established — the lobby's peer socket, handed to the
+/// relay once the session starts.
+///
+/// Reconnecting after the lobby handshake would mean a second listen/dial cycle with a race
+/// between the two launchers, for no benefit: the peers are connected and already agree on
+/// the session.
+/// </summary>
+public sealed class ExistingStreamTransport : IRemoteTransport
+{
+    private readonly TcpClient _client;
+
+    public ExistingStreamTransport(TcpClient client, Stream stream)
+    {
+        _client = client;
+        Stream = stream;
+    }
+
+    public string Describe => "Lobby connection (already established)";
+
+    public bool Connected => _client?.Connected == true;
+
+    public Stream Stream { get; }
+
+    // Already connected: both are no-ops rather than errors, so the relay needs no special
+    // case for "this transport skips the connect phase".
+    public Task ListenAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public Task ConnectAsync(string address, CancellationToken ct) => Task.CompletedTask;
+
+    public void Dispose() => _client?.Dispose();
+}
+
+/// <summary>
 /// PHASE 2 — Steam networking. Deliberately NOT implemented, and the reason matters.
 ///
 /// The design is sound and the pieces exist: both players own DW2 on Steam, so

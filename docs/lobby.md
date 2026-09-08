@@ -230,3 +230,55 @@ adds no measurable overhead on loopback.
 One limitation the test exposed and FIXED: the launcher hardcoded local port 47810, so two
 launchers on one machine would collide. It now asks the OS for a free loopback port per
 instance and passes it to the game as `DW2MP_LOCAL_PORT`.
+
+---
+
+## Slot exchange — VERIFIED 2026-09-08
+
+The gap that made empire customisation decoration is closed. Both players now agree a
+session **before either game starts**, which is the only order that can work: a galaxy
+generated before the joiner's choices arrive cannot contain their empire.
+
+```
+[HOST  ] Lobby open on port 47900. Waiting for a player to join...
+[CLIENT] Connected to 127.0.0.1:47900. Sending your empire...
+[HOST  ] Friend joined as "Ackdarian Compact" (slot 1).
+[CLIENT] Session received: 2 player(s), mode coop-shared, you are slot 1.
+
+HOST's view                                   CLIENT's view
+  slot 0: Mitch  — "Terran Union"      race=0   slot 0: Mitch  — "Terran Union"      race=0
+  slot 1: Friend — "Ackdarian Compact" race=1   slot 1: Friend — "Ackdarian Compact" race=1
+  mySlot=0                                      mySlot=1
+
+RESULT: PASS — empires exchanged, slots assigned, start delivered
+```
+
+Both sides hold an identical descriptor differing **only in `mySlot`**, which is what lets
+each machine know which empire is its own without either side guessing.
+
+### Design notes
+
+- **The host owns slot numbering.** A client asking for a slot must not be able to
+  overwrite the host's own empire, so the host assigns `Players.Count` and echoes the
+  agreed session back.
+- **The lobby connection is reused as the relay's transport** (`ExistingStreamTransport`).
+  Reconnecting after the handshake would mean a second listen/dial cycle with a race
+  between the two launchers, for no benefit — the peers are connected and already agree.
+- **The lobby stops reading when it hands over.** Two readers on one socket would each
+  consume half the other's frames.
+- Framing matches the game protocol exactly, so the codebase has one framing convention
+  rather than two subtly different ones.
+
+### Flow in the UI
+
+1. Both players configure an empire.
+2. Host clicks **Open lobby**; joiner enters the address and clicks **Connect to host**.
+3. Both see the player list fill in with names, empires, races and governments.
+4. Host clicks **Start session** — enabled only once someone has actually joined.
+5. Both launch, and the already-open connection becomes the relay.
+
+### Still to do
+
+The mod does not yet read `session.json`, so the agreed empires do not yet shape the
+generated galaxy. `MakeSave` already proves that path works — it builds `GameStartSettings`
+with per-empire configuration and generates a galaxy — so this is wiring, not discovery.

@@ -43,7 +43,9 @@ public sealed class LobbyForm : Form
     private readonly NumericUpDown _aiEmpires = new() { Minimum = 0, Maximum = 20, Value = 4 };
     private readonly NumericUpDown _seed = new() { Minimum = 0, Maximum = 999999, Value = 12345 };
 
-    private readonly Button _launch = new() { Text = "Host and launch", Height = 36 };
+    private readonly Button _openLobby = new() { Text = "Open lobby", Height = 32 };
+    private readonly ListBox _playerList = new() { Height = 76 };
+    private readonly Button _launch = new() { Text = "Start session", Height = 36, Enabled = false };
     private readonly TextBox _log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly ListBox _modList = new();
     private readonly Label _modSummary = new() { AutoSize = true };
@@ -53,6 +55,7 @@ public sealed class LobbyForm : Form
     private List<LocalAddress> _localAddresses = new();
     private Color _empireColour = Color.SteelBlue;
     private Relay _relay;
+    private LobbySession _lobby;
     private readonly System.Windows.Forms.Timer _statusTimer = new() { Interval = 1000 };
 
     /// <summary>
@@ -149,9 +152,18 @@ public sealed class LobbyForm : Form
             ("AI empires", _aiEmpires),
             ("Seed", _seed))));
 
-        root.Controls.Add(_launch);
+        root.Controls.Add(Section("Players", Stack2(_openLobby, _playerList, _launch)));
         page.Controls.Add(root);
         return page;
+    }
+
+    /// <summary>Vertical stack that fills width — for the players panel.</summary>
+    private static Control Stack2(params Control[] controls)
+    {
+        var panel = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Top };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        foreach (var c in controls) { c.Dock = DockStyle.Top; panel.Controls.Add(c); }
+        return panel;
     }
 
     /// <summary>
@@ -272,12 +284,13 @@ public sealed class LobbyForm : Form
         };
 
         _roleHost.CheckedChanged += (_, _) => UpdateRoleEnabled();
-        _launch.Click += (_, _) => Launch();
+        _openLobby.Click += async (_, _) => await OpenLobby();
+        _launch.Click += (_, _) => StartSession();
 
         _statusTimer.Tick += (_, _) => UpdateStatus();
         _statusTimer.Start();
 
-        FormClosing += (_, _) => _relay?.Dispose();
+        FormClosing += (_, _) => { _relay?.Dispose(); _lobby?.Dispose(); };
 
         SetColour(_races.FirstOrDefault()?.DefaultColor ?? Color.SteelBlue);
         UpdateRoleEnabled();
@@ -326,7 +339,7 @@ public sealed class LobbyForm : Form
         _mode.Enabled = host;
         _myAddress.Enabled = _copyAddress.Enabled = host;
         _address.Enabled = _testConnection.Enabled = !host;
-        _launch.Text = host ? "Host and launch" : "Join and launch";
+        _openLobby.Text = host ? "Open lobby" : "Connect to host";
     }
 
     private void UpdateStatus()
@@ -350,21 +363,91 @@ public sealed class LobbyForm : Form
 
     // ------------------------------------------------------------- launch
 
-    private void Launch()
+    /// <summary>
+    /// Stage one: negotiate. Both players configure an empire and agree a session BEFORE
+    /// either game starts — which is the whole point, since a galaxy generated before the
+    /// joiner's choices arrive cannot contain their empire.
+    /// </summary>
+    private async Task OpenLobby()
     {
         try
         {
-            var session = BuildSession();
-            session.Save();
-            Log($"Wrote {SessionDescriptor.DefaultPath}");
+            _openLobby.Enabled = false;
+            _lobby = new LobbySession((int)_port.Value, Log);
+            _lobby.SessionChanged += () => BeginInvoke(RefreshPlayerList);
 
-            // The relay must be listening BEFORE the game starts, or the mod's first
-            // connection attempts fail. It retries, but starting in the right order keeps
-            // the log clean and the failure modes few.
+            if (_roleHost.Checked)
+            {
+                // The host's own slot is slot 0 and exists before anyone joins.
+                await _lobby.HostAsync(BuildSession(), CancellationToken.None);
+            }
+            else
+            {
+                _lobby.StartRequested += () => BeginInvoke(() => LaunchAgreedSession());
+                await _lobby.JoinAsync(_address.Text.Trim(), BuildSession().Players[0], CancellationToken.None);
+            }
+
+            RefreshPlayerList();
+        }
+        catch (Exception ex)
+        {
+            _openLobby.Enabled = true;
+            Log("Lobby failed: " + ex.Message);
+            MessageBox.Show(this, ex.Message, "Lobby failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void RefreshPlayerList()
+    {
+        _playerList.Items.Clear();
+
+        var session = _lobby?.Session;
+        if (session is null) return;
+
+        foreach (var p in session.Players)
+        {
+            var race = _races.FirstOrDefault(r => r.Id == p.Empire.RaceId)?.Name ?? $"race {p.Empire.RaceId}";
+            var gov = _governments.FirstOrDefault(g => g.Id == p.Empire.GovernmentId)?.Name ?? "";
+            var me = p.Slot == session.MySlot ? "  <- you" : "";
+            _playerList.Items.Add($"{p.Slot}: {p.Name} — \"{p.Empire.Name}\" ({race}, {gov}){me}");
+        }
+
+        // Only the host starts, and only with someone to play with.
+        _launch.Enabled = _lobby.IsHost && session.Players.Count > 1;
+        _launch.Text = _lobby.IsHost
+            ? (session.Players.Count > 1 ? "Start session" : "Waiting for a player...")
+            : "Waiting for the host to start...";
+    }
+
+    /// <summary>Stage two: host presses Start. Both sides launch from the same descriptor.</summary>
+    private async void StartSession()
+    {
+        try
+        {
+            _launch.Enabled = false;
+            await _lobby.StartAsync();
+            LaunchAgreedSession();
+        }
+        catch (Exception ex)
+        {
+            Log("Start failed: " + ex.Message);
+        }
+    }
+
+    private void LaunchAgreedSession()
+    {
+        try
+        {
+            var session = _lobby.Session ?? BuildSession();
+            session.Save();
+            Log($"Wrote {SessionDescriptor.DefaultPath} (slot {session.MySlot} of {session.Players.Count})");
+
+            // Reuse the lobby's connection rather than reconnecting: the peers are already
+            // linked and already agree, and a second listen/dial cycle would race.
             _relay = new Relay(
                 _localGamePort,
-                new TcpTransport((int)_port.Value),
-                _roleHost.Checked,
+                _lobby.HandOverTransport(),
+                _lobby.IsHost,
                 _address.Text.Trim(),
                 Log);
 
@@ -372,11 +455,9 @@ public sealed class LobbyForm : Form
 
             StartGame(session);
             _launch.Enabled = false;
+            _openLobby.Enabled = false;
 
-            Log("Launched. The game connects back to this launcher on 127.0.0.1:" + _localGamePort + ".");
-            Log(_roleHost.Checked
-                ? "Tell the other player to join once you are in the galaxy."
-                : "Waiting for the host — they must be in the galaxy already.");
+            Log($"Launched. The game connects back on 127.0.0.1:{_localGamePort}.");
         }
         catch (Exception ex)
         {
