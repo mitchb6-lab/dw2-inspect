@@ -94,6 +94,8 @@ public static class ApplyState
         harmony.Patch(update, new HarmonyMethod(typeof(ApplyState).GetMethod(
             nameof(OnUpdate), BindingFlags.NonPublic | BindingFlags.Static)));
 
+        GuardMessageDialog(harmony, log);
+
         log("# apply: armed on DWGame.Update (main thread)");
     }
 
@@ -148,6 +150,7 @@ public static class ApplyState
 
             sw.Restart();
             _startGameExisting.Invoke(_game, new[] { incoming, ReadStartTime(incoming), incomingData });
+            ResetDerivedCaches(incoming);
             double applyMs = sw.Elapsed.TotalMilliseconds;
 
             _incoming = incoming;
@@ -308,6 +311,7 @@ public static class ApplyState
 
         sw.Restart();
         _startGameExisting.Invoke(_game, new[] { _incoming, ReadStartTime(_incoming), incomingData });
+        ResetDerivedCaches(_incoming);
         double applyMs = sw.Elapsed.TotalMilliseconds;
 
         _log($"# apply: raw={_capturedBytes.LongLength:N0}B  deserialise={readMs:N0}ms  " +
@@ -419,5 +423,158 @@ public static class ApplyState
                  "); falling back to uninitialised object");
             return System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(galaxyType);
         }
+    }
+
+    /// <summary>
+    /// Re-key the galaxy's derived path cache to the galaxy it now belongs to.
+    ///
+    /// SystemPathTimeSet._PathTimesPerSystem is a raw SortedList[] indexed directly by
+    /// systemId, and GetPathTimesForSystem does `_PathTimesPerSystem[systemId]` with NO
+    /// bounds check — it validates that systemId is non-negative and that the system
+    /// exists in galaxy.Systems, then indexes an array that may be shorter than either.
+    ///
+    /// Adopting a galaxy is exactly the case that breaks it: the cache and the systems it
+    /// is indexed by stop agreeing. This produced 518 IndexOutOfRangeExceptions in the
+    /// 2026-09-08 two-instance run, all of them
+    /// Colony.CalculateCorruption -> FindNearestCapitalByCorruptionReductionRatio ->
+    /// GetPathTimesForSystem, and DW2 swallowed every one.
+    ///
+    /// Clear(Galaxy) is the game's own fix and does precisely the right thing: allocate
+    /// a fresh array of galaxy.Systems.GetNextIdRaw() entries and Interlocked.Exchange it
+    /// in. Losing the cached path times costs recomputation, which is the correct trade —
+    /// they describe a galaxy that is no longer loaded.
+    ///
+    /// SystemPathTimeExpiry is reset too so the next lookup recomputes rather than
+    /// trusting a starDate from the previous galaxy's timeline.
+    /// </summary>
+    private static void ResetDerivedCaches(object galaxy)
+    {
+        // Kill-switch so the fix can be A/B tested against itself. A run that produces no
+        // crashes proves nothing unless the same run WITH the fix disabled produces them.
+        if (Environment.GetEnvironmentVariable("DW2MP_RESET_PATH_CACHE") == "0")
+        {
+            _log("# apply: path cache reset DISABLED (DW2MP_RESET_PATH_CACHE=0)");
+            return;
+        }
+
+        try
+        {
+            var type = galaxy.GetType();
+            var cache = AccessTools.Field(type, "SystemPathTimesCached")?.GetValue(galaxy);
+
+            if (cache is null) { _log("# apply: no SystemPathTimesCached to reset"); return; }
+
+            var clear = AccessTools.Method(cache.GetType(), "Clear", new[] { type });
+            if (clear is null) { _log("# apply: SystemPathTimeSet.Clear(Galaxy) not found"); return; }
+
+            clear.Invoke(cache, new[] { galaxy });
+            AccessTools.Field(type, "SystemPathTimeExpiry")?.SetValue(galaxy, 0L);
+
+            _log("# apply: path cache re-keyed to the adopted galaxy");
+
+            // The UI's message list survives the swap and then binds against objects from
+            // the galaxy we just discarded. That is not cosmetic: EmpireMessageDialog.BindData
+            // throws NullReferenceException out of MessageListView.Update, which is inside
+            // DWGame.Update, so nothing catches it and the CLIENT PROCESS DIES. It killed
+            // the client ~45s into every two-instance run on 2026-09-08, and looked like a
+            // hang because a dead process stops writing watchdog lines.
+            //
+            // DWGame._ShouldRegenerateMessageLog is the game's own "this list is stale"
+            // flag; setting it makes DW2 rebuild from the adopted galaxy at its own safe
+            // point rather than us rebuilding UI state from under a frame in progress.
+            var dwGameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+            if (dwGameType is not null && _game is not null)
+            {
+                var flag = AccessTools.Field(dwGameType, "_ShouldRegenerateMessageLog");
+                if (flag is not null)
+                {
+                    flag.SetValue(_game, true);
+                    _log("# apply: message log flagged for regeneration");
+                }
+                else _log("# apply: _ShouldRegenerateMessageLog not found");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("# apply: path cache reset failed " + (ex.InnerException ?? ex).Message);
+        }
+    }
+
+    /// <summary>
+    /// Stops a message the UI cannot bind from killing the process.
+    ///
+    /// A galaxy swap leaves the message UI holding messages that refer to objects which no
+    /// longer resolve. EmpireMessageDialog.BindData then throws NullReferenceException, and
+    /// because the call chain is MessageListView.Update -> ... inside DWGame.Update, nothing
+    /// catches it and the CLIENT PROCESS DIES. It killed the client ~45s into every
+    /// two-instance run on 2026-09-08 and looked like a hang, because a dead process stops
+    /// writing watchdog lines.
+    ///
+    /// Guarding only BindData was tried first and merely MOVED the crash one frame up into
+    /// SetEmpireMessageDialogData, which dereferences the result. So the guard goes at the
+    /// TOP of the subtree — MessageListView.Update — with the inner methods kept as belt
+    /// and braces. Swallowing one frame of message-list UI is self-correcting; the next
+    /// frame runs again.
+    ///
+    /// This is the seatbelt, not the fix. Flagging the message log for regeneration is the
+    /// fix. But a mod that swaps state underneath a UI it does not fully understand should
+    /// not be one null away from killing the game.
+    /// </summary>
+    private static void GuardMessageDialog(Harmony harmony, Action<string> log)
+    {
+        // Outermost first: whichever resolves, the subtree below it is covered.
+        var targets = new (string Type, string Method)[]
+        {
+            ("DistantWorlds.UI.MessageListView",          "Update"),
+            ("DistantWorlds.UI.MessageListView",          "ProcessInvestigationMessages"),
+            ("DistantWorlds.UI.UserInterfaceController",  "SetEmpireMessageDialogData"),
+            ("DistantWorlds.UI.EmpireMessageDialog",      "BindData"),
+        };
+
+        var finalizer = new HarmonyMethod(typeof(ApplyState).GetMethod(
+            nameof(SwallowBindFailure), BindingFlags.NonPublic | BindingFlags.Static));
+
+        var guarded = new List<string>();
+
+        foreach (var (typeName, methodName) in targets)
+        {
+            try
+            {
+                var type = AccessTools.TypeByName(typeName);
+                var method = type is null ? null : AccessTools.Method(type, methodName);
+                if (method is null) continue;
+
+                harmony.Patch(method, finalizer: finalizer);
+                guarded.Add(methodName);
+            }
+            catch (Exception ex)
+            {
+                log($"# apply: could not guard {methodName} ({ex.GetType().Name})");
+            }
+        }
+
+        log(guarded.Count == 0
+            ? "# apply: NO message UI guard installed — a stale message can kill the client"
+            : "# apply: guarded message UI (" + string.Join(", ", guarded) + ")");
+    }
+
+    private static bool _loggedBindFailure;
+
+    /// <summary>
+    /// Harmony finalizer. Returning null swallows the exception; the cost is a popup that
+    /// does not appear, against a client that dies.
+    /// </summary>
+    private static Exception SwallowBindFailure(Exception __exception)
+    {
+        if (__exception is null) return null;
+
+        if (!_loggedBindFailure)
+        {
+            _loggedBindFailure = true;
+            _log?.Invoke("# apply: a message the UI could not bind was skipped (" +
+                         __exception.GetType().Name + "); logged once, further ones are silent");
+        }
+
+        return null;
     }
 }

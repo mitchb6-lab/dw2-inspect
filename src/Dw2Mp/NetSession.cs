@@ -64,6 +64,18 @@ public static class NetSession
     private static string _hostAddress;
     private static long _syncEveryTicks;
 
+    // --------------------------------------------------- outbound (host only)
+
+    /// <summary>
+    /// A ONE-SLOT outbox, newest wins. Full-state syncs supersede rather than accumulate:
+    /// once a newer snapshot exists an older one has no value, so a queue would only add
+    /// latency and memory to deliver worlds the client will immediately overwrite. This is
+    /// the same reasoning the client already applies to its inbound backlog.
+    /// </summary>
+    private static byte[] _outbound;
+    private static readonly AutoResetEvent _outboundReady = new(false);
+    private static long _statesDropped;
+
     private static TcpListener _listener;
     private static TcpClient _peer;
     private static NetworkStream _stream;
@@ -134,6 +146,18 @@ public static class NetSession
             Name = "Dw2Mp.Net",
         };
         thread.Start();
+
+        // The host's outbound sender lives on its own thread. See SenderLoop for why this
+        // is a correctness requirement rather than a performance tweak.
+        if (Role == NetRole.Host)
+        {
+            var sender = new Thread(SenderLoop)
+            {
+                IsBackground = true,
+                Name = "Dw2Mp.Send",
+            };
+            sender.Start();
+        }
     }
 
     // ------------------------------------------------------------ session
@@ -484,13 +508,20 @@ public static class NetSession
             byte[] packed = Compress(raw);
             double packMs = sw.Elapsed.TotalMilliseconds;
 
-            sw.Restart();
-            Send(Msg.FullState, packed);
-            double sendMs = sw.Elapsed.TotalMilliseconds;
+            // HAND OFF, do not send. Writing to the socket from the simulation thread is
+            // what froze the host in the 2026-09-08 run: the client stopped reading, the
+            // relay's buffer filled, the relay stopped reading from us, and Send blocked
+            // forever with the sim thread inside it. The host stopped at tick 15,600 --
+            // sync #13 -- having logged sync #12, and no amount of unpausing helped
+            // because the thread was not paused, it was stuck in a socket write.
+            var superseded = Interlocked.Exchange(ref _outbound, packed);
+            if (superseded is not null) Interlocked.Increment(ref _statesDropped);
+            _outboundReady.Set();
 
             _syncsSent++;
             _log($"# net[host]: sync #{_syncsSent} tick={tick} raw={raw.LongLength:N0}B " +
-                 $"packed={packed.Length:N0}B serialise={serialiseMs:N0}ms pack={packMs:N0}ms send={sendMs:N0}ms");
+                 $"packed={packed.Length:N0}B serialise={serialiseMs:N0}ms pack={packMs:N0}ms queued" +
+                 (superseded is null ? "" : $" (superseded 1, {Interlocked.Read(ref _statesDropped)} total)"));
         }
         catch (Exception ex)
         {
@@ -614,5 +645,47 @@ public static class NetSession
         using var output = new MemoryStream(48 * 1024 * 1024);
         deflate.CopyTo(output);
         return output.ToArray();
+    }
+
+    /// <summary>
+    /// Writes queued state to the socket, off the simulation thread.
+    ///
+    /// This exists for CORRECTNESS, not throughput. A socket write blocks when the far end
+    /// stops reading, and a full state is ~4.4 MB — far more than any buffer will absorb.
+    /// With the write inline on the simulation thread, a client that hangs, stalls or dies
+    /// takes the HOST down with it: the host froze mid-sync on 2026-09-08 and never ticked
+    /// again. A host must survive any client behaviour, including malicious.
+    ///
+    /// Blocking here is harmless: the sim keeps running, and each new sync simply replaces
+    /// whatever this thread has not managed to send yet.
+    /// </summary>
+    private static void SenderLoop()
+    {
+        while (true)
+        {
+            try
+            {
+                // Timed wait, so a state queued during a lost connection is still picked
+                // up once it returns rather than waiting for the next Set().
+                _outboundReady.WaitOne(TimeSpan.FromMilliseconds(250));
+
+                var payload = Interlocked.Exchange(ref _outbound, null);
+                if (payload is null || !_connected) continue;
+
+                var sw = Stopwatch.StartNew();
+                Send(Msg.FullState, payload);
+                var ms = sw.Elapsed.TotalMilliseconds;
+
+                // Only worth a line when it actually blocked; a healthy send is ~2 ms and
+                // logging every one would bury the interesting case.
+                if (ms > 1000)
+                    _log($"# net[host]: send took {ms:N0}ms — the client is not keeping up");
+            }
+            catch (Exception ex)
+            {
+                _log("# net[host]: send failed " + ex.GetType().Name + ": " + ex.Message);
+                _connected = false;
+            }
+        }
     }
 }

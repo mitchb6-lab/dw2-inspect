@@ -1004,3 +1004,103 @@ it is only contention.
 **Same seed, different galaxies** remains true and remains harmless: the host generated 10
 empires and the client 10 with different auto-generated names, and the client's copy is
 overwritten by the sync. It does mean the seed alone is not a shared input.
+
+---
+
+## The two blockers, worked 2026-09-08
+
+Both items from the previous section turned out to be misdiagnosed by their symptoms, and
+both are now measured rather than guessed.
+
+### Blocker 1 — "client throughput" was a HOST DEADLOCK and a CLIENT CRASH
+
+Neither half was contention.
+
+**The host froze in a socket write.** It stopped at exactly tick 15,600 in one run and
+13,200 in another — both exact multiples of the 1,200-tick sync interval, which is the
+tell: a clock stall stops anywhere, a sync stall stops on the boundary. `Send()` was
+called inline from the simulation thread; when the client stopped reading, the relay's
+buffer filled, the relay stopped reading from the host, and a ~4.4 MB socket write blocked
+forever **with the simulation thread inside it**.
+
+The watchdog now diagnoses a stall instead of printing a flat number, and its first run
+disproved the theory it was written for:
+
+```
+179s: 15600 cycle(s) — STALLED. IsRunning=False, AutoPaused=False, GetGamePaused=True
+      resumed the simulation
+209s: 15600 cycle(s) — STALLED. IsRunning=True,  AutoPaused=False, GetGamePaused=False
+```
+
+Unpausing worked and the count still did not move, because the thread was not paused — it
+was blocked in a syscall.
+
+**Fix: the host sends from its own thread**, through a one-slot outbox where the newest
+state supersedes the old (an older full state has no value once a newer exists — the same
+reasoning the client already applied to its inbound backlog). Result: 24,000 cycles and 20
+syncs with no freeze, and the outbox reported `superseded 1, 9 total` — nine stale states
+dropped rather than nine host stalls. **A host must survive any client behaviour**, so
+this is correctness, not throughput.
+
+**The client was DYING, not hanging.** Process sampling settled in one run what its own
+log could not: `CLIENT gone` at ~45 s. A dead process stops writing watchdog lines, which
+reads exactly like a hang.
+
+The killer was the crash dump previously dismissed as "a UI popup, not the simulation":
+`EmpireMessageDialog.BindData` throws `NullReferenceException` when a message refers to
+objects the swap discarded, and the chain `DWGame.Update → MessageListView.Update → …`
+means **nothing catches it**. Dismissing it as cosmetic was wrong — it was the whole
+failure.
+
+Fixes: `DWGame._ShouldRegenerateMessageLog` is set on adoption so DW2 rebuilds the message
+list from the galaxy it now has; and the message-UI subtree is guarded by Harmony
+finalizers. Guarding only `BindData` was tried first and merely **moved** the crash one
+frame up into `SetEmpireMessageDialogData`, so the guard now sits at the top of the subtree
+with the inner methods as belt and braces.
+
+The client went from 1 cycle and 1 apply to **sync #2 applied and cycle 2000 reached**.
+
+### Blocker 2 — the path cache, fixed and A/B proven
+
+`SystemPathTimeSet._PathTimesPerSystem` is a raw `SortedList[]` indexed directly by
+`systemId`, and `GetPathTimesForSystem` does `_PathTimesPerSystem[systemId]` with **no
+bounds check** — it validates that the id is non-negative and that the system exists in
+`galaxy.Systems`, then indexes an array that may be shorter than either. Adopting a galaxy
+is exactly the case where the cache and the systems stop agreeing.
+
+`SystemPathTimeSet.Clear(Galaxy)` is the game's own fix: allocate
+`galaxy.Systems.GetNextIdRaw()` entries and `Interlocked.Exchange` them in. It is now
+called on every adoption, along with resetting `SystemPathTimeExpiry`.
+
+**Proven by A/B**, same build, one environment variable apart (`DW2MP_RESET_PATH_CACHE`,
+which exists so the fix can be tested against itself):
+
+| Arm | `IndexOutOfRangeException` |
+|---|---:|
+| Reset enabled | **0** |
+| Reset disabled | **245** |
+
+The control arm also stopped logging entirely after the apply — the crash storm was
+hanging the process, not merely filling a directory.
+
+### What this uncovered: the path cache was the FIRST of several
+
+With the swap no longer crashing on paths and the client no longer dying on messages, the
+next layer is visible — 355 `NullReferenceException`s in a run, on a different axis:
+
+```
+354  Empire.DoTasks
+297  Empire.IdentifyRefuellingPointsPerSystem -> IdentifyRefuellingPointBasesWeCanDockAt
+192  Empire.DoTasksPirateEmpire_PreExpansion
+ 65  Empire.DoTasksIndependentEmpire
+```
+
+These are **per-empire derived caches** that a swap leaves inconsistent — `Empire` also
+carries `RepairBasesPerSystem` and `RepairSystems`, which are the same shape of problem.
+The general statement, and it is the thing to design around rather than patch case by
+case: **`StartGameExisting` replaces the galaxy but does not invalidate state derived from
+it.** Every such cache is a crash waiting for the first adoption.
+
+Note these are pirate and independent empires, not the players' — so they are not the
+`Independent`-promotion bug returning. They are the ordinary AI empires of an adopted
+galaxy, doing ordinary work against caches that describe a galaxy that is gone.

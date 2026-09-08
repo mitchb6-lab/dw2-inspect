@@ -56,6 +56,22 @@ public static class Determinism
     /// </summary>
     private static readonly bool MeasureApply = Env("DW2MP_MEASURE_APPLY", "0") == "1";
 
+    /// <summary>The live GameServer, kept so the watchdog can ask why the sim stopped.</summary>
+    private static volatile object _server;
+
+    /// <summary>
+    /// Resume the simulation whenever DW2 pauses it.
+    ///
+    /// DW2 AUTO-PAUSES on empire messages (DWGame.AutoPaused) and waits for a click. In an
+    /// unattended run that is indistinguishable from a hang, and it is exactly what stopped
+    /// the 2026-09-08 two-instance test dead: the host froze at 13,200 cycles and the client
+    /// at 1, for three minutes, with nothing in any log saying why.
+    ///
+    /// In a networked session it is also WRONG rather than merely inconvenient: the host
+    /// drives time, so a client that pauses itself is desynced, not paused.
+    /// </summary>
+    private static readonly bool KeepRunning = Env("DW2MP_KEEP_RUNNING", "1") == "1";
+
     private static readonly long CaptureAtCycles = EnvLong("DW2MP_CAPTURE_AT_CYCLES", 400);
 
     private static readonly long ApplyAfterCycles = EnvLong("DW2MP_APPLY_AFTER_CYCLES", 1600);
@@ -133,10 +149,25 @@ public static class Determinism
         Log($"# patched {serverType.Name}.{target.Name}");
 
         var started = DateTime.UtcNow;
+        long lastSeen = -1;
         _watchdog = new Timer(_ =>
         {
             if (_finished) return;
-            Log($"# watchdog {(int)(DateTime.UtcNow - started).TotalSeconds}s: {Interlocked.Read(ref _cycleCount)} cycle(s)");
+
+            var now = Interlocked.Read(ref _cycleCount);
+            var secs = (int)(DateTime.UtcNow - started).TotalSeconds;
+
+            // A flat cycle count used to be the whole message, and it says nothing about
+            // WHY. DW2 auto-pauses on empire messages and waits for a click, which in an
+            // unattended run looks exactly like a hang.
+            if (now == lastSeen)
+            {
+                Log($"# watchdog {secs}s: {now} cycle(s) — STALLED. {DescribeStall()}");
+                if (KeepRunning) ClearStall();
+            }
+            else Log($"# watchdog {secs}s: {now} cycle(s)");
+
+            lastSeen = now;
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
 
         Log("# cycle  bytes  hashA  hashB  stable");
@@ -154,6 +185,7 @@ public static class Determinism
 
             // A loaded save arrives PAUSED: the server cycles happily while Galaxy.Time
             // never moves, so nothing is ever simulated.
+            _server = __instance;
             if (n == 1) StartTheClock(__instance);
 
             // Hand the galaxy to the apply measurement once the game has settled. This
@@ -209,6 +241,72 @@ public static class Determinism
         }
     }
 
+
+    /// <summary>
+    /// Why has the server stopped cycling? Reads the three states that can stop it, so a
+    /// stall reports a cause instead of a flat number.
+    /// </summary>
+    private static string DescribeStall()
+    {
+        var parts = new List<string>();
+
+        try
+        {
+            if (_server is { } server)
+            {
+                var running = AccessTools.PropertyGetter(server.GetType(), "IsRunning")?.Invoke(server, null);
+                parts.Add($"GameServer.IsRunning={running?.ToString() ?? "?"}");
+            }
+            else parts.Add("no GameServer seen yet");
+
+            var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+            var game = ApplyState.Game;
+
+            if (gameType is not null && game is not null)
+            {
+                var auto = AccessTools.Field(gameType, "AutoPaused")?.GetValue(game);
+                if (auto is not null) parts.Add($"DWGame.AutoPaused={auto}");
+
+                var paused = AccessTools.Method(gameType, "GetGamePaused", Type.EmptyTypes)?.Invoke(game, null);
+                if (paused is not null) parts.Add($"GetGamePaused={paused}");
+            }
+        }
+        catch (Exception ex) { parts.Add("probe failed: " + ex.GetType().Name); }
+
+        return string.Join(", ", parts);
+    }
+
+    /// <summary>
+    /// Resume a paused simulation.
+    ///
+    /// DW2 auto-pauses on empire messages and waits for a click. That is right for a
+    /// single-player game at a keyboard and wrong here twice over: an unattended run has
+    /// nobody to click, and in a networked session the host drives time, so a client
+    /// pausing itself is a desync wearing a pause's clothes.
+    ///
+    /// Clearing AutoPaused as well as calling ResumeGame, because ResumeGame alone lets
+    /// the next frame re-pause on the message still sitting there.
+    /// </summary>
+    private static void ClearStall()
+    {
+        try
+        {
+            var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+            var game = ApplyState.Game;
+
+            if (gameType is not null && game is not null)
+                AccessTools.Field(gameType, "AutoPaused")?.SetValue(game, false);
+
+            if (_server is { } server)
+                AccessTools.Method(server.GetType(), "ResumeGame")?.Invoke(server, null);
+
+            Log("# watchdog: resumed the simulation (DW2 had paused it)");
+        }
+        catch (Exception ex)
+        {
+            Log("# watchdog: resume failed " + ex.GetType().Name + ": " + (ex.InnerException ?? ex).Message);
+        }
+    }
     /// <summary>
     /// Unpauses the simulation. GameServer.ResumeGame() is just _Stopwatch.Start();
     /// under FixedStep the stopwatch no longer drives anything, but the game still gates
