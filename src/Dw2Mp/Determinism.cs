@@ -142,6 +142,7 @@ public static class Determinism
             // into InputQueue.
             NetSession.SetServer(__instance);
             NetSession.HostTick(galaxy, n);
+            NetSession.ClientHeartbeatTick(n);
 
             if (ApplyState.Ready)
             {

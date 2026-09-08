@@ -701,3 +701,58 @@ Options, none cheap:
 **Recommendation: build co-op first on the current foundation, and investigate DW2's fog
 representation in parallel** — that investigation decides whether competitive is a
 milestone or a rewrite, and it costs nothing but reading code.
+
+---
+
+## M4b — command relay: BUILT, injection path NOT YET VERIFIED
+
+`NetSession` now carries client → host commands using the game's own wire format:
+
+- **Client** patches `GameClient.SendMessageToServer` and forwards any packet carrying
+  `GameTask`s, serialised with `MessagePacket.WriteToStream`.
+- **Host** deserialises with `MessagePacket.ReadFromStream` and injects into
+  `GameServer.InputQueue` — the same `ConcurrentDictionary` the host's own client writes
+  to in single-player.
+- Injection deliberately does **not** use the main thread. The queue is concurrent and the
+  server drains it, unlike state apply, which must be on the main thread.
+- The client patch is a **postfix**, so the local call still runs and the client executes
+  its own command immediately, with the host's next sync correcting it. That is
+  client-side prediction, free here because client state is overwritten anyway.
+
+### What is proven, and what is not
+
+**Proven:** the relay installs (`command relay armed on GameClient.SendMessageToServer`),
+the host side resolves `MessagePacket` and `InputQueue`, and the channel is open.
+
+**Not proven: no command has yet crossed the wire.** Two reasons, found by measuring:
+
+1. **`SendMessageToServer` is command-driven, not per-tick** — measured at **1 call in
+   nine minutes** with nobody at the client's keyboard. Organic traffic cannot exercise
+   the relay in an unattended run, which is why the counters were added: "no relay
+   activity" was otherwise ambiguous between "never called" and "called with nothing".
+2. A synthetic-packet path was added to close that gap (client sends an empty
+   `MessagePacket` every 400 ticks under `DW2MP_RELAY_HEARTBEAT=1`). **The run that
+   should have exercised it had the client fail to finish loading — 450 s, 0 cycles** — so
+   the heartbeat, which is driven off client server-cycles, never fired.
+
+**M4b needs one more run to verify.** The code path is complete; the evidence is not.
+
+### Separate finding: pathfinding exceptions
+
+Nine `IndexOutOfRangeException`s in a two-second window during the M4b run:
+
+```
+System.IndexOutOfRangeException
+  at SystemPathTimeSet.GetPathTimesForSystem(Galaxy, Empire, int systemId, ...)
+  at SystemPathTimeSet.GetPathTimeDelayed(...)
+  at StellarObjectList.FindNearestCapitalByCorruptionReductionRatio(...)
+```
+
+**Absent from the successful M4 run**, so M4's result stands. Cause unknown; candidates
+are a galaxy swap leaving derived path caches keyed to the previous galaxy's shape, or our
+synthesised `FixedStep` clock confusing a `starDate`-based cache. Worth chasing before
+either mode ships, because it points at derived state that a state-swap does not rebuild.
+
+**Process note:** M4 was reported as working on the strength of our own log without
+checking the game's own `SessionLog.txt`. That was the right result but an incomplete
+check — the game's log should be read on every run from here.

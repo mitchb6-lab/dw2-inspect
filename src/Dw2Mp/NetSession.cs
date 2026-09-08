@@ -226,6 +226,51 @@ public static class NetSession
         catch { return 0; }
     }
 
+    /// <summary>
+    /// Client: send a synthetic command packet every N ticks.
+    ///
+    /// Piggybacking on GameClient.SendMessageToServer does not work as a test: it is
+    /// command-driven, not per-tick — measured at ONE call in nine minutes with nobody at
+    /// the keyboard. So organic traffic cannot exercise the relay in an automated run.
+    ///
+    /// This builds an empty MessagePacket and sends it on a tick interval, which
+    /// exercises the entire path — construct, serialise, frame, wire, deserialise, inject
+    /// into the host's InputQueue — independently of whether a human is issuing orders.
+    /// A real player's commands then travel the same path with tasks attached.
+    /// </summary>
+    public static void ClientHeartbeatTick(long tick)
+    {
+        if (Role != NetRole.Client || !_connected || !RelayHeartbeat) return;
+        if (_messagePacketType is null || _packetWrite is null) return;
+        if (tick - _lastHeartbeatTick < HeartbeatEveryTicks) return;
+        _lastHeartbeatTick = tick;
+
+        try
+        {
+            var packet = Activator.CreateInstance(_messagePacketType);
+            _packetSerial?.SetValue(packet, unchecked((int)tick));
+
+            using var buffer = new MemoryStream();
+            using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                _packetWrite.Invoke(packet, new object[] { writer });
+                writer.Flush();
+            }
+
+            Send(Msg.Command, buffer.ToArray());
+            _commandsSent++;
+            _log($"# net[client]: sent synthetic command #{_commandsSent} tick={tick} ({buffer.Length:N0}B)");
+        }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            _log($"# net[client]: synthetic command failed {cause.GetType().Name}: {cause.Message}");
+        }
+    }
+
+    private static long _lastHeartbeatTick;
+    private const long HeartbeatEveryTicks = 400;
+
     /// <summary>Host: turn received bytes back into a MessagePacket and queue it.</summary>
     private static void InjectCommand(byte[] payload)
     {
