@@ -36,6 +36,9 @@ public static class ApplyState
     private static volatile bool _applied;
 
     private static byte[] _capturedBytes;
+    private static string _capturedFingerprint;
+    private static string _incomingFingerprint;
+    private static int _incomingShips = -1;
     private static string _capturedHash;
     private static DateTime _capturedTime;
 
@@ -93,6 +96,10 @@ public static class ApplyState
             _capturedHash = hash;
             _capturedTime = ReadTime(galaxy);
 
+            var fp = Fingerprint(galaxy);
+            _capturedFingerprint = fp.Hash;
+            _log($"# apply: captured fingerprint={fp.Hash} ({fp.Summary})");
+
             _log($"# apply: CAPTURED {bytes.LongLength:N0}B  hash={hash}  time={_capturedTime:yyyy-MM-dd HH:mm:ss.fff}");
         }
         catch (Exception ex)
@@ -125,18 +132,34 @@ public static class ApplyState
             bool sameObject = ReferenceEquals(galaxy, _incoming);
             bool timeMatches = now == _capturedTime;
 
-            string verdict;
             if (_observations == 1)
             {
-                var (_, hash) = Serialise(galaxy);
-                bool hashMatches = hash == _capturedHash;
-                verdict = hashMatches ? "ADOPTED (hash matches capture)" : $"hash={hash} != captured {_capturedHash}";
-                _log($"# verify[{cycle}]: liveTime={now:HH:mm:ss.fff} capturedTime={_capturedTime:HH:mm:ss.fff} " +
-                     $"timeReverted={timeMatches} isIncomingObject={sameObject} -> {verdict}");
+                // The CONTENT check, and the one that decides M3c. The clock-based checks
+                // below are kept for context only -- FixedStep makes time a monotonic
+                // function of the tick counter, so timeReverted can never be true and
+                // says nothing either way.
+                var after = Fingerprint(galaxy);
+
+                // ENTITY COUNT, not the hash. The hash is sampled one tick after the
+                // apply, and ship positions and countdowns advance every tick, so it can
+                // never match. The population cannot change by hundreds in one tick, so a
+                // count that reverts to the received value is decisive.
+                bool contentMatches = after.Ships == _incomingShips && _incomingShips >= 0;
+
+                _log($"# verify[{cycle}]: captured={_capturedFingerprint} incoming={_incomingFingerprint} after={after.Hash} ({after.Summary})");
+                _log(contentMatches
+                    ? $"# verify: *** CONTENT ADOPTED *** live ship count reverted to the received {_incomingShips}"
+                    : "# verify: content does NOT match capture -- the object was swapped but the " +
+                      "simulation is not running the received entity state");
+
+                _log($"# verify[{cycle}]: (context) isIncomingObject={sameObject} " +
+                     $"liveTime={now:HH:mm:ss.fff} timeReverted={timeMatches}");
             }
             else
             {
-                _log($"# verify[{cycle}]: liveTime={now:HH:mm:ss.fff} timeReverted={timeMatches} isIncomingObject={sameObject}");
+                var after = Fingerprint(galaxy);
+                _log($"# verify[{cycle}]: ships={after.Ships} matchesIncoming={after.Ships == _incomingShips} " +
+                     $"isIncomingObject={sameObject}");
             }
         }
         catch (Exception ex)
@@ -166,6 +189,8 @@ public static class ApplyState
     private static void RunApply()
     {
         var liveTimeBefore = ReadTime(_galaxy);
+        var before = Fingerprint(_galaxy);
+        _log($"# apply: live fingerprint BEFORE apply={before.Hash} ({before.Summary})");
         _log($"# apply: live time before = {liveTimeBefore:yyyy-MM-dd HH:mm:ss.fff} " +
              $"(captured was {_capturedTime:HH:mm:ss.fff}, delta {(liveTimeBefore - _capturedTime).TotalSeconds:N1}s)");
 
@@ -194,6 +219,16 @@ public static class ApplyState
         var copyStatics = AccessTools.Method(_incoming.GetType(), "CopyStaticBaseDataToGalaxyInstance");
         copyStatics?.Invoke(copyStatics.IsStatic ? null : _incoming, new[] { _incoming });
 
+        // Fingerprint the INCOMING object before applying it. Comparing post-apply state
+        // against the ORIGINAL capture is wrong by construction: the fingerprint reads
+        // every primitive ship field, and serialisation does not persist transient runtime
+        // ones, so a round-trip legitimately differs from its source. What must match is
+        // the object we handed over.
+        var incomingFp = Fingerprint(_incoming);
+        _incomingFingerprint = incomingFp.Hash;
+        _incomingShips = incomingFp.Ships;
+        _log($"# apply: incoming fingerprint={incomingFp.Hash} ({incomingFp.Summary})");
+
         sw.Restart();
         _startGameExisting.Invoke(_game, new[] { _incoming, ReadStartTime(_incoming), incomingData });
         double applyMs = sw.Elapsed.TotalMilliseconds;
@@ -216,6 +251,80 @@ public static class ApplyState
 
         byte[] raw = buffer.ToArray();
         return (raw, Convert.ToHexString(SHA256.HashData(raw))[..16]);
+    }
+
+    /// <summary>
+    /// A clock-independent fingerprint of simulation CONTENT.
+    ///
+    /// The M3c time and hash checks were both defeated by our own FixedStep clock, which
+    /// makes Galaxy.Time a monotonic function of the tick counter — so it can never
+    /// revert, and a differing Time alone changes a whole-galaxy hash. This looks at
+    /// entities instead: ship and empire counts, plus every primitive field of the first
+    /// N ships, sorted by field name so ordering cannot vary.
+    ///
+    /// Ship positions and countdowns change every tick, so a live galaxy 120 s ahead of a
+    /// captured one is guaranteed to fingerprint differently. That is what makes the
+    /// comparison decisive rather than merely suggestive.
+    /// </summary>
+    private static (string Hash, string Summary, int Ships) Fingerprint(object galaxy)
+    {
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            int shipCount = -1, empireCount = -1;
+
+            shipCount = ListCount(galaxy, "Ships");
+            empireCount = ListCount(galaxy, "Empires");
+
+            sb.Append("ships=").Append(shipCount).Append(";empires=").Append(empireCount).Append(';');
+
+            var ships = AccessTools.Field(galaxy.GetType(), "Ships")?.GetValue(galaxy);
+            if (ships is not null && shipCount > 0)
+            {
+                var itemGetter = ships.GetType().GetMethod("get_Item", new[] { typeof(int) });
+                int sample = Math.Min(shipCount, 40);
+
+                for (int i = 0; i < sample; i++)
+                {
+                    object ship;
+                    try { ship = itemGetter?.Invoke(ships, new object[] { i }); }
+                    catch { continue; }
+                    if (ship is null) continue;
+
+                    // Declared-and-inherited primitives, name-sorted: stable regardless of
+                    // reflection ordering or where a field sits in the hierarchy.
+                    foreach (var f in ship.GetType()
+                                 .GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                                 .Where(f => f.FieldType.IsPrimitive)
+                                 .OrderBy(f => f.Name, StringComparer.Ordinal))
+                    {
+                        object v;
+                        try { v = f.GetValue(ship); } catch { continue; }
+                        sb.Append(f.Name).Append('=').Append(Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture)).Append(',');
+                    }
+                }
+            }
+
+            var bytes = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+            var hash = Convert.ToHexString(SHA256.HashData(bytes))[..16];
+            return (hash, $"ships={shipCount} empires={empireCount}", shipCount);
+        }
+        catch (Exception ex)
+        {
+            return ("<failed>", (ex.InnerException ?? ex).Message, -1);
+        }
+    }
+
+    private static int ListCount(object galaxy, string fieldName)
+    {
+        try
+        {
+            var list = AccessTools.Field(galaxy.GetType(), fieldName)?.GetValue(galaxy);
+            if (list is null) return -1;
+            var count = list.GetType().GetProperty("Count")?.GetValue(list);
+            return count is int c ? c : -1;
+        }
+        catch { return -1; }
     }
 
     private static DateTime ReadTime(object galaxy) =>

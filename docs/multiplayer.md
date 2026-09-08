@@ -461,3 +461,56 @@ an empire's cash — captured alongside the bytes and compared after the apply. 
 
 Confirmed costs remain good: **~660 ms client cost** for a full 40 MB late-game galaxy,
 of which the apply itself is 14 ms.
+
+### M3c FINAL — content adoption PROVEN, measured 2026-09-07
+
+Captured at tick 400, ran on to tick 1600 (120.0 s of game time), applied the older
+captured state back to the running client.
+
+| Point | Ships | Fingerprint |
+|---|---:|---|
+| Captured (tick 400) | 732 | `199DCEBD90703BB7` |
+| Live before apply (tick 1600) | **1111** | `99F7D9D4B6453719` |
+| Incoming (deserialised) | 731 | `25FB02C7E08F1C67` |
+| **Live after apply (tick 1601)** | **731** | `837CC352C8EFD831` |
+
+**The live ship population dropped from 1111 back to 731.** The simulation had built 379
+ships over 120 game-seconds; applying the received state wound that back to the received
+galaxy's population exactly. Together with `isIncomingObject=True`, the client is
+provably running the received entity state, not merely holding the object.
+
+Three notes on method, because each cost a run to learn:
+
+- **Entity count is the right signal; the hash is not.** The fingerprint is sampled one
+  tick after the apply, and ship positions and countdowns advance every tick, so it can
+  never match. The population cannot change by hundreds in a single tick, so a count that
+  reverts is decisive. The verdict logic now uses counts.
+- **The harness clock must stay ON for this test.** With `DW2MP_STEP_MS=0` an earlier
+  attempt produced captured == live-before (delta 0.0 s, identical fingerprints): the
+  simulation never advanced, so the test had no discriminating power at all. **DW2's
+  simulation only advances when `GameServer.Now` advances, and `ResumeGame()` alone does
+  not achieve that** — the game stays effectively paused.
+- **Comparing post-apply against the ORIGINAL capture is wrong by construction.** The
+  fingerprint reads every primitive ship field and serialisation does not persist
+  transient runtime ones, so a round-trip legitimately differs from its source. The
+  comparison must be against the incoming object.
+
+**Fidelity caveat: 732 captured → 731 after round-trip.** One ship does not survive
+serialise/deserialise. Small, but it is a real fidelity gap that would compound over
+repeated syncs, and it should be understood before this is trusted in a live session.
+
+#### M3 verdict
+
+Host-authoritative is **viable and verified end to end**: a running DW2 client accepts a
+foreign galaxy, adopts its contents, and continues simulating.
+
+| Stage | Cost |
+|---|---|
+| Host serialise | 373 ms |
+| Host compress | 338 ms |
+| Wire | 9.2 MB (23.4 %) |
+| Client deserialise | 650–1,740 ms (varies with galaxy size) |
+| Client apply | 8–23 ms |
+
+The apply is nearly free; parsing dominates. Next milestone is transport (M4): loopback
+first, two processes on one machine, relaying `MessagePacket`s and full-state syncs.
