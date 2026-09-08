@@ -100,6 +100,10 @@ public static class Determinism
         // machine plays.
         MakeSave.Session = SessionConfig.Load(Env("DW2MP_SESSION", ""), Log);
 
+        // Perspective, not state: which of the galaxy's empires THIS machine drives. Must
+        // come after the session is loaded and before anything renders.
+        PlayerEmpire.Install(harmony, MakeSave.Session, Log);
+
         // NetSession reuses the apply path, so install it for either consumer.
         NetSession.Install(harmony, Log);
 

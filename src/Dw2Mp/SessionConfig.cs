@@ -31,6 +31,15 @@ public sealed class SessionConfig
     /// </summary>
     public int PlayableEmpireIndex => IsCompetitive ? MySlot : 0;
 
+    /// <summary>
+    /// The empire NAME this machine drives. Name rather than index because generation
+    /// interleaves our specified empires with auto-generated AI ones, Independent and the
+    /// pirates, in an order we do not choose — index 2 on the host is not index 2 by
+    /// intent, it is wherever DW2 happened to put it.
+    /// </summary>
+    public string MyEmpireName =>
+        Players.FirstOrDefault(p => p.Slot == PlayableEmpireIndex)?.Empire?.Name;
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
