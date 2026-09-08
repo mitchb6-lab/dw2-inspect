@@ -175,6 +175,37 @@ for ($i = 1; $i -le $Runs; $i++) {
     $proc = Start-Process -FilePath (Join-Path $game 'DistantWorlds2.exe') `
                           -ArgumentList $args -WorkingDirectory $game -PassThru
 
+    # STARTUP GUARD. A run that produces no snapshots has two very different causes, and
+    # they look identical from our own log: the harness measured nothing, or DW2 never
+    # started. Both happened on 2026-09-08 -- a 17k-file crash-dump pile made the game
+    # hang for 400s without ever opening its own SessionLog, and separately a launcher
+    # missing -WorkingDirectory made it die with 0xE0434352 before our ModuleInitializer
+    # ran. An hour went into blaming the feature under test. Prove the engine is alive.
+    $gameLog = Join-Path $game 'data\Logs\SessionLog.txt'
+    $logMark = (Get-Item $gameLog -ErrorAction SilentlyContinue).LastWriteTime
+    $started = $false
+
+    for ($w = 0; $w -lt 90; $w++) {
+        Start-Sleep -Seconds 1
+        if ($proc.HasExited) {
+            Write-Warning "run ${i}: DW2 exited after ${w}s with code $($proc.ExitCode) before starting."
+            if ($proc.ExitCode -eq -532462766) {
+                Write-Warning '  0xE0434352 is an unhandled managed exception during startup.'
+                Write-Warning '  Usual causes: crash-dump pile in data\Logs, or a stale data\SessionActive.'
+            }
+            break
+        }
+        $now = (Get-Item $gameLog -ErrorAction SilentlyContinue).LastWriteTime
+        if ($now -and (-not $logMark -or $now -gt $logMark)) { $started = $true; break }
+    }
+
+    if (-not $started -and -not $proc.HasExited) {
+        Write-Warning "run ${i}: STARTUP STALL -- DW2 wrote no SessionLog in 90s. This is not a measurement failure."
+        $dumps = @(Get-ChildItem (Join-Path $game 'data\Logs') -Filter '*CrashDump*' -File -ErrorAction SilentlyContinue).Count
+        if ($dumps -gt 500) { Write-Warning "  $dumps crash dumps in data\Logs -- clear them; the pile alone stops the game launching." }
+        try { $proc.Kill($true) } catch { }
+    }
+
     if (-not $proc.WaitForExit($TimeoutMinutes * 60 * 1000)) {
         Write-Warning "run $i hit the ${TimeoutMinutes}-minute timeout; killing it and using whatever it logged."
         try { $proc.Kill($true) } catch { }
