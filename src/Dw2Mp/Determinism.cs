@@ -128,8 +128,14 @@ public static class Determinism
             // different failures: the patch never fired, it fired but game time is frozen
             // (the game starts paused), or time is advancing too slowly for the interval.
             long n = Interlocked.Increment(ref _cycleCount);
+
+            // A loaded save arrives PAUSED. The server cycles happily (194k cycles in
+            // 900s was the first measurement) while Galaxy.Time never moves, so nothing
+            // is ever simulated. Resume it, once.
+            if (n == 1) StartTheClock(__instance);
+
             if (n == 1 || n % HeartbeatEvery == 0)
-                Log($"# cycle {n}: gameTime={now:yyyy-MM-dd HH:mm} elapsedDays={elapsedDays:F3}");
+                Log($"# cycle {n}: gameTime={now:yyyy-MM-dd HH:mm:ss} elapsedDays={elapsedDays:F4}");
 
             if (elapsedDays < _nextSnapshotDay) return;
 
@@ -144,6 +150,37 @@ public static class Determinism
         {
             Log("ERROR in prefix: " + ex.GetType().Name + ": " + ex.Message);
             _finished = true;   // stop rather than log the same failure every cycle
+        }
+    }
+
+    /// <summary>
+    /// Unpauses the simulation and sets a speed.
+    ///
+    /// GameServer.ResumeGame() simply calls _Stopwatch.Start(): DW2's game clock is a
+    /// wall-clock stopwatch scaled by game speed, not a tick counter. Worth stating
+    /// plainly because it bears directly on the multiplayer question -- the simulation
+    /// is not fixed-timestep, so two machines never execute the same step sequence.
+    /// </summary>
+    private static void StartTheClock(object server)
+    {
+        try
+        {
+            var type = server.GetType();
+
+            var isRunning = AccessTools.PropertyGetter(type, "IsRunning")?.Invoke(server, null);
+            Log($"# clock: IsRunning={isRunning} -> resuming");
+
+            AccessTools.Method(type, "ResumeGame")?.Invoke(server, null);
+
+            float speed = (float)EnvDouble("DW2MP_GAME_SPEED", 4);
+            AccessTools.Method(type, "ChangeGameSpeed")?.Invoke(server, new object[] { speed });
+
+            var actual = AccessTools.Method(type, "GetGameSpeed")?.Invoke(server, null);
+            Log($"# clock: requested speed={speed}, reported={actual}");
+        }
+        catch (Exception ex)
+        {
+            Log("# clock: resume failed " + ex.GetType().Name + ": " + (ex.InnerException ?? ex).Message);
         }
     }
 

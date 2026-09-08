@@ -131,7 +131,56 @@ Three things that had to be right, and would each have failed silently:
 - **Log outside the game directory.** The install is under Program Files; a write there
   is not reliably permitted, and the log is the only evidence the injection worked.
 
-### M2 — The determinism experiment ← *the decision point*  🔧 BUILT, AWAITING A SAVE
+### M2 — The determinism experiment ← *the decision point*  ⚠️ REDESIGN REQUIRED
+
+**First run produced a finding that invalidates the test as originally designed, and it
+is more important than the test would have been.**
+
+Two things were learned by running it:
+
+1. **A loaded save arrives paused.** The server cycles happily — 194,000 cycles in 900
+   seconds — while `Galaxy.Time` never moves. Fixed by calling `GameServer.ResumeGame()`
+   and `ChangeGameSpeed()` from the harness on the first cycle.
+
+2. **DW2's simulation clock is a wall-clock stopwatch, not a tick counter.**
+   `GameServer.ResumeGame()` decompiles to exactly `_Stopwatch.Start()`, and
+   `Galaxy.Time` is a real-world `DateTime` that advances with real elapsed time scaled
+   by game speed. Observed: `21:47:51` → `21:47:53` across 16,000 server cycles.
+
+**Why that breaks the experiment.** Comparing state at equal `Galaxy.Time` compares two
+runs that have executed *different numbers of update steps*, because steps are paced by
+wall-clock and the machine is not equally loaded from moment to moment. A perfectly
+deterministic DW2 would still fail such a test. It cannot distinguish "the arithmetic
+diverges" from "the runs took different numbers of steps", so a divergence result would
+mean nothing.
+
+**Why it matters far beyond the test.** Lockstep requires a **fixed-timestep** model:
+step N on machine A must correspond to step N on machine B. DW2 has no such notion. Its
+simulation is variable-timestep, wall-clock-paced, multithreaded, and partitions its work
+by measured milliseconds. There is no existing concept of "the same simulation step" for
+two machines to agree on.
+
+So the three risks listed above are really one: **DW2 does not have a simulation tick.**
+
+#### The redesigned experiment (M2b)
+
+Make one, and test determinism inside it:
+
+1. Harmony-patch the clock so `Galaxy.Time` advances by a **fixed increment per server
+   cycle**, removing wall-clock from the simulation entirely.
+2. Run twice, comparing state at equal **cycle counts**.
+
+This is a valid test — identical step sequences, so any divergence is genuinely the
+arithmetic — and it is not throwaway work: forcing a fixed timestep is the first piece
+of the actual fix, not just instrumentation for measuring it. If state then matches
+across runs, the remaining obstacles (thread ordering, block sizing) are attackable one
+at a time. If it still diverges with an identical step sequence, the cause is float
+arithmetic itself and lockstep needs a much bigger intervention.
+
+#### Built so far
+
+`src/Dw2Mp/Determinism.cs` + `Scripts/determinism-run.ps1`. Armed only when
+`DW2MP_DETERMINISM=1`, since it exits the process when a run completes.
 
 `src/Dw2Mp/Determinism.cs` + `Scripts/determinism-run.ps1`. Armed only when
 `DW2MP_DETERMINISM=1`, since it exits the process when a run completes.
