@@ -106,6 +106,18 @@ turns that off.
   actually do", which is the point, but it is not a source reconstruction.
 - Warnings go to **stderr**, so redirecting stdout gives you a clean dump.
 
+## Multiplayer
+
+DW2 ships no multiplayer. This repo contains a working host-authoritative prototype:
+two live game instances share a universe, with state syncing host→client and commands
+relaying client→host.
+
+- **[How to join a session](docs/joining-a-session.md)** — the practical guide: what to
+  send someone, the steps, and the troubleshooting
+- **[Architecture and evidence](docs/multiplayer.md)** — what was tried, what was measured,
+  and why lockstep was ruled out
+- **[Lobby design](docs/lobby.md)** — the standalone launcher and the `session.json` contract
+
 ## Mods
 
 `mods/` holds data mods built with what this tool uncovered. Each is a **generator**
