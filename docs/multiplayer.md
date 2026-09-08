@@ -1104,3 +1104,75 @@ it.** Every such cache is a crash waiting for the first adoption.
 Note these are pirate and independent empires, not the players' — so they are not the
 `Independent`-promotion bug returning. They are the ordinary AI empires of an adopted
 galaxy, doing ordinary work against caches that describe a galaxy that is gone.
+
+---
+
+## Derived-state invalidation on adoption — fixed 2026-09-08
+
+**Crash dumps across a two-instance run: 355 → 106 → 1.** The client went from dying at
+45 s having applied one sync, to applying **26 syncs and running 37,119 cycles**.
+
+### The method that mattered: read the game's own load path
+
+The first instinct was to enumerate stale caches. That would not have finished — `Empire`
+alone carries `RefuellingPointsPerSystem`, `RefuellingPointsPerSystemMilitary`,
+`RefuellingSystems`, `RefuellingSystemsMilitary`, `RepairBasesPerSystem`, `RepairSystems`,
+`ConstructionBasesPerSystem` and `_PathFindingDangerousSystems`, and two of the three real
+fixes are not cache fields at all.
+
+DW2 deserialises galaxies constantly — every save load — so the question worth asking was
+**what does the game do that we don't**:
+
+| Step | `BeginLoadGame` / `LoadGame` | `StartGameExisting` | Ours, before |
+|---|---|---|---|
+| `Galaxy.WaitAllTasksCompleted()` | ✅ | ❌ | ❌ |
+| `DWGame.ClearMessageQueues()` | ✅ | ❌ | ❌ |
+| `PathFindingSystem.CalculateSystemDistances(galaxy)` | ✅ | ❌ | ❌ |
+| `Resource.ClearCachedValues()` | — | ✅ | ✅ |
+| `CheckInitializeOrBindSinglePlayerGame` | ✅ | ✅ | ✅ |
+
+Adoption was doing the bind and none of the preparation.
+
+**`WaitAllTasksCompleted` is the load-bearing one.** DW2 runs galaxy work across many
+threads; replacing the galaxy mid-flight leaves workers walking half-old, half-new
+structures. That matches the evidence in a way no single null field does — the failures
+were scattered across research, refuelling, corruption and pirate code, and were transient
+rather than every-call. It also explains the `PauseGame(true)` inside `StartGameExisting`:
+the game expects to be quiesced around this, and we were calling it on a live simulation.
+
+### The one genuine missing rebuild: `Ship.Summary`
+
+`ShipSummary` is derived and `ReadFromStream` does not restore it, so ships arrive with
+`Summary` null. `IdentifyRefuellingPointBasesWeCanDockAt` then does
+`ship.Summary.DockingBayCount` with no null check.
+
+`Ship.RegenerateSummary()` is the game's own rebuild, and only null summaries are touched
+so the count is evidence rather than a blanket action:
+
+```
+# apply: rebuilt 64 of 64 ship summaries (null after deserialisation)
+```
+
+**64 of 64** — the field is simply not serialised.
+
+This one change took the run from 106 dumps to 1, and it removed the *research* family too
+(`CalculateResearchFundingAvailableAndActualAmounts` → `GetScientistsAtResearchStations`)
+even though nothing research-specific was touched. Research funding walks scientists at
+research **stations**, which are ships, so both families shared the same root.
+
+### The general statement
+
+**`StartGameExisting` replaces the galaxy but neither quiesces the threads using it nor
+rebuilds state derived from it.** Any future adoption bug should be checked against DW2's
+own load sequence first.
+
+`DW2MP_ADOPT_FIXUP=0` disables the whole fixup so it can be A/B tested against itself, the
+same way `DW2MP_RESET_PATH_CACHE=0` does for the path cache.
+
+### NEXT: the client leaks memory and dies at ~215 s
+
+The remaining blocker, and it is not a crash. Client private bytes climb steadily across
+the run — 3.6 GB → 8.4 GB over 26 adoptions — and the process is killed at ~215 s. Growth
+is far more than our own buffers can account for (26 × 24 MB ≈ 0.6 GB), so **old galaxies
+are being retained**. `Galaxy.CopyGalaxyInstanceToStaticBaseData` is the first place to
+look: there is static state holding galaxy data, and every adoption creates another galaxy.

@@ -148,6 +148,16 @@ public static class ApplyState
             var copyStatics = AccessTools.Method(incoming.GetType(), "CopyStaticBaseDataToGalaxyInstance");
             copyStatics?.Invoke(copyStatics.IsStatic ? null : incoming, new[] { incoming });
 
+            RebuildPathData(incoming);
+            RegenerateShipSummaries(incoming);
+
+            // Mirror the game's own load sequence. DW2 deserialises galaxies constantly --
+            // every save load -- and it does three things around it that StartGameExisting
+            // alone does not. Skipping them is why adoption produced hundreds of scattered
+            // NullReferenceExceptions across research, refuelling, corruption and pirate
+            // code. See AdoptionFixup for what each one is for.
+            QuiesceBeforeSwap();
+
             sw.Restart();
             _startGameExisting.Invoke(_game, new[] { incoming, ReadStartTime(incoming), incomingData });
             ResetDerivedCaches(incoming);
@@ -576,5 +586,174 @@ public static class ApplyState
         }
 
         return null;
+    }
+
+    // ------------------------------------------------- adoption fixup
+    //
+    // AdoptionFixup, in one place because the reasoning is shared.
+    //
+    // StartGameExisting replaces the galaxy but does NOT invalidate state derived from it,
+    // and it is not the whole of what DW2 does when it loads a galaxy. Comparing the game's
+    // own path against ours:
+    //
+    //   DWGame.BeginLoadGame   -> Galaxy.WaitAllTasksCompleted()      we skipped
+    //                          -> DWGame.ClearMessageQueues()          we skipped
+    //   DWGame.LoadGame        -> PathFindingSystem.CalculateSystemDistances(galaxy)
+    //                                                                  we skipped
+    //                          -> CheckInitializeOrBindSinglePlayerGame
+    //   DWGame.StartGameExisting -> Resource.ClearCachedValues()
+    //                            -> CheckInitializeOrBindSinglePlayerGame
+    //
+    // So adoption was doing the bind and none of the preparation. Every one of these was
+    // established by reading the game's own load sequence rather than guessing at field
+    // names, which matters: the first attempt at this problem chased individual cache
+    // fields, and there are at least eight on Empire alone (RefuellingPointsPerSystem,
+    // RefuellingPointsPerSystemMilitary, RefuellingSystems, RefuellingSystemsMilitary,
+    // RepairBasesPerSystem, RepairSystems, ConstructionBasesPerSystem,
+    // _PathFindingDangerousSystems). Replicating the load path fixes the class.
+    //
+    // Set DW2MP_ADOPT_FIXUP=0 to disable, so the fix can be A/B tested against itself.
+
+    private static bool FixupEnabled => Environment.GetEnvironmentVariable("DW2MP_ADOPT_FIXUP") != "0";
+
+    /// <summary>
+    /// Stop the world before swapping it.
+    ///
+    /// DW2 runs galaxy work across many threads. Replacing the galaxy while those tasks are
+    /// in flight leaves worker threads walking half-old, half-new structures — which is
+    /// exactly the shape of the failures adoption produced: scattered across unrelated
+    /// subsystems, and transient rather than every call. Ship.Summary reading null inside
+    /// IdentifyRefuellingPointBasesWeCanDockAt is one symptom of many.
+    ///
+    /// Message queues are cleared for the same reason the game clears them: they hold
+    /// EmpireMessages referring to objects the swap is about to discard, and binding one
+    /// afterwards throws out of DWGame.Update where nothing catches it.
+    /// </summary>
+    private static void QuiesceBeforeSwap()
+    {
+        if (!FixupEnabled) { _log("# apply: adoption fixup DISABLED (DW2MP_ADOPT_FIXUP=0)"); return; }
+
+        try
+        {
+            var current = AccessTools.PropertyGetter(_game.GetType(), "Galaxy")?.Invoke(_game, null);
+
+            if (current is not null)
+            {
+                AccessTools.Method(current.GetType(), "WaitAllTasksCompleted", Type.EmptyTypes)
+                          ?.Invoke(current, null);
+            }
+
+            AccessTools.Method(_game.GetType(), "ClearMessageQueues", Type.EmptyTypes)
+                      ?.Invoke(_game, null);
+
+            if (!_loggedQuiesce)
+            {
+                _loggedQuiesce = true;
+                _log("# apply: quiesced — galaxy tasks drained, message queues cleared");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("# apply: quiesce failed " + (ex.InnerException ?? ex).Message);
+        }
+    }
+
+    private static bool _loggedQuiesce;
+    private static bool _loggedPathRebuild;
+
+    /// <summary>
+    /// Rebuild inter-system distances for the incoming galaxy.
+    ///
+    /// DWGame.LoadGame calls this before binding the game, and it is the step that makes
+    /// pathfinding valid for the galaxy actually loaded. Without it the pathing tables
+    /// describe whatever galaxy was here before.
+    /// </summary>
+    private static void RebuildPathData(object galaxy)
+    {
+        if (!FixupEnabled) return;
+
+        try
+        {
+            var pathfinding = AccessTools.TypeByName("DistantWorlds.Types.PathFindingSystem");
+            var calc = pathfinding is null
+                ? null
+                : AccessTools.Method(pathfinding, "CalculateSystemDistances", new[] { galaxy.GetType() });
+
+            if (calc is null) { _log("# apply: CalculateSystemDistances not found"); return; }
+
+            var sw = Stopwatch.StartNew();
+            calc.Invoke(calc.IsStatic ? null : pathfinding, new[] { galaxy });
+
+            if (!_loggedPathRebuild)
+            {
+                _loggedPathRebuild = true;
+                _log($"# apply: system distances rebuilt for the adopted galaxy ({sw.Elapsed.TotalMilliseconds:N0}ms)");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("# apply: system distance rebuild failed " + (ex.InnerException ?? ex).Message);
+        }
+    }
+
+    private static bool _loggedSummaries;
+
+    /// <summary>
+    /// Rebuild Ship.Summary on the adopted galaxy.
+    ///
+    /// ShipSummary is DERIVED data and ReadFromStream does not restore it, so ships arrive
+    /// with Summary null. IdentifyRefuellingPointBasesWeCanDockAt then does
+    /// `ship.Summary.DockingBayCount` with no null check and throws — 68 of the 106 crashes
+    /// remaining after the load-sequence fixup, and the single largest family.
+    ///
+    /// Ship.RegenerateSummary() is the game's own rebuild. Only null summaries are touched,
+    /// which keeps the change minimal and makes the logged count evidence: if every ship
+    /// needed one, the field genuinely is not serialised.
+    ///
+    /// Runs on the incoming galaxy BEFORE it goes live, so nothing is iterating it yet.
+    /// </summary>
+    private static void RegenerateShipSummaries(object galaxy)
+    {
+        if (!FixupEnabled) return;
+
+        try
+        {
+            var ships = AccessTools.Field(galaxy.GetType(), "Ships")?.GetValue(galaxy);
+            if (ships is null) { _log("# apply: no Ships collection to rebuild"); return; }
+
+            var listType = ships.GetType();
+            var count = AccessTools.PropertyGetter(listType, "Count")?.Invoke(ships, null) is int c ? c : 0;
+            var item = AccessTools.Method(listType, "get_Item", new[] { typeof(int) });
+            if (item is null) { _log("# apply: ShipList has no indexer"); return; }
+
+            FieldInfo summaryField = null;
+            MethodInfo regenerate = null;
+            int rebuilt = 0;
+
+            for (int i = 0; i < count; i++)
+            {
+                var ship = item.Invoke(ships, new object[] { i });
+                if (ship is null) continue;
+
+                summaryField ??= AccessTools.Field(ship.GetType(), "Summary");
+                regenerate ??= AccessTools.Method(ship.GetType(), "RegenerateSummary", Type.EmptyTypes);
+                if (summaryField is null || regenerate is null) break;
+
+                if (summaryField.GetValue(ship) is not null) continue;
+
+                regenerate.Invoke(ship, null);
+                rebuilt++;
+            }
+
+            if (!_loggedSummaries)
+            {
+                _loggedSummaries = true;
+                _log($"# apply: rebuilt {rebuilt} of {count} ship summaries (null after deserialisation)");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("# apply: ship summary rebuild failed " + (ex.InnerException ?? ex).Message);
+        }
     }
 }
