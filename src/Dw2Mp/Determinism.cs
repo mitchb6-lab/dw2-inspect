@@ -44,6 +44,8 @@ public static class Determinism
 
     private static readonly bool PinBlocks = Env("DW2MP_PIN_BLOCKS", "1") == "1";
 
+    private static readonly long ApplyAfterCycles = EnvLong("DW2MP_APPLY_AFTER_CYCLES", 400);
+
     /// <summary>When set, raw snapshot bytes are written here for byte-level diffing.</summary>
     private static readonly string DumpDir = Env("DW2MP_DUMP_DIR", "");
 
@@ -91,6 +93,9 @@ public static class Determinism
         if (Env("DW2MP_SEQUENTIAL", "0") == "1")
             Sequential.Install(harmony, Log);
 
+        if (Env("DW2MP_MEASURE_APPLY", "0") == "1")
+            ApplyState.Install(harmony, _writeToStream, _galaxyDataType, Log);
+
         var prefix = typeof(Determinism).GetMethod(nameof(OnServerCycle), BindingFlags.NonPublic | BindingFlags.Static);
         harmony.Patch(target, new HarmonyMethod(prefix));
         Log($"# patched {serverType.Name}.{target.Name}");
@@ -110,8 +115,6 @@ public static class Determinism
     {
         try
         {
-            if (_finished) return;
-
             var galaxy = __args is { Length: > 0 } ? __args[0] : null;
             if (galaxy is null || !_galaxyType.IsInstanceOfType(galaxy)) return;
 
@@ -120,6 +123,18 @@ public static class Determinism
             // A loaded save arrives PAUSED: the server cycles happily while Galaxy.Time
             // never moves, so nothing is ever simulated.
             if (n == 1) StartTheClock(__instance);
+
+            // Hand the galaxy to the apply measurement once the game has settled. This
+            // sits ABOVE the _finished check on purpose: the two measurements are
+            // independent, and coupling them meant a completed snapshot run silently
+            // cancelled the apply measurement before it ever armed.
+            if (ApplyState.Ready && n == ApplyAfterCycles)
+            {
+                Log($"# apply: arming at cycle {n}");
+                ApplyState.Arm(galaxy);
+            }
+
+            if (_finished) return;
 
             if (n == 1 || n % HeartbeatEvery == 0)
             {

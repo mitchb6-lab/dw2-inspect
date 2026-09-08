@@ -375,3 +375,53 @@ rebuilds the world every time, the design needs a cheaper application path — p
 state into the live galaxy rather than replacing it — which is a much larger job.
 
 Do not build transport before knowing this number.
+
+### M3b RESULT — applying state to a running client, measured 2026-09-07
+
+```
+raw=39,994,915B   deserialise=819ms   StartGameExisting=8ms   (total client cost 828ms)
+```
+
+**`StartGameExisting` costs 8 ms.** Adopting a foreign galaxy is nearly free on a running
+client; the cost is *parsing* it. That fits the stack trace seen while debugging this —
+the call loads facility images, and on a live client that content is already in memory.
+
+**Correction to M3a.** M3a reported deserialisation at 220 ms. That measurement used
+`RuntimeHelpers.GetUninitializedObject` as the read target, skipping `Galaxy`'s
+constructor, so collections it allocates stayed null and the read bailed out early. The
+same bug made `StartGameExisting` die inside `LoadImagesForFacilities` with a bare
+`NullReferenceException` that looked like the game rejecting foreign state. **Use 819 ms**
+— the only run that produced a galaxy the game actually accepted.
+
+Two steps a receiving client must perform, both learned the hard way:
+
+1. Construct the target galaxy properly (`Activator.CreateInstance`), not
+   `GetUninitializedObject`.
+2. Call `Galaxy.CopyStaticBaseDataToGalaxyInstance` on the incoming galaxy. A
+   deserialised galaxy carries per-game state but not the static definition tables
+   (facilities, races, components), and asset loading walks those.
+
+#### Corrected sync budget
+
+| Stage | Cost |
+|---|---|
+| Host serialise | 373 ms |
+| Host compress (Deflate/Fastest) | 338 ms |
+| Wire | 9.2 MB (23.4 % of 39.3 MB) |
+| Client deserialise | 819 ms |
+| Client apply | 8 ms |
+| **Client total** | **~830 ms** |
+
+A sub-second client hitch per full sync, on a *late-game* 40 MB galaxy — the worst case.
+At one sync every 10 s that is ~920 KB/s. Viable on a LAN; heavy but possible on good
+broadband. Deltas over shorter intervals should improve both figures substantially.
+
+**Both gates are now passed. Host-authoritative is viable.**
+
+#### Not yet verified
+
+The 8 ms says the call *returned*. It does not prove the client then ran correctly on the
+incoming galaxy — no visual or behavioural check was made, and the process was killed on
+a timer rather than observed. **M3c should apply a state that is visibly different (a
+galaxy from a different point in time) and confirm the client actually shows it.** Do
+that before building transport.
