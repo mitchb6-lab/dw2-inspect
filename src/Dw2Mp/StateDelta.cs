@@ -14,20 +14,28 @@ namespace Dw2Mp;
 /// change the memory problem not at all. The only way out is to stop adopting: update the
 /// galaxy the client already has, IN PLACE.
 ///
-/// WHAT IT CARRIES, in three sections:
+/// WHAT IT CARRIES, in two shapes:
 ///
-///   ships     position, hull damage, destroyed-ness      -- what moves on screen
-///   colonies  corruption, approval, quality, max pop     -- what changes on the map
-///   research  per-project progress and researched flag   -- what changes in the UI
+///   FIELD-LEVEL, thresholded -- for the collections with hundreds of members:
+///     ships     position, hull damage, destroyed-ness    -- what moves on screen
+///     colonies  corruption, approval, quality, max pop   -- what changes on the map
+///     research  per-project progress and researched flag -- what changes in the UI
 ///
-/// Only records that actually changed are sent, each against a per-kind threshold, so a
-/// quiet galaxy costs nothing.
+///   WHOLE-OBJECT, membership only -- for the collections with tens:
+///     fleets, characters                                 -- created and removed
 ///
-/// STRUCTURE, TOO -- ships and colonies are created and removed client-side, using DW2's
-/// OWN per-object serialisation. Ship and Colony both expose WriteToStream(BinaryWriter)
-/// and ReadFromStream(Galaxy, BinaryReader), and their list deserialisers do exactly
+/// The split is by CARDINALITY, not taste. Field-level diffing needs someone to name the
+/// fields that matter, which is impossible for objects whose state lives in nested
+/// collections (which ships are in a fleet, which traits a character has). Whole-object
+/// carries them by serialising the object, which costs a full serialise per object per
+/// delta to detect change at all -- affordable for tens, wrong for hundreds.
+///
+/// STRUCTURE IS CARRIED, using DW2's OWN per-object serialisation. Ship, Colony, Fleet and
+/// Character all expose WriteToStream(BinaryWriter) and ReadFromStream(Galaxy, BinaryReader),
+/// and their list deserialisers do exactly
 ///     new T(galaxy); t.ReadFromStream(galaxy, reader); list.Add(t);
-/// when loading a save. So no constructor is reproduced and no field list is guessed.
+/// when loading a save -- except CharacterList, which uses `new Character()`. So no
+/// constructor is reproduced and no field list is guessed.
 ///
 /// This was once documented here as out of scope, on the grounds that building a Ship by
 /// hand would be too risky. That was true and beside the point: the game already knows how,
@@ -36,16 +44,21 @@ namespace Dw2Mp;
 /// ship it had never heard of was skipped forever. Now the gap sits at 1, which is a ship
 /// built between the host's snapshot and the client's apply.
 ///
-/// STILL NOT CARRIED: research projects are created and removed with an empire, not during
-/// play, so they are update-only; and anything reached through a nested collection
-/// (Colony.Population is per-race, fleets, characters, diplomacy) is left to full states.
+/// WHY MEMBERSHIP ONLY for the whole-object kinds: see RefreshEvery. Refreshing their
+/// CONTENTS was built, measured at 32.4 MB and then 5.4 MB of delta traffic against a
+/// 523 KB baseline, and turned off on the numbers. Membership is the part deltas are needed
+/// for -- an object the client does not have is one it can never be told about again.
+///
+/// STILL NOT CARRIED: research projects are created and removed with an empire rather than
+/// during play, so they are update-only; and Colony.Population is a per-race collection,
+/// which is the nested-collection problem one level down. Diplomacy is untouched.
 ///
 /// Deltas carry change AND the structure they can safely reconstruct; full states carry
 /// the rest, and remain the repair path when a delta does not fit.
 /// </summary>
 public static class StateDelta
 {
-    private const int Version = 5;
+    private const int Version = 6;
 
     /// <summary>
     /// Per-kind change thresholds. Without them every float that drifts by a rounding error
@@ -75,6 +88,7 @@ public static class StateDelta
             _lastShips.Clear();
             _lastColonies.Clear();
             _lastResearch.Clear();
+            _lastWhole.Clear();
         }
     }
 
@@ -125,9 +139,14 @@ public static class StateDelta
 
             lock (_baseline)
             {
+                if (!primeOnly) _deltaSequence++;
+
                 changed += WriteShipSection(galaxy, writer, out total, primeOnly);
                 changed += WriteColonySection(galaxy, writer, primeOnly);
                 changed += WriteResearchSection(galaxy, writer);
+
+                foreach (var kind in WholeObjectKinds)
+                    changed += WriteWholeObjectSection(galaxy, writer, kind, primeOnly);
             }
 
             if (changed == 0) return null;
@@ -241,8 +260,16 @@ public static class StateDelta
         {
             if (_serialisers.TryGetValue(type, out var cached)) return cached;
 
+            // (Galaxy) first, then parameterless. DW2's list deserialisers are not uniform:
+            // ShipList/ColonyList/FleetList do `new T(galaxy)`, but CharacterList does
+            // `new Character()`. Looking only for the (Galaxy) form returned a null
+            // constructor for Character and would have failed silently -- the object simply
+            // never gets created and the section reports it absent forever.
+            var ctor = type.GetConstructor(new[] { galaxyType })
+                    ?? type.GetConstructor(Type.EmptyTypes);
+
             var made = new Serialiser(
-                type.GetConstructor(new[] { galaxyType }),
+                ctor,
                 AccessTools.Method(type, "ReadFromStream", new[] { galaxyType, typeof(BinaryReader) }),
                 AccessTools.Method(type, "WriteToStream", new[] { typeof(BinaryWriter) }),
                 AccessTools.Method(type, "RegenerateSummary", Type.EmptyTypes));
@@ -251,6 +278,12 @@ public static class StateDelta
             return made;
         }
     }
+
+    /// <summary>Construct through whichever form this type's list deserialiser uses.</summary>
+    private static object Construct(Serialiser s, object galaxy) =>
+        s.Ctor is null ? null
+        : s.Ctor.GetParameters().Length == 1 ? s.Ctor.Invoke(new[] { galaxy })
+        : s.Ctor.Invoke(null);
 
     private static byte[] SerialiseObject(object item, Type galaxyType)
     {
@@ -389,6 +422,220 @@ public static class StateDelta
         return records.Count;
     }
 
+
+    // ------------------------------------------- whole-object sections (fleets, characters)
+    //
+    // Fleets and characters are carried WHOLE rather than field by field, and refreshed IN
+    // PLACE rather than replaced.
+    //
+    // Why whole. Their meaningful state lives in nested collections and object references --
+    // which ships are in a fleet, which traits and skills a character has, where it is
+    // stationed. A scalar diff cannot express any of that, which is exactly why both were
+    // excluded when deltas carried only scalars. Serialising the object hands the whole
+    // problem to DW2's own writer.
+    //
+    // Why in place. Ship.ReadFromStream and Character.ReadFromStream both end `ldarg.0; ret`
+    // -- they populate the instance they are CALLED ON and return it. So an object the client
+    // already has can be refreshed by calling ReadFromStream on it with the host's bytes:
+    // every field repopulated by DW2's reader, and the object identity preserved. Removing
+    // and re-adding would have worked too, and would have broken every reference another
+    // object holds to the old instance and reordered the list for no gain.
+    //
+    // Why not ships. This costs a full serialise per object per delta, on both sides, to
+    // detect change at all. That is affordable for tens of fleets and characters and wrong
+    // for hundreds of ships -- which is why ships keep field-level diffing with thresholds.
+    // The two strategies are chosen by cardinality, not by taste.
+    //
+    // Change detection is a hash of the serialised bytes: exact, with no threshold to tune
+    // and no judgement about which fields matter.
+
+    private sealed record WholeObjectKind(string Collection, string TypeName, string IdField, bool IdIsShort);
+
+    private static readonly WholeObjectKind[] WholeObjectKinds =
+    {
+        new("Fleets",     "DistantWorlds.Types.Fleet",     "FleetId",     IdIsShort: true),
+        new("Characters", "DistantWorlds.Types.Character", "CharacterId", IdIsShort: false),
+    };
+
+    private static readonly Dictionary<(string Kind, long Id), ulong> _lastWhole = new();
+
+    private static ulong HashBytes(byte[] bytes)
+    {
+        // FNV-1a. Only ever compared against itself, so the choice is about speed, not
+        // cryptography -- and a collision costs one skipped update, not corruption.
+        ulong h = 14695981039346656037UL;
+        foreach (var b in bytes) { h ^= b; h *= 1099511628211UL; }
+        return h;
+    }
+
+    /// <summary>
+    /// How often a whole object is refreshed when only its CONTENTS changed.
+    /// **0 means never** -- creations and removals only, which is where this landed.
+    ///
+    /// Measured over three 240-second runs, against a 523 KB baseline before fleets and
+    /// characters existed:
+    ///
+    ///     refresh every delta   32.4 MB   -- more than the four full states it replaces
+    ///     refresh every 10th     5.4 MB   -- 4 characters eating ~90% of the delta budget
+    ///     membership only        (below)
+    ///
+    /// The detector is a byte hash, which is exact and therefore cannot tell "this
+    /// character's allegiance flipped" from "a timestamp advanced". Character carries
+    /// DateArrivedAtLocation, LastBattleDate, GhostCountdown and a growing GameEvents list,
+    /// so every character is "changed" on every delta at ~3.5 KB each.
+    ///
+    /// At every-10th the refresh interval is 30 s against a full state every 60 s -- twice
+    /// as fresh, for roughly ten times the traffic, to keep FOUR objects current. That is a
+    /// bad exchange rate, and it is the measurement rather than the taste that decides it.
+    ///
+    /// What deltas are actually needed for here is SET MEMBERSHIP: an object the client does
+    /// not have is one it can never be told about again, because every update naming it is
+    /// skipped as absent. Contents are merely stale, and a full state fixes them. So
+    /// membership is immediate and contents wait.
+    ///
+    /// Raise this above 0 if a client-side feature ever needs fresher fleet or character
+    /// internals than the full-state interval; the machinery is intact and this is the only
+    /// line to change.
+    /// </summary>
+    private const int RefreshEvery = 0;
+
+    private static long _deltaSequence;
+
+    private static int WriteWholeObjectSection(object galaxy, BinaryWriter writer, WholeObjectKind kind, bool primeOnly)
+    {
+        var list = ListField(galaxy, kind.Collection);
+        var item = Indexer(list);
+        int count = CountOf(list);
+
+        bool refreshWindow = primeOnly || (RefreshEvery > 0 && _deltaSequence % RefreshEvery == 0);
+
+        var present = new HashSet<long>();
+        var upserts = new List<(long Id, byte[] Bytes)>();
+
+        for (int i = 0; i < count && item is not null; i++)
+        {
+            var element = At(item, list, i);
+            if (element is null) continue;
+
+            var idField = AccessTools.Field(element.GetType(), kind.IdField);
+            if (idField is null) break;
+
+            long id;
+            try { id = Convert.ToInt64(idField.GetValue(element)); }
+            catch { continue; }
+
+            present.Add(id);
+
+            var key = (kind.Collection, id);
+            bool isNew = !_lastWhole.ContainsKey(key);
+
+            // Outside a refresh window an existing object is not even serialised. That is
+            // most of the saving: serialising to compare is the expensive half.
+            if (!isNew && !refreshWindow) continue;
+
+            var bytes = SerialiseObject(element, galaxy.GetType());
+            if (bytes is null) continue;
+
+            var hash = HashBytes(bytes);
+            if (!isNew && _lastWhole[key] == hash) continue;
+
+            _lastWhole[key] = hash;
+            if (!primeOnly) upserts.Add((id, bytes));
+        }
+
+        var removed = _lastWhole.Keys
+            .Where(k => k.Kind == kind.Collection && !present.Contains(k.Id))
+            .Select(k => k.Id)
+            .ToList();
+
+        foreach (var id in removed) _lastWhole.Remove((kind.Collection, id));
+
+        writer.Write(removed.Count);
+        foreach (var id in removed) WriteId(writer, id, kind.IdIsShort);
+
+        writer.Write(upserts.Count);
+        foreach (var (id, bytes) in upserts)
+        {
+            WriteId(writer, id, kind.IdIsShort);
+            writer.Write(bytes.Length);
+            writer.Write(bytes);
+        }
+
+        return removed.Count + upserts.Count;
+    }
+
+    private static void WriteId(BinaryWriter writer, long id, bool asShort)
+    {
+        if (asShort) writer.Write((short)id); else writer.Write((int)id);
+    }
+
+    private static long ReadId(BinaryReader reader, bool asShort) =>
+        asShort ? reader.ReadInt16() : reader.ReadInt32();
+
+    private static int ApplyWholeObjectSection(object galaxy, BinaryReader reader, WholeObjectKind kind, out int absent)
+    {
+        absent = 0;
+
+        var list = ListField(galaxy, kind.Collection);
+        var getById = ById(list, kind.IdIsShort ? typeof(short) : typeof(int))
+                   ?? ById(list, kind.IdIsShort ? typeof(int) : typeof(short));
+        var type = AccessTools.TypeByName(kind.TypeName);
+        int applied = 0;
+
+        int removedCount = reader.ReadInt32();
+        for (int i = 0; i < removedCount; i++)
+        {
+            long id = ReadId(reader, kind.IdIsShort);
+            var element = Lookup(getById, list, id);
+            if (element is null) { absent++; continue; }
+
+            if (RemoveFromList(list, element)) applied++; else absent++;
+        }
+
+        int upsertCount = reader.ReadInt32();
+        for (int i = 0; i < upsertCount; i++)
+        {
+            long id = ReadId(reader, kind.IdIsShort);
+            int length = reader.ReadInt32();
+            var bytes = length > 0 ? reader.ReadBytes(length) : null;
+            if (bytes is null || bytes.Length != length) { absent++; continue; }
+
+            var existing = Lookup(getById, list, id);
+
+            if (existing is not null)
+            {
+                if (RefreshInPlace(galaxy, existing, bytes)) applied++; else absent++;
+                continue;
+            }
+
+            if (AddFromBytes(galaxy, list, type, bytes)) applied++; else absent++;
+        }
+
+        return applied;
+    }
+
+    /// <summary>
+    /// Repopulate an object the client already has, from the host's bytes, without replacing
+    /// it. See the section comment above for why identity is worth preserving.
+    /// </summary>
+    private static bool RefreshInPlace(object galaxy, object existing, byte[] bytes)
+    {
+        try
+        {
+            var s = SerialiserFor(existing.GetType(), galaxy.GetType());
+            if (s.Read is null) return false;
+
+            using var input = new MemoryStream(bytes, writable: false);
+            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+
+            var result = s.Read.Invoke(existing, new[] { galaxy, (object)reader });
+            if (result is null) return false;      // the reader's own bad-id early-out
+
+            s.Regenerate?.Invoke(existing, null);
+            return true;
+        }
+        catch { return false; }
+    }
     // ---------------------------------------------------------------- client
 
     /// <summary>
@@ -419,6 +666,15 @@ public static class StateDelta
             if (ships + absentShips > 0) parts.Add($"{ships} ship(s)" + (absentShips > 0 ? $" +{absentShips} absent" : ""));
             if (colonies + absentColonies > 0) parts.Add($"{colonies} colony" + (absentColonies > 0 ? $" +{absentColonies} absent" : ""));
             if (research + absentResearch > 0) parts.Add($"{research} project(s)" + (absentResearch > 0 ? $" +{absentResearch} absent" : ""));
+
+            // Order matters and is the wire format: the reader must consume these sections in
+            // the same order the writer produced them, so both iterate WholeObjectKinds.
+            foreach (var kind in WholeObjectKinds)
+            {
+                int n = ApplyWholeObjectSection(galaxy, reader, kind, out int missed);
+                if (n + missed > 0)
+                    parts.Add($"{n} {kind.Collection.ToLowerInvariant()}" + (missed > 0 ? $" +{missed} absent" : ""));
+            }
 
             info = string.Join(", ", parts) +
                    (hostShips != localShips ? $" [have {localShips} of host's {hostShips} ships]" : "") +
@@ -507,9 +763,10 @@ public static class StateDelta
             if (list is null || elementType is null) return false;
 
             var s = SerialiserFor(elementType, galaxy.GetType());
-            if (s.Ctor is null || s.Read is null) return false;
+            if (s.Read is null) return false;
 
-            var blank = s.Ctor.Invoke(new[] { galaxy });
+            var blank = Construct(s, galaxy);
+            if (blank is null) return false;
 
             using var input = new MemoryStream(bytes, writable: false);
             using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
@@ -843,4 +1100,22 @@ public static class StateDelta
 
     private static bool ResearchDiffers(ResearchState a, ResearchState b) =>
         a.Researched != b.Researched || Math.Abs(a.Progress - b.Progress) > MinResearchChange;
+
+    /// <summary>
+    /// Sizes of the collections deltas carry, for logging once at startup.
+    ///
+    /// Worth having because "0 fleets were sent" has two very different meanings -- the
+    /// section is broken, or this galaxy has no fleets yet -- and the delta log alone cannot
+    /// tell them apart.
+    /// </summary>
+    public static string Census(object galaxy)
+    {
+        if (galaxy is null) return "no galaxy";
+
+        var parts = new List<string>();
+        foreach (var name in new[] { "Ships", "Colonies", "Fleets", "Characters", "Empires" })
+            parts.Add($"{name}={CountOf(ListField(galaxy, name))}");
+
+        return string.Join(" ", parts);
+    }
 }

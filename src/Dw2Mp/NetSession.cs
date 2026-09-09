@@ -630,23 +630,39 @@ public static class NetSession
     {
         try
         {
+            // Timed because the whole-object sections serialise every fleet and character
+            // to detect change at all, on the simulation thread. That is the one part of
+            // delta building whose cost scales with something other than what moved, so it
+            // is the part worth watching rather than assuming.
+            var sw = Stopwatch.StartNew();
             var payload = StateDelta.Build(galaxy, out int changed, out int total);
+            var buildMs = sw.Elapsed.TotalMilliseconds;
+
+            _deltaBuildMs += buildMs;
+            if (buildMs > _worstDeltaBuildMs) _worstDeltaBuildMs = buildMs;
+
             if (payload is null) return;
 
             Send(Msg.Delta, payload);
             _deltasSent++;
             _deltaBytes += payload.Length;
 
+            if (_deltasSent == 1) _log("# net[host]: galaxy census — " + StateDelta.Census(galaxy));
+
             if (_deltasSent % 50 == 1)
                 _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed} record(s) changed " +
-                     $"across ships/colonies/research ({total} ships total) " +
-                     $"({payload.Length:N0}B; {_deltaBytes:N0}B total, vs {_syncsSent} full state(s))");
+                     $"({total} ships total) ({payload.Length:N0}B; {_deltaBytes:N0}B total, " +
+                     $"vs {_syncsSent} full state(s)) build={buildMs:N1}ms " +
+                     $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms");
         }
         catch (Exception ex)
         {
             _log("# net[host]: delta failed " + ex.GetType().Name + ": " + ex.Message);
         }
     }
+
+    private static double _deltaBuildMs;
+    private static double _worstDeltaBuildMs;
     /// <summary>
     /// Tick plus a structural fingerprint. Tens of bytes, computed by reading two fields
     /// per ship — against 24 MB of serialisation and ~100 ms for a full state.

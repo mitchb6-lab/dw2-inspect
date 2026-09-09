@@ -1598,3 +1598,68 @@ it. Knowing that from the earlier work is what made this safe first time.
   come and go, which is the same problem one level down.
 
 Full states remain the repair path when a delta does not fit.
+
+---
+
+## Fleets and characters — 2026-09-08, and the refresh half was measured out again
+
+Deltas now carry **fleet and character membership**: created and removed client-side, using
+DW2's own per-object serialisation like ships and colonies.
+
+### The exclusion was half right
+
+Both were excluded as "reached through a nested collection" — a fleet's membership, a
+character's traits — which a field-level diff cannot express. That part was correct. What it
+missed is that the nested collection is not a problem if you never touch it: serialising the
+whole object hands it to DW2's writer, exactly as for ships.
+
+Two details the ship path did not cover:
+
+- **`CharacterList` uses `new Character()`, not `new Character(galaxy)`.** `ShipList`,
+  `ColonyList` and `FleetList` all take the galaxy; `CharacterList` does not. The resolver
+  looked only for the `(Galaxy)` form, so it returned a null constructor for `Character` and
+  would have failed **silently** — the object simply never created, reported absent forever.
+  It now falls back to the parameterless form.
+- **`ReadFromStream` returns `this`.** `Ship` and `Character` both end `ldarg.0; ret`, so it
+  populates the instance it is *called on*. That makes refresh-in-place possible: an object
+  the client already has can be repopulated from the host's bytes without being replaced,
+  preserving identity and list order. Remove-and-re-add would have worked and would have
+  broken every reference another object held to the old instance, for no gain.
+
+### Then the refresh half was measured, and turned off
+
+Refreshing contents was built, and cost this, over three 240-second runs against a **523 KB**
+baseline:
+
+| Policy | Delta traffic |
+|---|---:|
+| Refresh on every change | **32.4 MB** — more than the four full states it replaces |
+| Refresh every 10th delta | **5.4 MB** — four characters eating ~90% of the budget |
+| **Membership only** | **546 KB** ✅ |
+
+The cause is that the change detector is a **byte hash** — exact, and therefore unable to
+tell "this character's allegiance flipped" from "a timestamp advanced". `Character` carries
+`DateArrivedAtLocation`, `LastBattleDate`, `GhostCountdown` and a growing `GameEvents` list,
+so every character was changed on every delta at ~3.5 KB each.
+
+At every-10th, the refresh interval is 30 s against a full state every 60 s — **twice as
+fresh for ten times the traffic, to keep four objects current.** That is a bad exchange rate,
+and the number decided it rather than the taste.
+
+What survives is the part deltas are actually needed for. **Set membership is
+irrecoverable**: an object the client does not have is one it can never be told about again,
+because every update naming it is skipped as absent. Contents are merely stale, and the next
+full state fixes them. `RefreshEvery` is one constant and the machinery is intact, so a
+client-side feature that ever needs fresher internals turns it back on.
+
+### Honest limits
+
+- **The fleet path is implemented but UNEXERCISED.** The census added for exactly this
+  reason says `Ships=45 Colonies=3 Fleets=0 Characters=5 Empires=11` — this early-game
+  galaxy has no fleets at all, so nothing has ever run through that half. "0 fleets were
+  sent" and "the section is broken" look identical in a delta log, which is why the census
+  exists.
+- **Delta build now costs avg 5.3 ms, worst 29.8 ms** on the simulation thread. This is
+  newly *visible* rather than newly introduced — the timing was added in the same change.
+  The likely bulk is the research section walking ~10,300 projects every delta, which
+  predates fleets and characters. Worth measuring properly before it matters.
