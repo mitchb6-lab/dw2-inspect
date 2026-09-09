@@ -1728,3 +1728,62 @@ cumulative totals rather than a better sample rate, because a total has no phase
 5 full states, ~1,650 deltas, 770 KB of delta traffic
 delta build avg 0.8 ms  [research=0.46 ships=0.14 fleets=0.07 characters=0.03 colonies=0.03]
 ```
+
+---
+
+## The 24.8 ms spike, attributed — 2026-09-09
+
+`worst=24.8ms` against a 0.8 ms mean. It is **two different things**, and the larger one is
+not ours.
+
+### The steady-state spikes are GC pauses charged to whatever was running
+
+40 builds in a 240-second run exceeded 5 ms, mostly 5–12 ms. The evidence, in the order it
+arrived:
+
+| Observation | |
+|---|---|
+| A gen0 collection ran inside **42 of 42** slow builds | |
+| …and inside **0 of 6** sampled typical builds | |
+| The section blamed was `research` 20×, `ships` 17×, `fleets` 3× | |
+| **`fleets[n=0 +0 -0]` was charged 4.63 ms** | ← the one that settles it |
+
+A section that saw zero objects, sent none and removed none **cannot take 4.63 ms doing it.**
+So a section's elapsed time can be almost entirely stall, and `Timed` — which measures
+wall-clock around the call — attributes a pause to whichever section was executing when it
+landed.
+
+**This corrects an inference made earlier the same day.** The first reading of the GC
+correlation argued causation ran work → GC, on the grounds that "the elapsed time is inside
+a named section, so the work is ours". That reasoning was wrong, and the empty fleet section
+is what disproved it. Time inside a section is not evidence the section spent it.
+
+Research and ships lead the table because they are the **longest** sections, so they are the
+most likely to be mid-flight when a collection lands. That is a selection effect, not a cost:
+a 0.2 ms build rarely overlaps a collection, a 2 ms build often does.
+
+**DW2 allocates across ~230 threads and a gen0 collection suspends all of them.** A mod
+cannot avoid a process-wide pause. What it can do is be running for less of the time a pause
+might land in — which is exactly what the research work already did, and why the spike
+population shrank along with the mean.
+
+### The two genuine outliers are startup, and they are real work
+
+| Build | Cost | What |
+|---:|---:|---|
+| #1 | 20–22 ms | first delta — creating every ship, colony and character from an empty baseline |
+| #5 | 20 ms | first research window — 10,300 projects compared against a baseline primed several seconds earlier |
+
+Both are one-off. Neither recurs, and reporting a `worst` without saying *which build* made
+the pair look like steady-state behaviour. The log now carries `worst=20.9ms@#5`.
+
+### What this changes, and what it does not
+
+Nothing needs fixing. The steady-state spike is not delta work, and the two large outliers
+are unavoidable first-time costs paid once per session. The useful outcome is the
+instrumentation:
+
+- per-build section breakdown, not just running averages — an average cannot explain an outlier
+- GC counts **on typical builds too**, because a correlation with no control is not evidence
+- collection sizes per section, which is what exposed the empty-section charge
+- `worst` carries the build index, so startup cannot masquerade as steady state

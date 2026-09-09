@@ -129,6 +129,13 @@ public static class StateDelta
     private static readonly Dictionary<string, double> _sectionMs = new();
     private static long _sectionSamples;
 
+    // Per-BUILD section times, reset each build, alongside the running totals. The averages
+    // alone cannot explain a spike: they say what a typical build costs, and a spike is by
+    // definition not typical. A 24.8 ms worst against a 0.8 ms mean is either one build doing
+    // far more work than the rest, or something outside this code stalling it -- and those
+    // want different answers, so the instrumentation has to separate them.
+    private static readonly Dictionary<string, double> _thisBuildMs = new();
+
     private static int Timed(string name, Func<int> section)
     {
         var sw = Stopwatch.StartNew();
@@ -137,8 +144,33 @@ public static class StateDelta
         {
             var ms = sw.Elapsed.TotalMilliseconds;
             _sectionMs[name] = _sectionMs.TryGetValue(name, out var v) ? v + ms : ms;
+            _thisBuildMs[name] = ms;
         }
     }
+
+    /// <summary>What the most recent build spent, section by section.</summary>
+    public static string LastBuildBreakdown()
+    {
+        lock (_baseline)
+        {
+            if (_thisBuildMs.Count == 0) return "no sections";
+            return string.Join(" ", _thisBuildMs
+                .OrderByDescending(kv => kv.Value)
+                .Select(kv => $"{kv.Key}={kv.Value:N2}ms"));
+        }
+    }
+
+    /// <summary>
+    /// Garbage collections that happened during the most recent build.
+    ///
+    /// The discriminator for the spike. If a slow build coincides with a gen2 collection it
+    /// is the GC stalling us, and no amount of making the sections faster will remove it --
+    /// the answer would be allocating less. If it does not, the work really is ours.
+    /// </summary>
+    public static string LastBuildCollections() =>
+        $"gc0={_gcDuringBuild[0]} gc1={_gcDuringBuild[1]} gc2={_gcDuringBuild[2]}";
+
+    private static readonly int[] _gcDuringBuild = new int[3];
 
     /// <summary>Mean milliseconds per build, per section. For logging.</summary>
     public static string SectionTimings()
@@ -170,6 +202,9 @@ public static class StateDelta
             {
                 if (!primeOnly) { _deltaSequence++; _sectionSamples++; }
 
+                _thisBuildMs.Clear();
+                int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+
                 int shipTotal = 0;
                 changed += Timed("ships", () => WriteShipSection(galaxy, writer, out shipTotal, primeOnly));
                 total = shipTotal;
@@ -183,6 +218,9 @@ public static class StateDelta
                     changed += Timed(k.Collection.ToLowerInvariant(),
                                      () => WriteWholeObjectSection(galaxy, writer, k, primeOnly));
                 }
+                _gcDuringBuild[0] = GC.CollectionCount(0) - g0;
+                _gcDuringBuild[1] = GC.CollectionCount(1) - g1;
+                _gcDuringBuild[2] = GC.CollectionCount(2) - g2;
             }
 
             if (changed == 0) return null;
@@ -652,6 +690,8 @@ public static class StateDelta
             writer.Write(bytes.Length);
             writer.Write(bytes);
         }
+
+        _lastWholeCounts[kind.Collection.ToLowerInvariant()] = (count, upserts.Count, removed.Count);
 
         return removed.Count + upserts.Count;
     }
@@ -1237,6 +1277,22 @@ public static class StateDelta
         {
             if (_appliedTotals.Count == 0) return "nothing applied yet";
             return string.Join(" ", _appliedTotals.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value:N0}"));
+        }
+    }
+
+    // What each whole-object section actually saw, last build. Added because a fleet-led
+    // 21.4 ms spike appeared in a galaxy whose census reported Fleets=0 and whose client
+    // applied no fleets at all -- three facts that cannot all be true of a section doing
+    // nothing, and no amount of re-reading the timings distinguishes them.
+    private static readonly Dictionary<string, (int Count, int Upserts, int Removed)> _lastWholeCounts = new();
+
+    public static string LastWholeCounts()
+    {
+        lock (_baseline)
+        {
+            if (_lastWholeCounts.Count == 0) return "none";
+            return string.Join(" ", _lastWholeCounts.Select(kv =>
+                $"{kv.Key}[n={kv.Value.Count} +{kv.Value.Upserts} -{kv.Value.Removed}]"));
         }
     }
 }

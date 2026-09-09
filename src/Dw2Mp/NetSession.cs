@@ -639,7 +639,15 @@ public static class NetSession
             var buildMs = sw.Elapsed.TotalMilliseconds;
 
             _deltaBuildMs += buildMs;
-            if (buildMs > _worstDeltaBuildMs) _worstDeltaBuildMs = buildMs;
+            if (buildMs > _worstDeltaBuildMs) { _worstDeltaBuildMs = buildMs; _worstDeltaAt = _deltasSent + 1; }
+
+            // Every slow build is reported the moment it happens, with WHICH build it was,
+            // what it spent per section, and whether a collection ran inside it. A running
+            // average cannot explain an outlier, and a "worst" with no index cannot say
+            // whether the outlier was startup or steady state.
+            if (buildMs > SlowBuildMs)
+                _log($"# net[host]: SLOW delta build #{_deltasSent + 1} {buildMs:N1}ms " +
+                     $"[{StateDelta.LastBuildBreakdown()}] [{StateDelta.LastBuildCollections()}] [{StateDelta.LastWholeCounts()}]");
 
             if (payload is null) return;
 
@@ -653,8 +661,8 @@ public static class NetSession
                 _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed} record(s) changed " +
                      $"({total} ships total) ({payload.Length:N0}B; {_deltaBytes:N0}B total, " +
                      $"vs {_syncsSent} full state(s)) build={buildMs:N1}ms " +
-                     $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms " +
-                     $"[{StateDelta.SectionTimings()}]");
+                     $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms@#{_worstDeltaAt} " +
+                     $"[{StateDelta.SectionTimings()}] [{StateDelta.LastBuildCollections()}]");
         }
         catch (Exception ex)
         {
@@ -664,6 +672,10 @@ public static class NetSession
 
     private static double _deltaBuildMs;
     private static double _worstDeltaBuildMs;
+    private static long _worstDeltaAt;
+
+    /// <summary>Anything above this is an outlier worth a line of its own, not a statistic.</summary>
+    private const double SlowBuildMs = 5.0;
     /// <summary>
     /// Tick plus a structural fingerprint. Tens of bytes, computed by reading two fields
     /// per ship — against 24 MB of serialisation and ~100 ms for a full state.
