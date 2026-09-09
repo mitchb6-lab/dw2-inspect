@@ -1787,3 +1787,73 @@ instrumentation:
 - GC counts **on typical builds too**, because a correlation with no control is not evidence
 - collection sizes per section, which is what exposed the empty-section charge
 - `worst` carries the build index, so startup cannot masquerade as steady state
+
+---
+
+## Fleets: the collection was wrong, not the galaxy — 2026-09-09
+
+The fleet path had never executed. Three runs reported `Fleets=0`, and that was read as "this
+early-game galaxy has not formed any yet". A bigger galaxy was run to make them form.
+
+**It did not, and that is what gave the answer.** A 50-star, 19-empire galaxy over 480 seconds
+scaled everything else and not fleets:
+
+| | 15-star | 50-star |
+|---|---:|---:|
+| Ships | 273 | 576 |
+| Colonies | 3 | 15 |
+| Empires | 9 | 19 |
+| **Fleets** | 0 | **0**, across all 330 sampled deltas |
+
+Everything scaling except one collection is not what "too small" looks like. **`Galaxy.Fleets`
+exists, is a `FleetList`, and is permanently empty — fleets live on `Empire.Fleets`, one list
+per empire.**
+
+### The census worked and was misread
+
+`Fleets=0` meant *"this collection has no fleets, ever"*, not *"this galaxy has none yet"*. The
+census had been added specifically to tell those apart, and was then read the wrong way anyway.
+
+**A count of zero cannot distinguish an empty collection from the wrong collection.** Only
+knowing where the objects live can, and a plausible field name at the galaxy level is not
+evidence — the same trap as `Empire.Name` being a property and `EmpireId` being `Int16`.
+
+Two things had to line up to hide it: a convincing field name, and a galaxy small enough that
+"no fleets yet" was a believable story. The bigger run removed the second, which exposed the
+first.
+
+### What changed
+
+- Fleets moved out of the galaxy-level whole-object table into their own **two-level walk**
+  over `Galaxy.Empires` → `Empire.Fleets`.
+- **The key packs both ids.** `Fleet.FleetId` is an `Int16` scoped to its empire's list, so two
+  empires can each own a fleet #1. A baseline keyed on `FleetId` alone would have treated one
+  empire's fleet as a change to another's. `(empireId << 16) | fleetId` makes the collision
+  impossible rather than unlikely.
+- The census now sums `Empire.Fleets` across empires, so the number it prints is about the
+  place the code actually reads.
+- Wire version 6 → 7: the section layout changed.
+
+### Verified end to end
+
+```
+host    fleets[n=1 +1 -0]   once -- a fleet formed and was sent
+host    fleets[n=1 +0 -0]   x171 -- present, nothing to send (membership only)
+client  totals: ... fleets=1     -- applied
+0 crash dumps, both processes alive at 480 s, peak 8.7 GB each
+```
+
+`new Fleet(galaxy)` → `Fleet.ReadFromStream` → `CheckAdd` ran on a real fleet and worked. None
+of the three risks flagged before the run materialised: serialising a fleet was not expensive,
+the `Int16` `GetById` overload resolved, and ships-before-fleets ordering held.
+
+**The per-delta log never showed it** — the fleet arrived on a delta the every-50th sampler did
+not land on. The cumulative totals caught it, which is the mechanism added after the research
+blind spot. A fix for one measurement trap paid for itself on an unrelated one.
+
+### Honest limit
+
+**One** fleet formed in eight minutes across eighteen empires. The path is now exercised rather
+than unexercised, but lightly: one creation, no removal, and no case where two empires both own
+a fleet — which is precisely what the packed key exists to handle. That specific collision is
+still untested.

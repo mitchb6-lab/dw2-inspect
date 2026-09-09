@@ -59,7 +59,7 @@ namespace Dw2Mp;
 /// </summary>
 public static class StateDelta
 {
-    private const int Version = 6;
+    private const int Version = 7;
 
     /// <summary>
     /// Per-kind change thresholds. Without them every float that drifts by a rounding error
@@ -218,6 +218,8 @@ public static class StateDelta
                     changed += Timed(k.Collection.ToLowerInvariant(),
                                      () => WriteWholeObjectSection(galaxy, writer, k, primeOnly));
                 }
+
+                changed += Timed("fleets", () => WriteFleetSection(galaxy, writer, primeOnly));
                 _gcDuringBuild[0] = GC.CollectionCount(0) - g0;
                 _gcDuringBuild[1] = GC.CollectionCount(1) - g1;
                 _gcDuringBuild[2] = GC.CollectionCount(2) - g2;
@@ -580,10 +582,22 @@ public static class StateDelta
     // and no judgement about which fields matter.
 
     private sealed record WholeObjectKind(string Collection, string TypeName, string IdField, bool IdIsShort);
-
+    /// <summary>
+    /// Galaxy-level whole-object collections.
+    ///
+    /// Fleets are NOT here, and the reason is worth recording. `Galaxy.Fleets` exists, is a
+    /// FleetList, and is permanently EMPTY -- fleets live on `Empire.Fleets`, one list per
+    /// empire. Pointed at the galaxy-level field, the section ran 330 times across a 480-second
+    /// run in a 50-star galaxy with 19 empires and 576 ships and saw `n=0` every time.
+    ///
+    /// The census reported `Fleets=0` from the first run and that was read as "this galaxy has
+    /// no fleets yet". It actually meant "this collection has no fleets, ever". A count of zero
+    /// cannot tell an empty collection from the wrong one -- and a plausible field name is not
+    /// evidence it is the one the game uses, which is the same trap as Empire.Name being a
+    /// property and EmpireId being Int16.
+    /// </summary>
     private static readonly WholeObjectKind[] WholeObjectKinds =
     {
-        new("Fleets",     "DistantWorlds.Types.Fleet",     "FleetId",     IdIsShort: true),
         new("Characters", "DistantWorlds.Types.Character", "CharacterId", IdIsShort: false),
     };
 
@@ -812,6 +826,14 @@ public static class StateDelta
                 if (n + missed > 0)
                     parts.Add($"{n} {kind.Collection.ToLowerInvariant()}" + (missed > 0 ? $" +{missed} absent" : ""));
             }
+
+            // Fleets read LAST, matching the order Build writes them. The reader consumes
+            // sections positionally, so this pairing IS the wire format: swap the two and
+            // every field afterwards is read from the wrong offsets.
+            int fleets = ApplyFleetSection(galaxy, reader, out int absentFleets);
+            CountApplied("fleets", fleets);
+            if (fleets + absentFleets > 0)
+                parts.Add($"{fleets} fleet(s)" + (absentFleets > 0 ? $" +{absentFleets} absent" : ""));
 
             info = string.Join(", ", parts) +
                    (hostShips != localShips ? $" [have {localShips} of host's {hostShips} ships]" : "") +
@@ -1250,8 +1272,12 @@ public static class StateDelta
         if (galaxy is null) return "no galaxy";
 
         var parts = new List<string>();
-        foreach (var name in new[] { "Ships", "Colonies", "Fleets", "Characters", "Empires" })
+        foreach (var name in new[] { "Ships", "Colonies", "Characters", "Empires" })
             parts.Add($"{name}={CountOf(ListField(galaxy, name))}");
+
+        // Fleets counted where they actually live -- summed over Empire.Fleets, not read off
+        // the permanently-empty Galaxy.Fleets that made this line report 0 for three runs.
+        parts.Add($"Fleets={CountFleets(galaxy)}");
 
         return string.Join(" ", parts);
     }
@@ -1294,5 +1320,158 @@ public static class StateDelta
             return string.Join(" ", _lastWholeCounts.Select(kv =>
                 $"{kv.Key}[n={kv.Value.Count} +{kv.Value.Upserts} -{kv.Value.Removed}]"));
         }
+    }
+
+    // ------------------------------------------------- fleets (per empire, whole object)
+    //
+    // Fleets live on Empire.Fleets, one list per empire, so they need a two-level walk that
+    // the galaxy-level whole-object path does not do. They are otherwise identical: carried
+    // whole, membership only, created through DW2's own `new Fleet(galaxy)` +
+    // Fleet.ReadFromStream.
+    //
+    // The KEY packs both ids. Fleet.FleetId is an Int16 scoped to its empire's list, so two
+    // empires can each own a fleet #1; a baseline keyed on FleetId alone would treat one as a
+    // change to the other and send neither correctly. Packing empire and fleet into one int
+    // keeps a single wire shape and makes the collision impossible rather than unlikely.
+
+    private static int PackFleetKey(short empireId, short fleetId) =>
+        ((ushort)empireId << 16) | (ushort)fleetId;
+
+    private static (short Empire, short Fleet) UnpackFleetKey(int key) =>
+        ((short)(ushort)(key >> 16), (short)(ushort)(key & 0xFFFF));
+
+    private static int _lastFleetCount;
+
+    private static int WriteFleetSection(object galaxy, BinaryWriter writer, bool primeOnly)
+    {
+        var empires = ListField(galaxy, "Empires");
+        var empireItem = Indexer(empires);
+        int empireCount = CountOf(empires);
+
+        var present = new HashSet<long>();
+        var upserts = new List<(int Key, byte[] Bytes)>();
+        int seen = 0;
+
+        for (int e = 0; e < empireCount && empireItem is not null; e++)
+        {
+            var empire = At(empireItem, empires, e);
+            if (empire is null) continue;
+
+            var empireIdGetter = FastAccess.Getter<short>(empire.GetType(), "EmpireId");
+            if (empireIdGetter is null) continue;
+            short empireId = empireIdGetter(empire);
+
+            var fleets = AccessTools.Field(empire.GetType(), "Fleets")?.GetValue(empire);
+            int fleetCount = CountOf(fleets);
+            if (fleets is null || fleetCount == 0) continue;
+
+            var fleetItem = FastAccess.Indexer(fleets.GetType());
+            if (fleetItem is null) continue;
+
+            for (int f = 0; f < fleetCount; f++)
+            {
+                var fleet = fleetItem(fleets, f);
+                if (fleet is null) continue;
+
+                var idGetter = FastAccess.Getter<short>(fleet.GetType(), "FleetId");
+                if (idGetter is null) break;
+
+                seen++;
+                int key = PackFleetKey(empireId, idGetter(fleet));
+                present.Add(key);
+
+                var mapKey = ("Fleets", (long)key);
+                bool isNew = !_lastWhole.ContainsKey(mapKey);
+                if (!isNew) continue;                       // membership only, as for characters
+
+                var bytes = SerialiseObject(fleet, galaxy.GetType());
+                if (bytes is null) continue;
+
+                _lastWhole[mapKey] = HashBytes(bytes);
+                if (!primeOnly) upserts.Add((key, bytes));
+            }
+        }
+
+        var removed = _lastWhole.Keys
+            .Where(k => k.Kind == "Fleets" && !present.Contains(k.Id))
+            .Select(k => (int)k.Id)
+            .ToList();
+
+        foreach (var key in removed) _lastWhole.Remove(("Fleets", key));
+
+        writer.Write(removed.Count);
+        foreach (var key in removed) writer.Write(key);
+
+        writer.Write(upserts.Count);
+        foreach (var (key, bytes) in upserts)
+        {
+            writer.Write(key);
+            writer.Write(bytes.Length);
+            writer.Write(bytes);
+        }
+
+        _lastFleetCount = seen;
+        _lastWholeCounts["fleets"] = (seen, upserts.Count, removed.Count);
+        return removed.Count + upserts.Count;
+    }
+
+    private static int ApplyFleetSection(object galaxy, BinaryReader reader, out int absent)
+    {
+        absent = 0;
+
+        var empires = ListField(galaxy, "Empires");
+        var empireById = ById(empires, typeof(short)) ?? ById(empires, typeof(int));
+        var fleetType = AccessTools.TypeByName("DistantWorlds.Types.Fleet");
+        int applied = 0;
+
+        int removedCount = reader.ReadInt32();
+        for (int i = 0; i < removedCount; i++)
+        {
+            var (empireId, fleetId) = UnpackFleetKey(reader.ReadInt32());
+
+            var fleets = FleetsOf(empires, empireById, empireId);
+            var fleet = fleets is null ? null : Lookup(ById(fleets, typeof(short)) ?? ById(fleets, typeof(int)), fleets, fleetId);
+            if (fleet is null) { absent++; continue; }
+
+            if (RemoveFromList(fleets, fleet)) applied++; else absent++;
+        }
+
+        int upsertCount = reader.ReadInt32();
+        for (int i = 0; i < upsertCount; i++)
+        {
+            var (empireId, _) = UnpackFleetKey(reader.ReadInt32());
+            int length = reader.ReadInt32();
+            var bytes = length > 0 ? reader.ReadBytes(length) : null;
+            if (bytes is null || bytes.Length != length) { absent++; continue; }
+
+            var fleets = FleetsOf(empires, empireById, empireId);
+            if (fleets is null) { absent++; continue; }
+
+            if (AddFromBytes(galaxy, fleets, fleetType, bytes)) applied++; else absent++;
+        }
+
+        return applied;
+    }
+
+    private static object FleetsOf(object empires, MethodInfo empireById, short empireId)
+    {
+        var empire = Lookup(empireById, empires, empireId);
+        return empire is null ? null : AccessTools.Field(empire.GetType(), "Fleets")?.GetValue(empire);
+    }
+
+    private static int CountFleets(object galaxy)
+    {
+        var empires = ListField(galaxy, "Empires");
+        var item = Indexer(empires);
+        int total = 0;
+
+        for (int e = 0; e < CountOf(empires) && item is not null; e++)
+        {
+            var empire = At(item, empires, e);
+            if (empire is null) continue;
+            total += CountOf(AccessTools.Field(empire.GetType(), "Fleets")?.GetValue(empire));
+        }
+
+        return total;
     }
 }

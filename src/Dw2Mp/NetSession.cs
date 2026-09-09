@@ -662,7 +662,7 @@ public static class NetSession
                      $"({total} ships total) ({payload.Length:N0}B; {_deltaBytes:N0}B total, " +
                      $"vs {_syncsSent} full state(s)) build={buildMs:N1}ms " +
                      $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms@#{_worstDeltaAt} " +
-                     $"[{StateDelta.SectionTimings()}] [{StateDelta.LastBuildCollections()}]");
+                     $"[{StateDelta.SectionTimings()}] [{StateDelta.LastWholeCounts()}]");
         }
         catch (Exception ex)
         {
