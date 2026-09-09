@@ -105,27 +105,43 @@ process, so port 47800 is already permitted — nothing to configure.
 
 ## Confirming it worked
 
-Both machines write a log to `%LOCALAPPDATA%\Dw2Mp\`. Open the newest `determinism-*.log`:
+Both machines write a log to `%LOCALAPPDATA%\Dw2Mp\`. Open the newest `determinism-*.log`.
 
 **Host should show**
 
 ```
-# net[host]: listening on 47800, waiting for a client
-# net[host]: client connected from 192.168.1.xxx:#####
+# net: role=Host launcher=127.0.0.1:47810 — commands carry the steady state, ...
+# net[Host]: connected to launcher on 127.0.0.1:47810
 # net: handshake OK — protocol and game version match
-# net[host]: sync #1 tick=1200 raw=23,138,161B packed=4,207,851B ...
+# net[host]: client requested a resync
+# net[host]: full state #1 tick=442 (client asked) raw=23,881,224B packed=4,330,091B ...
+# net[host]: delta #1 tick=30 28 record(s) changed (44 ships total) (600B; ...)
 ```
 
 **Joiner should show**
 
 ```
-# net[client]: connected
+# net[client]: connected to launcher on 127.0.0.1:47811
 # net: handshake OK — protocol and game version match
-# net[client]: APPLIED sync #1  23,138,167B  read=161ms  apply=42ms  ships=90 empires=6
+# net[client]: requested full state #1 — no galaxy yet
+# net[client]: APPLIED sync #1  23,910,011B  read=280ms  apply=42ms  ships=45 empires=9
+# net[client]: local simulation STOPPED — the host's deltas move this world
+# net[client]: delta #51 applied — 2 ship(s), 4 project(s), 62B
 ```
 
-`APPLIED` is the one that matters — it means a galaxy simulated on your PC is now running
-on theirs.
+Three lines matter, in this order:
+
+- **`handshake OK`** — the two builds agree on protocol and game version. A mismatch here is
+  the failure you want, because it stops before corrupting anything.
+- **`APPLIED sync #1`** — a galaxy simulated on the host is now running on the joiner. This is
+  the join.
+- **`delta … applied`** — the steady state. If you see the first two and never this, the
+  joiner is connected and frozen.
+
+The joiner's `[totals: …]` on every 50th delta is the cumulative count by kind. Prefer it to
+the per-delta line for "is this working", because a sampled log can miss a whole category:
+research runs every 5th delta and the log samples every 50th, so **the sampler never lands on
+a research delta** and that section looks dead while working perfectly. Totals have no phase.
 
 ---
 
@@ -169,30 +185,44 @@ peer connections.
 > full-tunnel VPN, it will fight a virtual-LAN adapter and break the connection. Turn it
 > off for a session.
 
-### The real constraint is bandwidth, not NAT
+### ~~The real constraint is bandwidth, not NAT~~ — OVERTAKEN 2026-09-09
 
-A virtual LAN solves reachability. What it does not solve is that **we send a full
-compressed galaxy on every sync**:
+> **The section below was true when written and is now wrong.** It is kept, struck, because
+> it explains why delta sync was built — and because it recommends `DW2MP_SYNC_EVERY_TICKS`,
+> an environment variable that **no longer exists**. Setting it does nothing.
+>
+> ~~A virtual LAN solves reachability. What it does not solve is that we send a full
+> compressed galaxy on every sync — 4.2 MB for a small save, 9.2 MB late-game, every 1,200
+> ticks, bounded by the host's upload speed. Use a small save; sync less often with
+> `DW2MP_SYNC_EVERY_TICKS`; expect the joiner to lag by roughly one transfer time. Delta sync
+> is the priority for internet play.~~
 
-| Save | Payload per sync | 10 Mbps up | 25 Mbps | 50 Mbps |
-|---|---:|---:|---:|---:|
-| Small (23 MB) | 4.2 MB | 3.4 s | 1.3 s | 0.7 s |
-| Late-game (40 MB) | 9.2 MB | 7.4 s | 2.9 s | 1.5 s |
+**Deltas exist now, and bandwidth is no longer the binding constraint.** What crosses the
+wire in normal play:
 
-On a LAN that transfer is about a millisecond and irrelevant — measured `send=1ms`. Over
-the internet it becomes the dominant cost and it is paid **every sync**, bounded by the
-host's *upload* speed, which on most home connections is far lower than download.
+| Message | Size | When |
+|---|---:|---|
+| Ship/colony/research/fleet delta | **~400–900 B** | every 30 ticks (~3 s) |
+| Structural summary | **25 B** | every 300 ticks |
+| Player command | ~39 B | as you act |
+| Full galaxy state | 4.3 MB | on join, and on a resync the client asks for |
 
-Practical advice until deltas exist:
+Measured over a 480-second two-instance run in a 50-star galaxy: **five full states and
+~2,650 deltas, the deltas totalling under 1 MB between them.** A full state is now a join
+and repair mechanism rather than the transport, so the host's upload speed stops being the
+thing that decides whether internet play is usable.
 
-- **Use a small save.** 4.2 MB against 9.2 MB is the difference between usable and painful.
-- **Sync less often.** `DW2MP_SYNC_EVERY_TICKS` controls it; a longer interval means more
-  drift between syncs but far less traffic.
-- Expect the joiner's view to lag the host by roughly one transfer time.
+What replaces the old advice:
 
-This is why **delta sync is the priority for internet play** rather than the host's
-serialise hitch — on a LAN the hitch dominates, over a VPN the payload does.
+- **Save size no longer matters** for ongoing play — only for the one state sent on join.
+- **There is no sync interval to tune.** Full states are sent when the client asks, and it
+  asks when its structure has genuinely diverged or on a 60-second safety floor.
+- The joiner is a few hundred milliseconds behind on *movement* and a second or two behind
+  on newly-built ships, rather than one 4 MB transfer behind on everything.
 
+**Still unmeasured over a real network.** These numbers are loopback. Latency and jitter are
+exactly what loopback cannot show, and a delta stream is more sensitive to both than a
+periodic bulk transfer was.
 ### The better long-term answer
 
 `SteamNetworkingSockets` gives NAT traversal and lobby discovery with **no third-party
@@ -235,20 +265,27 @@ simulation thread: ~150–200 ms on a small save, up to ~700 ms on a late-game o
 
 Things that will surprise you if you do not know them:
 
-- **The joiner's empire choice does not reach the host.** The lobby collects it but does
-  not yet send it. Both players currently end up in the host's galaxy as the host
-  configured it. Slot exchange is the next piece of work.
-- **Everyone needs the same save.** The host has to send its galaxy on connect instead —
-  the mechanism exists, it just is not wired to the join flow yet. This is what will remove
-  file-sharing from the process entirely.
-- **Internet play needs either a virtual LAN or port forwarding.** A virtual LAN (Tailscale,
-  ZeroTier) is the easy path and needs no code changes; see above. Steam sockets will
-  remove the third-party dependency entirely.
-- **Competitive mode leaks information.** Every client receives the whole galaxy. The UI
-  filters it correctly per empire, so it *plays* right, but the hidden data is present in
-  memory and a determined player could read it. Fine among people who will not; not
-  cheat-proof.
+- ~~**The joiner's empire choice does not reach the host.**~~ ~~**Everyone needs the same
+  save.**~~ **Both fixed 2026-09-08** — struck rather than deleted because a reader who
+  remembers them should be able to see when they stopped being true. Both players pick their
+  empire in the lobby and the host builds the galaxy to match; the host sends its state on
+  join, so **no save file is shared and nothing has to match beforehand** beyond the game
+  version, which the handshake checks.
+- **Competitive mode leaks information.** Every client receives the whole galaxy on join and
+  on each resync. The UI filters it correctly per empire, so it *plays* right, but the hidden
+  data is present in memory and a determined player could read it. Fine among people who will
+  not; not cheat-proof.
 - **The host has authority.** If the host quits, the session ends. No reconnection.
+- **The client does not simulate.** Its world moves only when the host says so, through
+  deltas. That is what a host-authoritative client should be, and it means a client whose
+  connection stalls sees a frozen galaxy rather than a diverging one — which is the better
+  failure, but it is a visible one.
+- **The client is briefly behind on what EXISTS.** Deltas carry ships, colonies, fleets and
+  characters as they are created and destroyed, so this is a second or two, not a session.
+  Research progress and colony internals refresh on a slower schedule.
+- **Never tested across two machines.** Everything measured so far is two game processes on
+  one PC. The transport is the same either way, but latency, MTU and a real network stack
+  are not exercised by loopback.
 
 ---
 
@@ -273,3 +310,24 @@ Things that will surprise you if you do not know them:
   fail to start. Deleting `DW2_CrashDump*` and `SENT_DW2_CrashDump*` is safe.
 - Also delete `data\SessionActive` if the game was force-killed — a stale one can block
   startup.
+
+### 2026-09-09 — the protocol changed underneath this guide
+
+Three sections above were describing a design that no longer exists. Corrected, and struck
+rather than deleted so a reader who remembers the old behaviour can see when it changed:
+
+- **Bandwidth is no longer the binding constraint.** Full galaxy state used to go out every
+  1,200 ticks at 4.2–9.2 MB; it is now sent on join and on request only, with ~400–900 B
+  deltas carrying the world in between. The old section recommended `DW2MP_SYNC_EVERY_TICKS`,
+  which **no longer exists** — setting it does nothing.
+- **The log lines to look for have changed.** `# net[host]: listening on 47800` and
+  `sync #N tick=…` are gone; the mod now talks to the launcher on loopback and the host logs
+  `full state #N (client asked)` plus `delta #N`. A guide that lists lines the software no
+  longer prints reads as "it is broken".
+- **Two limitations were fixed and the page still listed them** — the joiner's empire choice
+  reaching the host, and both players needing the same save. Both have been true since
+  2026-09-08, and the Changelog directly below already said so while Limitations directly
+  above still denied it.
+
+Also added: the client no longer simulates locally, so a stalled connection now shows as a
+frozen galaxy rather than a diverging one — worth knowing before you diagnose it as a hang.
