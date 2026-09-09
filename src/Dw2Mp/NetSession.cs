@@ -653,7 +653,8 @@ public static class NetSession
                 _log($"# net[host]: delta #{_deltasSent} tick={tick} {changed} record(s) changed " +
                      $"({total} ships total) ({payload.Length:N0}B; {_deltaBytes:N0}B total, " +
                      $"vs {_syncsSent} full state(s)) build={buildMs:N1}ms " +
-                     $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms");
+                     $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms " +
+                     $"[{StateDelta.SectionTimings()}]");
         }
         catch (Exception ex)
         {
@@ -1003,7 +1004,7 @@ public static class NetSession
             {
                 _deltasApplied++;
                 if (_deltasApplied % 50 == 1)
-                    _log($"# net[client]: delta #{_deltasApplied} applied — {info}");
+                    _log($"# net[client]: delta #{_deltasApplied} applied — {info}  [totals: {StateDelta.AppliedTotals()}]");
                 continue;
             }
 

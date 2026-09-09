@@ -1663,3 +1663,68 @@ client-side feature that ever needs fresher internals turns it back on.
   newly *visible* rather than newly introduced — the timing was added in the same change.
   The likely bulk is the research section walking ~10,300 projects every delta, which
   predates fleets and characters. Worth measuring properly before it matters.
+
+---
+
+## The research walk — 2026-09-09
+
+The delta build cost avg 4.6 ms on the simulation thread, and the previous note *guessed*
+research. Per-section timing settled it first:
+
+```
+research=3.97ms  ships=0.24ms  colonies=0.20ms  characters=0.08ms  fleets=0.07ms
+```
+
+**87% of the build, for ~3% of the records sent.** ~10,300 projects walked every delta, each
+costing one indexer `Invoke` plus three `FieldInfo.GetValue` — roughly 41,000 reflection
+calls, three times a second.
+
+### Two fixes, and the order matters
+
+**1. Compiled accessors (`FastAccess.cs`) — 3.97 → 1.96 ms.** `FieldInfo.GetValue` boxes and
+does access checks per call; an expression-compiled `Func<object,float>` is a direct field
+load. Cached per (type, member) and compiled once.
+
+The alternative was to walk *less*: `ResearchSystem` also exposes `ResearchQueue` and
+`NextProjects`, and walking those would have been faster still. It would also have been a
+**guess** — a project changed by anything outside the queue would be missed silently, and an
+under-report is indistinguishable from "nothing changed". Compiling keeps the walk
+exhaustive and removes the cost instead of moving it, so there is no correctness question to
+get wrong.
+
+**2. Cadence, every 5th delta (~15 s) — 1.96 → 0.46 ms.** Safe here in a way it explicitly
+is **not** for fleet and character membership, and the difference is the whole reason both
+decisions can coexist:
+
+| | Delayed update costs | Delayed creation costs |
+|---|---|---|
+| research (update-only) | staleness, repaired by the next delta | — nothing is ever created |
+| fleets / characters | staleness | **irrecoverable** — every later update naming an unknown id is skipped as absent forever |
+
+Research projects are created with their empire and already exist on the client. Membership
+is the thing that cannot wait; contents can.
+
+**Net: 3.97 → 0.46 ms, and the whole build 4.6 → 0.8 ms.**
+
+### A blind spot built out of two cadences
+
+The first run after the cadence change reported **zero** research deltas reaching the client
+— while the host reported the section running. Neither was wrong. The client logs every 50th
+delta and research runs every 5th, and `50k+1 mod 5` is **always 1**, so every sampled delta
+was guaranteed to be a non-research one. The section looked dead while working perfectly.
+
+Two cadences sharing a factor is an easy way to build a permanent blind spot into a sampler,
+and the failure is silent in the direction that matters — it reports *absence*. The fix is
+cumulative totals rather than a better sample rate, because a total has no phase:
+
+```
+[totals: characters=18 colonies=390 research=22,269 ships=15,747]
+```
+
+### State of the run
+
+```
+0 crash dumps, 0 guard hits
+5 full states, ~1,650 deltas, 770 KB of delta traffic
+delta build avg 0.8 ms  [research=0.46 ships=0.14 fleets=0.07 characters=0.03 colonies=0.03]
+```

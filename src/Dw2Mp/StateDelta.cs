@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
 
@@ -123,6 +124,34 @@ public static class StateDelta
     /// Build a delta of everything that changed since the last one. Returns null when
     /// nothing did, so a still galaxy costs no traffic at all.
     /// </summary>
+    // Per-section timing, so "the delta build costs 5 ms" can name WHICH section. The
+    // previous note in the docs guessed research and said so; guessing is what this replaces.
+    private static readonly Dictionary<string, double> _sectionMs = new();
+    private static long _sectionSamples;
+
+    private static int Timed(string name, Func<int> section)
+    {
+        var sw = Stopwatch.StartNew();
+        try { return section(); }
+        finally
+        {
+            var ms = sw.Elapsed.TotalMilliseconds;
+            _sectionMs[name] = _sectionMs.TryGetValue(name, out var v) ? v + ms : ms;
+        }
+    }
+
+    /// <summary>Mean milliseconds per build, per section. For logging.</summary>
+    public static string SectionTimings()
+    {
+        lock (_baseline)
+        {
+            if (_sectionSamples == 0) return "no samples";
+            return string.Join(" ", _sectionMs
+                .OrderByDescending(kv => kv.Value)
+                .Select(kv => $"{kv.Key}={kv.Value / _sectionSamples:N2}ms"));
+        }
+    }
+
     public static byte[] Build(object galaxy, out int changed, out int total, bool primeOnly = false)
     {
         changed = 0;
@@ -139,14 +168,21 @@ public static class StateDelta
 
             lock (_baseline)
             {
-                if (!primeOnly) _deltaSequence++;
+                if (!primeOnly) { _deltaSequence++; _sectionSamples++; }
 
-                changed += WriteShipSection(galaxy, writer, out total, primeOnly);
-                changed += WriteColonySection(galaxy, writer, primeOnly);
-                changed += WriteResearchSection(galaxy, writer);
+                int shipTotal = 0;
+                changed += Timed("ships", () => WriteShipSection(galaxy, writer, out shipTotal, primeOnly));
+                total = shipTotal;
+
+                changed += Timed("colonies", () => WriteColonySection(galaxy, writer, primeOnly));
+                changed += Timed("research", () => WriteResearchSection(galaxy, writer));
 
                 foreach (var kind in WholeObjectKinds)
-                    changed += WriteWholeObjectSection(galaxy, writer, kind, primeOnly);
+                {
+                    var k = kind;
+                    changed += Timed(k.Collection.ToLowerInvariant(),
+                                     () => WriteWholeObjectSection(galaxy, writer, k, primeOnly));
+                }
             }
 
             if (changed == 0) return null;
@@ -371,8 +407,56 @@ public static class StateDelta
         return removed.Count + (primeOnly ? 0 : added.Count) + updated.Count;
     }
 
+    // Compiled accessors for the research walk. See FastAccess: this loop touches ~10,300
+    // projects on every delta and was 87% of the whole delta build under plain reflection.
+    // Resolved lazily against the first real object rather than by type name, so a renamed
+    // or restructured type degrades to "section reports nothing" exactly as before instead
+    // of throwing.
+    private static Func<object, short> _fastProjectId;
+    private static Func<object, float> _fastProgress;
+    private static Func<object, bool> _fastResearched;
+    private static Func<object, short> _fastEmpireId;
+    private static bool _fastResearchResolved;
+
+    private static bool ResolveFastResearch(object empire, object project)
+    {
+        if (_fastResearchResolved) return _fastProjectId is not null;
+
+        _fastEmpireId = FastAccess.Getter<short>(empire.GetType(), "EmpireId");
+        _fastProjectId = FastAccess.Getter<short>(project.GetType(), "ResearchProjectId");
+        _fastProgress = FastAccess.Getter<float>(project.GetType(), "Progress");
+        _fastResearched = FastAccess.Getter<bool>(project.GetType(), "Researched");
+
+        _fastResearchResolved = true;
+        return _fastProjectId is not null;
+    }
+
+    /// <summary>
+    /// How often the research section walks. Every 5th delta is ~15 s of simulated time.
+    ///
+    /// Safe here in a way it is NOT for fleet and character membership, and the difference
+    /// is worth stating: research projects are created with their empire and already exist
+    /// on the client, so this section is update-only. A delayed update is pure staleness --
+    /// nothing becomes irrecoverable. A delayed CREATION would be, because every later
+    /// update naming an object the client does not have is skipped as absent forever.
+    ///
+    /// The walk is what costs: ~10,300 projects per delta, measured at 3.97 ms of a 4.55 ms
+    /// build under plain reflection and 1.96 ms of 2.3 ms with compiled accessors -- still
+    /// ~85% of the whole build, for a handful of records. Compiling made each visit cheap;
+    /// this makes most visits not happen.
+    /// </summary>
+    private const int ResearchEvery = 5;
+
     private static int WriteResearchSection(object galaxy, BinaryWriter writer)
     {
+        // The count still goes on the wire on a skipped delta -- the reader consumes sections
+        // positionally, so a section that writes nothing at all would desynchronise it.
+        if (_deltaSequence % ResearchEvery != 0)
+        {
+            writer.Write(0);
+            return 0;
+        }
+
         var empires = ListField(galaxy, "Empires");
         var empireItem = Indexer(empires);
         int empireCount = CountOf(empires);
@@ -384,29 +468,37 @@ public static class StateDelta
             var empire = At(empireItem, empires, e);
             if (empire is null) continue;
 
-            // Int16, not Int32. Reading it as int made the pattern fail for EVERY empire and
-            // the research section came out empty in every delta, silently -- the same class
-            // of mistake as reading Empire.Name as a field when it is a property.
-            if (AccessTools.Field(empire.GetType(), "EmpireId")?.GetValue(empire) is not short empireId) continue;
-
             var research = AccessTools.Field(empire.GetType(), "Research")?.GetValue(empire);
             if (research is null) continue;
 
             var projects = AccessTools.Field(research.GetType(), "Projects")?.GetValue(research);
-            var projectItem = Indexer(projects);
             int projectCount = CountOf(projects);
+            if (projects is null || projectCount == 0) continue;
 
-            for (int p = 0; p < projectCount && projectItem is not null; p++)
+            var projectItem = FastAccess.Indexer(projects.GetType());
+            if (projectItem is null) continue;
+
+            var first = projectItem(projects, 0);
+            if (first is null || !ResolveFastResearch(empire, first)) continue;
+
+            // Int16, not Int32. Reading it as int made the pattern fail for EVERY empire and
+            // the research section came out empty in every delta, silently -- the same class
+            // of mistake as reading Empire.Name as a field when it is a property.
+            if (_fastEmpireId is null) continue;
+            short empireId = _fastEmpireId(empire);
+
+            for (int p = 0; p < projectCount; p++)
             {
-                var project = At(projectItem, projects, p);
-                if (project is null || !ResolveResearch(project)) continue;
-                if (!TryReadResearch(project, out var projectId, out var now)) continue;
+                var project = projectItem(projects, p);
+                if (project is null) continue;
 
-                var key = (empireId, projectId);
+                var now = new ResearchState(_fastProgress(project), _fastResearched(project));
+                var key = (empireId, _fastProjectId(project));
+
                 if (_lastResearch.TryGetValue(key, out var before) && !ResearchDiffers(before, now)) continue;
 
                 _lastResearch[key] = now;
-                records.Add((empireId, projectId, now));
+                records.Add((key.Item1, key.Item2, now));
             }
         }
 
@@ -662,6 +754,10 @@ public static class StateDelta
             int colonies = ApplyColonies(galaxy, reader, out int absentColonies);
             int research = ApplyResearch(galaxy, reader, out int absentResearch);
 
+            CountApplied("ships", ships);
+            CountApplied("colonies", colonies);
+            CountApplied("research", research);
+
             var parts = new List<string>();
             if (ships + absentShips > 0) parts.Add($"{ships} ship(s)" + (absentShips > 0 ? $" +{absentShips} absent" : ""));
             if (colonies + absentColonies > 0) parts.Add($"{colonies} colony" + (absentColonies > 0 ? $" +{absentColonies} absent" : ""));
@@ -672,6 +768,7 @@ public static class StateDelta
             foreach (var kind in WholeObjectKinds)
             {
                 int n = ApplyWholeObjectSection(galaxy, reader, kind, out int missed);
+                CountApplied(kind.Collection.ToLowerInvariant(), n);
                 if (n + missed > 0)
                     parts.Add($"{n} {kind.Collection.ToLowerInvariant()}" + (missed > 0 ? $" +{missed} absent" : ""));
             }
@@ -1117,5 +1214,29 @@ public static class StateDelta
             parts.Add($"{name}={CountOf(ListField(galaxy, name))}");
 
         return string.Join(" ", parts);
+    }
+
+    // Cumulative applied counts, per kind. Sampled logging cannot answer "has any research
+    // ever arrived": the client logs every 50th delta and research runs every 5th, and
+    // 50k+1 mod 5 is always 1 -- so every sampled delta is guaranteed to be a NON-research
+    // one, and the section looked dead while working perfectly. Two cadences sharing a
+    // factor is an easy way to build a blind spot into a sampler. Totals have no phase.
+    private static readonly Dictionary<string, long> _appliedTotals = new();
+
+    private static void CountApplied(string kind, int n)
+    {
+        if (n <= 0) return;
+        lock (_appliedTotals)
+            _appliedTotals[kind] = _appliedTotals.TryGetValue(kind, out var v) ? v + n : n;
+    }
+
+    /// <summary>Everything this client has applied, by kind, since it started.</summary>
+    public static string AppliedTotals()
+    {
+        lock (_appliedTotals)
+        {
+            if (_appliedTotals.Count == 0) return "nothing applied yet";
+            return string.Join(" ", _appliedTotals.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value:N0}"));
+        }
     }
 }
