@@ -59,7 +59,7 @@ namespace Dw2Mp;
 /// </summary>
 public static class StateDelta
 {
-    private const int Version = 7;
+    private const int Version = 8;
 
     /// <summary>
     /// Per-kind change thresholds. Without them every float that drifts by a rounding error
@@ -205,6 +205,12 @@ public static class StateDelta
                 _thisBuildMs.Clear();
                 int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
+                foreach (var kind in WholeObjectKinds)
+                {
+                    var k = kind;
+                    changed += Timed(k.Collection.ToLowerInvariant(),
+                                     () => WriteWholeObjectSection(galaxy, writer, k, primeOnly));
+                }
                 int shipTotal = 0;
                 changed += Timed("ships", () => WriteShipSection(galaxy, writer, out shipTotal, primeOnly));
                 total = shipTotal;
@@ -212,12 +218,6 @@ public static class StateDelta
                 changed += Timed("colonies", () => WriteColonySection(galaxy, writer, primeOnly));
                 changed += Timed("research", () => WriteResearchSection(galaxy, writer));
 
-                foreach (var kind in WholeObjectKinds)
-                {
-                    var k = kind;
-                    changed += Timed(k.Collection.ToLowerInvariant(),
-                                     () => WriteWholeObjectSection(galaxy, writer, k, primeOnly));
-                }
 
                 changed += Timed("fleets", () => WriteFleetSection(galaxy, writer, primeOnly));
                 _gcDuringBuild[0] = GC.CollectionCount(0) - g0;
@@ -598,6 +598,14 @@ public static class StateDelta
     /// </summary>
     private static readonly WholeObjectKind[] WholeObjectKinds =
     {
+        // Designs FIRST. A ship resolves its hull through Galaxy.Designs.GetById(DesignId) on
+        // first use, and the AI designs a ship before it builds one -- so a created ship
+        // routinely references a design the client has never seen. Without this, the new
+        // ship arrives, its design does not, GetShipHull() is null, and RegenerateSummary
+        // and later ShipSummary.DetermineShipSummary both dereference it: 100-173 silent
+        // creation failures per run, then 506-626 crash dumps once the objects were kept.
+        // The probe that named it: `GetShipHull=NULL` with every other input ok.
+        new("Designs",    "DistantWorlds.Types.Design",    "DesignId",    IdIsShort: false),
         new("Characters", "DistantWorlds.Types.Character", "CharacterId", IdIsShort: false),
     };
 
@@ -804,18 +812,7 @@ public static class StateDelta
 
             if (reader.ReadInt32() != Version) { info = "delta version mismatch"; return false; }
 
-            int ships = ApplyShips(galaxy, reader, out int absentShips, out int hostShips, out int localShips);
-            int colonies = ApplyColonies(galaxy, reader, out int absentColonies);
-            int research = ApplyResearch(galaxy, reader, out int absentResearch);
-
-            CountApplied("ships", ships);
-            CountApplied("colonies", colonies);
-            CountApplied("research", research);
-
             var parts = new List<string>();
-            if (ships + absentShips > 0) parts.Add($"{ships} ship(s)" + (absentShips > 0 ? $" +{absentShips} absent" : ""));
-            if (colonies + absentColonies > 0) parts.Add($"{colonies} colony" + (absentColonies > 0 ? $" +{absentColonies} absent" : ""));
-            if (research + absentResearch > 0) parts.Add($"{research} project(s)" + (absentResearch > 0 ? $" +{absentResearch} absent" : ""));
 
             // Order matters and is the wire format: the reader must consume these sections in
             // the same order the writer produced them, so both iterate WholeObjectKinds.
@@ -826,6 +823,19 @@ public static class StateDelta
                 if (n + missed > 0)
                     parts.Add($"{n} {kind.Collection.ToLowerInvariant()}" + (missed > 0 ? $" +{missed} absent" : ""));
             }
+
+            int ships = ApplyShips(galaxy, reader, out int absentShips, out int hostShips, out int localShips);
+            int colonies = ApplyColonies(galaxy, reader, out int absentColonies);
+            int research = ApplyResearch(galaxy, reader, out int absentResearch);
+
+            CountApplied("ships", ships);
+            CountApplied("colonies", colonies);
+            CountApplied("research", research);
+
+            if (ships + absentShips > 0) parts.Add($"{ships} ship(s)" + (absentShips > 0 ? $" +{absentShips} absent" : ""));
+            if (colonies + absentColonies > 0) parts.Add($"{colonies} colony" + (absentColonies > 0 ? $" +{absentColonies} absent" : ""));
+            if (research + absentResearch > 0) parts.Add($"{research} project(s)" + (absentResearch > 0 ? $" +{absentResearch} absent" : ""));
+
 
             // Fleets read LAST, matching the order Build writes them. The reader consumes
             // sections positionally, so this pairing IS the wire format: swap the two and
@@ -907,56 +917,200 @@ public static class StateDelta
         return applied;
     }
 
+    /// <summary>Set by NetSession so mutation failures can be reported. Null-safe.</summary>
+    public static Action<string> Log { get; set; }
+
+    private static readonly HashSet<string> _mutationFailures = new();
+    private static long _mutationFailureCount;
+
+    /// <summary>
+    /// Report a failed add or remove -- ONCE per distinct reason, with a running count.
+    ///
+    /// These used to be `catch { return false; }`. A creation that fails silently is not a
+    /// dropped record, it is an object the client will never have: every later update naming
+    /// it is skipped as absent, forever. In the 50-star run the client's ship count swung
+    /// from 86 behind the host to 19 AHEAD of it, which a non-simulating client cannot do
+    /// unless removals are not landing either. Both were failing and both were reporting
+    /// success.
+    /// </summary>
+    private static void NoteMutationFailure(string reason)
+    {
+        Interlocked.Increment(ref _mutationFailureCount);
+        bool isNew;
+        lock (_mutationFailures) isNew = _mutationFailures.Add(reason);
+        if (isNew)
+            Log?.Invoke($"# delta: MUTATION FAILED -- {reason} (distinct #{_mutationFailures.Count}, " +
+                        $"{Interlocked.Read(ref _mutationFailureCount)} total)");
+    }
+
+    public static string MutationFailureSummary() =>
+        $"mutation failures={Interlocked.Read(ref _mutationFailureCount)} distinct={_mutationFailures.Count}";
+
+    /// <summary>The id field DW2 uses for each type we create or remove.</summary>
+    private static string IdFieldFor(Type type) => type.Name switch
+    {
+        "Ship"      => "ShipId",
+        "Colony"    => "ColonyId",
+        "Fleet"     => "FleetId",
+        "Character" => "CharacterId",
+        "Design"    => "DesignId",
+        _           => null,
+    };
+
+    /// <summary>
+    /// Is this exact element in the list, by id? The only trustworthy answer to "did that
+    /// mutation happen". See AddFromBytes for why neither a method name nor its return is.
+    /// </summary>
+    private static bool ListContains(object list, object element, out string why)
+    {
+        why = "";
+        var idField = IdFieldFor(element.GetType());
+        var field = idField is null ? null : AccessTools.Field(element.GetType(), idField);
+        if (field is null) { why = $"no id field for {element.GetType().Name}"; return false; }
+
+        long id;
+        try { id = Convert.ToInt64(field.GetValue(element)); }
+        catch (Exception ex) { why = "id unreadable: " + ex.GetType().Name; return false; }
+
+        var getById = ById(list, field.FieldType == typeof(short) ? typeof(short) : typeof(int))
+                   ?? ById(list, field.FieldType == typeof(short) ? typeof(int) : typeof(short));
+        if (getById is null) { why = $"{list.GetType().Name} has no GetById"; return false; }
+
+        return ReferenceEquals(Lookup(getById, list, id), element);
+    }
+
     /// <summary>
     /// Rebuild an object from the host's bytes and put it in the list.
     ///
-    /// RegenerateSummary afterwards where the type has one: ShipSummary is derived and NOT
-    /// serialised, established when adopting a full state left 64 of 64 ships with a null
-    /// Summary. A per-object deserialise is the same code path, so a newly created ship
-    /// would arrive with the same hole and crash the first thing that read it.
+    /// ORDER: read, ADD, verify, then regenerate. The first version regenerated before
+    /// adding, and Ship.RegenerateSummary threw NullReferenceException on every ship that was
+    /// not yet in the galaxy -- 173 times in one run, one distinct reason, and each one a
+    /// ship the client then never had. The game's own order is the list deserialiser adding
+    /// the object and summaries being rebuilt afterwards, on objects that already belong to a
+    /// galaxy; this now matches it. Regeneration failing is logged and does NOT discard the
+    /// object: a ship without a summary is a known, guarded hazard, a ship that does not
+    /// exist is an absent-forever one.
+    ///
+    /// Uses `Add`, because that is what DW2's own list deserialisers call. The earlier
+    /// preference for `CheckAdd` was based on reading its IL as a no-op; on a generic type
+    /// that IL was an unrestored placeholder, and the staged failure log showed no Add ever
+    /// failed. A method's name is not evidence, and neither was that reading.
+    ///
+    /// Then READS THE LIST BACK. A `true` return does not prove the mutation happened;
+    /// GetById does.
     /// </summary>
     private static bool AddFromBytes(object galaxy, object list, Type elementType, byte[] bytes)
     {
+        string stage = "start";
+        string name = elementType?.Name ?? "?";
+
         try
         {
-            if (list is null || elementType is null) return false;
+            if (list is null || elementType is null) { NoteMutationFailure($"{name}: no list or type"); return false; }
 
             var s = SerialiserFor(elementType, galaxy.GetType());
-            if (s.Read is null) return false;
+            if (s.Read is null) { NoteMutationFailure($"{name}: no ReadFromStream"); return false; }
 
+            stage = "construct";
             var blank = Construct(s, galaxy);
-            if (blank is null) return false;
+            if (blank is null) { NoteMutationFailure($"{name}: no usable constructor"); return false; }
 
-            using var input = new MemoryStream(bytes, writable: false);
-            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
+            stage = "read";
+            object item;
+            using (var input = new MemoryStream(bytes, writable: false))
+            using (var reader = new BinaryReader(input, System.Text.Encoding.UTF8))
+                item = s.Read.Invoke(blank, new[] { galaxy, (object)reader });
 
-            var item = s.Read.Invoke(blank, new[] { galaxy, (object)reader });
-            if (item is null) return false;
+            if (item is null) { NoteMutationFailure($"{name}: ReadFromStream returned null"); return false; }
 
-            s.Regenerate?.Invoke(item, null);
-
-            var add = AccessTools.Method(list.GetType(), "CheckAdd")
+            stage = "add";
+            var add = AccessTools.Method(list.GetType(), "Add", new[] { elementType })
                    ?? AccessTools.Method(list.GetType(), "Add");
-            if (add is null) return false;
+            if (add is null) { NoteMutationFailure($"{name}: {list.GetType().Name} has no Add"); return false; }
 
-            add.Invoke(list, new[] { item });
+            var result = add.Invoke(list, new[] { item });
+            if (result is false) { NoteMutationFailure($"{name}: Add returned false"); return false; }
+
+            stage = "verify";
+            if (!ListContains(list, item, out var why))
+            {
+                NoteMutationFailure($"{name}: Add reported success but the list does not contain it" +
+                                    (why.Length > 0 ? $" ({why})" : ""));
+                return false;
+            }
+
+            // Only now, with the object in its galaxy. Failure here is reported, not fatal.
+            stage = "regenerate";
+            try { s.Regenerate?.Invoke(item, null); }
+            catch (Exception ex)
+            {
+                var cause = ex.InnerException ?? ex;
+                NoteMutationFailure($"{name}: regenerate after add: {cause.GetType().Name} (object kept)");
+                ProbeSummaryInputs(galaxy, item);
+            }
+
             return true;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            NoteMutationFailure($"{name} at {stage}: {cause.GetType().Name}: {cause.Message}");
+            return false;
+        }
     }
 
+    private static bool _loggedTombstone;
+
+    /// <summary>
+    /// Remove, then READ BACK by id -- and by COUNT.
+    ///
+    /// The count check exists because of a specific observation: with zero removal failures
+    /// reported, the client's ship count still swung to 178 MORE than the host's. Read-back
+    /// by GetById said every removed ship was gone; Count said otherwise. Both are true if
+    /// removal clears the index and leaves a tombstone in the backing array that only the
+    /// simulation's compaction reclaims -- and the client does not simulate. If that is the
+    /// mechanism, Count is not a measure of membership on the client, and the host-vs-client
+    /// gap in the log is an artefact. This logs it once so the question is answered by the
+    /// next run rather than argued about.
+    /// </summary>
     private static bool RemoveFromList(object list, object element)
     {
+        string name = element?.GetType().Name ?? "?";
+
         try
         {
-            var remove = AccessTools.Method(list.GetType(), "CheckRemove")
-                      ?? AccessTools.Method(list.GetType(), "FastRemove", new[] { element.GetType() });
-            if (remove is null) return false;
+            var remove = AccessTools.Method(list.GetType(), "FastRemove", new[] { element.GetType() })
+                      ?? AccessTools.Method(list.GetType(), "Remove", new[] { element.GetType() })
+                      ?? AccessTools.Method(list.GetType(), "FastRemove");
+            if (remove is null) { NoteMutationFailure($"{name}: {list.GetType().Name} has no FastRemove/Remove"); return false; }
 
-            remove.Invoke(list, new[] { element });
+            int before = CountOf(list);
+            var result = remove.Invoke(list, new[] { element });
+            if (result is false) { NoteMutationFailure($"{name}: remove returned false"); return false; }
+
+            if (ListContains(list, element, out _))
+            {
+                NoteMutationFailure($"{name}: remove reported success but the list still contains it");
+                return false;
+            }
+
+            int after = CountOf(list);
+            if (after == before && !_loggedTombstone)
+            {
+                _loggedTombstone = true;
+                Log?.Invoke($"# delta: NOTE — {name} removed by id but {list.GetType().Name}.Count did not drop " +
+                            $"({before} -> {after}). Count includes tombstones; the host/client ship gap is " +
+                            "an artefact of that, not of missing removals. Logged once.");
+            }
+
             return true;
         }
-        catch { return false; }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            NoteMutationFailure($"{name} remove: {cause.GetType().Name}: {cause.Message}");
+            return false;
+        }
     }
 
     private static int ApplyColonies(object galaxy, BinaryReader reader, out int absent)
@@ -1473,5 +1627,162 @@ public static class StateDelta
         }
 
         return total;
+    }
+
+    // ------------------------------------------------------------ self-test
+
+    /// <summary>
+    /// Deterministic test of the fleet key, run at every launch and logged.
+    ///
+    /// WHY THIS IS THE COLLISION TEST. Fleet.FleetId is an Int16 scoped to its empire's own
+    /// list, so two empires can each own a fleet #1. The client cannot collide on that: it
+    /// looks a fleet up through FleetsOf(empireId) first, so same-numbered fleets land in
+    /// different lists by construction. The ONLY place a collision can happen is the host's
+    /// baseline, keyed by PackFleetKey -- and that is pure logic with no DW2 in it, so it is
+    /// tested here rather than by hoping the AI builds two same-numbered fleets in one run.
+    /// (It built one fleet in eight minutes across eighteen empires.)
+    ///
+    /// Each case names what it would have caught. A test that cannot say what it catches is
+    /// decoration.
+    /// </summary>
+    public static string SelfTest()
+    {
+        var failures = new List<string>();
+
+        void Expect(bool ok, string what) { if (!ok) failures.Add(what); }
+
+        // 1. Same fleet id under different empires must produce different keys. This is the
+        //    collision itself: a key on FleetId alone would make these equal, and the host
+        //    would treat empire 2's fleet #1 as an update to empire 1's -- sending neither
+        //    correctly and, on removal, deleting the wrong one.
+        Expect(PackFleetKey(1, 1) != PackFleetKey(2, 1), "empire 1 fleet 1 collides with empire 2 fleet 1");
+        Expect(PackFleetKey(1, 1) != PackFleetKey(1, 2), "empire 1 fleet 1 collides with empire 1 fleet 2");
+
+        // 2. Round trip across the whole Int16 range, including the sign bit. Packing uses
+        //    (ushort) casts; unpacking must undo them. A wrong cast here would round-trip 0..32767
+        //    perfectly and corrupt every id above that or below zero, which no small test sees.
+        foreach (short e in new short[] { 0, 1, 2, 255, 256, short.MaxValue, -1, -2, short.MinValue })
+        foreach (short f in new short[] { 0, 1, 2, 255, 256, short.MaxValue, -1, -2, short.MinValue })
+        {
+            var (e2, f2) = UnpackFleetKey(PackFleetKey(e, f));
+            Expect(e2 == e && f2 == f, $"round trip ({e},{f}) -> ({e2},{f2})");
+        }
+
+        // 3. The baseline itself keeps both. This is the dictionary the host actually uses,
+        //    exercised the way WriteFleetSection uses it, so a key type mismatch between the
+        //    writer's `(long)key` and the remover's `(int)k.Id` would show up here too.
+        lock (_baseline)
+        {
+            var saved = _lastWhole.Where(kv => kv.Key.Kind == "SelfTest").Select(kv => kv.Key).ToList();
+            foreach (var k in saved) _lastWhole.Remove(k);
+
+            _lastWhole[("SelfTest", (long)PackFleetKey(1, 1))] = 0xA;
+            _lastWhole[("SelfTest", (long)PackFleetKey(2, 1))] = 0xB;
+            Expect(_lastWhole.Count(kv => kv.Key.Kind == "SelfTest") == 2, "baseline merged two empires' fleet #1 into one entry");
+
+            // Remove exactly one, the way the section does: by unpacked-then-repacked key.
+            var (re, rf) = UnpackFleetKey(PackFleetKey(1, 1));
+            _lastWhole.Remove(("SelfTest", (long)PackFleetKey(re, rf)));
+            Expect(_lastWhole.ContainsKey(("SelfTest", (long)PackFleetKey(2, 1))), "removing empire 1's fleet #1 also removed empire 2's");
+            Expect(!_lastWhole.ContainsKey(("SelfTest", (long)PackFleetKey(1, 1))), "removal of empire 1's fleet #1 did not take");
+
+            _lastWhole.Remove(("SelfTest", (long)PackFleetKey(2, 1)));
+        }
+
+        return failures.Count == 0
+            ? "fleet key self-test PASS (collision, sign-bit round trip, baseline isolation)"
+            : "fleet key self-test FAIL: " + string.Join("; ", failures);
+    }
+
+    private static readonly HashSet<string> _nullMapsSeen = new();
+
+    /// <summary>
+    /// When RegenerateSummary fails on a freshly created ship, say WHICH of its inputs is
+    /// null. Logged once per distinct pattern.
+    ///
+    /// Each input is read under its OWN try/catch and a failure becomes a value in the map.
+    /// The first version read them in one block and one AmbiguousMatchException -- an
+    /// overloaded member somewhere in the list -- aborted the whole probe, 100 times, and
+    /// answered nothing. An instrument that can fail as a unit is one that can fail on the
+    /// exact input it was built to see.
+    ///
+    /// Three hypotheses about this failure had already been wrong in a day (needs the list
+    /// first; CheckAdd is a no-op; a resolve pass is skipped). ShipSummary.DetermineShipSummary
+    /// takes galaxy, empire, hull, research, bonuses, artifacts, components and battle data;
+    /// this reads each by the route RegenerateSummary does.
+    /// </summary>
+    private static void ProbeSummaryInputs(object galaxy, object ship)
+    {
+        var t = ship.GetType();
+        var parts = new List<string>();
+
+        string Try(string label, Func<string> read)
+        {
+            try { return label + "=" + read(); }
+            catch (Exception ex) { return label + "=<" + (ex.InnerException ?? ex).GetType().Name + ">"; }
+        }
+
+        string NullOrOk(object o) => o is null ? "NULL" : "ok";
+
+        // Fields via GetField with explicit flags and DeclaredOnly-first search, because
+        // AccessTools.Field walks the hierarchy and a name declared on both Ship and its base
+        // is exactly the kind of thing that turns into an ambiguity.
+        FieldInfo FindField(string name)
+        {
+            for (var cur = t; cur is not null; cur = cur.BaseType)
+            {
+                var f = cur.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                if (f is not null) return f;
+            }
+            return null;
+        }
+
+        object shipGalaxy = null, empireItem = null, empire = null;
+
+        parts.Add(Try("_Galaxy", () =>
+        {
+            var f = FindField("_Galaxy");
+            if (f is null) return "<no field>";
+            shipGalaxy = f.GetValue(ship);
+            return shipGalaxy is null ? "NULL" : ReferenceEquals(shipGalaxy, galaxy) ? "ok" : "OTHER-GALAXY";
+        }));
+
+        parts.Add(Try("Empire(item)", () =>
+        {
+            var f = FindField("Empire");
+            if (f is null) return "<no field>";
+            empireItem = f.GetValue(ship);
+            return NullOrOk(empireItem);
+        }));
+
+        parts.Add(Try("Empire.Resolve", () =>
+        {
+            if (empireItem is null) return "skip";
+            var m = empireItem.GetType().GetMethod("Resolve", new[] { galaxy.GetType() });
+            if (m is null) return "<no Resolve(Galaxy)>";
+            empire = m.Invoke(empireItem, new[] { galaxy });
+            var idF = empireItem.GetType().GetField("Id", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                   ?? empireItem.GetType().GetField("_Id", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            return NullOrOk(empire) + "(id=" + (idF?.GetValue(empireItem) ?? "?") + ")";
+        }));
+
+        parts.Add(Try("Empire.Research", () =>
+            empire is null ? "skip" : NullOrOk(empire.GetType().GetField("Research", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(empire))));
+
+        parts.Add(Try("GetShipHull", () =>
+        {
+            var m = t.GetMethod("GetShipHull", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+            if (m is null) return "<no GetShipHull()>";
+            var hullId = FindField("HullId")?.GetValue(ship);
+            return NullOrOk(m.Invoke(ship, null)) + "(HullId=" + (hullId ?? "?") + ")";
+        }));
+
+        foreach (var name in new[] { "BattleData", "Components", "BonusValuesComplete", "_Design" })
+            parts.Add(Try(name, () => { var f = FindField(name); return f is null ? "<no field>" : NullOrOk(f.GetValue(ship)); }));
+
+        var map = string.Join(" ", parts);
+        bool isNew;
+        lock (_nullMapsSeen) isNew = _nullMapsSeen.Add(map);
+        if (isNew) Log?.Invoke("# delta: SUMMARY INPUTS on a failing ship -> " + map);
     }
 }

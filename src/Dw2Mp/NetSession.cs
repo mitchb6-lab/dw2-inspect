@@ -143,6 +143,7 @@ public static class NetSession
         }
         else log("# net: DWGame.Update not found; client cannot apply state");
 
+        StateDelta.Log = log;
         InstallCommandRelay(harmony, log);
 
         var thread = new Thread(LauncherLoop)
@@ -1016,7 +1017,7 @@ public static class NetSession
             {
                 _deltasApplied++;
                 if (_deltasApplied % 50 == 1)
-                    _log($"# net[client]: delta #{_deltasApplied} applied — {info}  [totals: {StateDelta.AppliedTotals()}]");
+                    _log($"# net[client]: delta #{_deltasApplied} applied — {info}  [totals: {StateDelta.AppliedTotals()}] [{StateDelta.MutationFailureSummary()}]");
                 continue;
             }
 

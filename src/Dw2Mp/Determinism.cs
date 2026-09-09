@@ -132,6 +132,9 @@ public static class Determinism
         // come after the session is loaded and before anything renders.
         PlayerEmpire.Install(harmony, MakeSave.Session, Log);
 
+        // Pure-logic test of the fleet baseline key, every launch. See StateDelta.SelfTest.
+        Log("# delta: " + StateDelta.SelfTest());
+
         // NetSession reuses the apply path, so install it for either consumer.
         NetSession.Install(harmony, Log);
 
