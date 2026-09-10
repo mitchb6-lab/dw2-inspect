@@ -23,7 +23,7 @@ this page is about your end.
 | Game | **Distant Worlds 2 on Steam, build 1.3.6.3** | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
 | .NET SDK | **9.0 or later** | `dotnet --list-sdks` |
 | git | any | `git --version` |
-| GitHub access | the repo is **private** | you need to be signed in as `mitchb6-lab` or added as a collaborator; ask the host |
+| GitHub access | **none needed** — the repo is public (since 2026-09-10; it was private when this page was written) | `git clone` works without signing in |
 | RAM | ~4 GB free for the game | a small galaxy costs ~3.5 GB; the 50-star test galaxy peaked at 8.7 GB |
 | Network | same LAN as the host, **or** Tailscale on both ends | see [Reaching the host](#reaching-the-host) |
 
