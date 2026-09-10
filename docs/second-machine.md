@@ -21,6 +21,7 @@ this page is about your end.
 |---|---|---|
 | OS | Windows 10/11, x64 | — |
 | Game | **Distant Worlds 2 on Steam, build 1.3.6.3** | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
+| **DLC** | **the same content packs as the host** — the host has all four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* | run the launcher: it logs `Content packs on disk: …` on its Log tab at start, and refuses to start a session whose two players differ |
 | .NET SDK | **9.0 or later** | `dotnet --list-sdks` |
 | git | any | `git --version` |
 | GitHub access | **none needed** — the repo is public (since 2026-09-10; it was private when this page was written) | `git clone` works without signing in |
@@ -273,3 +274,50 @@ land — because none of the automated runs had anybody at the keyboard.
   this repo. The acknowledgement in *this* protocol is the host echoing the agreed session
   (`Session received: 2 player(s) ...` in the joiner's log) in reply to the Join.
 - The host's **Your address** now defaults to the Tailscale entry when one exists.
+
+## The first two-PC run — 2026-09-10, joined, then crashed
+
+It joined. Handshake OK over Tailscale, full state received (4.5 MB packed, 24.7 MB raw),
+`APPLIED sync #1 … ships=189 empires=13`, 65 held deltas released, deltas applying. **The
+transport, the lobby and the adoption all worked across a real link on the first try.**
+Eighteen seconds later the joiner's game died:
+
+```
+System.Exception: Missing texture: Ships/Planet Destroyers/FX/Shakturi/projectile
+   at DistantWorlds2.ScaledRenderer.LoadBillboardTextures(...)
+   at DistantWorlds2.ScaledRenderer.InitializeGraphics()
+   at DistantWorlds2.DWGame.Draw(GameTime gameTime)
+```
+
+**Cause: DLC mismatch.** That texture is in `PlanetDestroyers.bundle`, which belongs to the
+*Return of the Shakturi* content pack (`DWGame`'s static constructor lists each pack's
+bundles; `CheckBundleAllowed` refuses to mount a pack's bundles unless the store says it is
+owned). The host owns it, so its galaxy has Planet Destroyer ships — component 397, *Super
+Inferno Torpedo*, references that texture. The joiner's game did not have the pack, so the
+first frame that drew the host's galaxy asked for a texture that was never mounted. The
+game-version check could not see it: both were 1.3.6.3.
+
+**Fixed the same day, in two places:**
+
+- **The launcher** sends each player's content packs (by bundle files on disk) with their
+  slot, and the host compares on join. A mismatch shows a dialog naming who has what, is
+  logged as `CONTENT MISMATCH:`, and **Start session stays disabled** until it is fixed.
+- **The mod** reads the game's own `ContentPack.Installed` flags after `DWGame.Initialize`,
+  exchanges them (`# net: peer content …`), and on a mismatch logs
+  `*** CONTENT MISMATCH ***` and **refuses to exchange state** — the client never asks for a
+  full state, the host never sends one. Two single-player games and a clear log line,
+  instead of a crash. Protocol version 2.
+
+Two other things the run reported, both fixed in the same commit:
+
+- **"Speed stuck at max."** The mod pinned the host's clock to 100 ms per server cycle (the
+  M2 determinism harness) and forced 4x at start. The pinned clock ignored the speed
+  setting entirely, so the UI showed 4x, the game ran at exactly 1x, and no button changed
+  anything. In a lobby session the host now runs DW2's own clock — **starts at 1x, the
+  host's speed buttons work, pause works** — and the client's clock **follows the host's**
+  (time and speed ride on every delta; a client does not simulate, so its own clock meant
+  nothing).
+- **"The joiner cannot edit the empire."** True in co-op, by design — there is one empire
+  and the host configures it — but the form took the joiner's input and silently discarded
+  it. The empire fields now carry a note; once the session arrives in co-op they lock and
+  say whose empire you are playing. Competitive leaves them editable.

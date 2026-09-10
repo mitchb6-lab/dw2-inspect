@@ -40,7 +40,15 @@ public static class Determinism
 
     private static readonly bool ExitWhenDone = Env("DW2MP_EXIT_WHEN_DONE", "1") == "1";
 
-    private static readonly double StepMilliseconds = EnvDouble("DW2MP_STEP_MS", 100);
+    /// <summary>
+    /// Simulated ms per server cycle for the M2 harness. In a LOBBY SESSION the default is
+    /// 0 -- the host runs DW2's own clock, so its speed buttons work and it starts at 1x.
+    /// The pinned clock made every cycle 100 ms regardless of speed, which the first
+    /// two-PC test reported as "stuck at max speed": the UI showed the 4x the harness had
+    /// requested, and no button changed what the simulation did.
+    /// </summary>
+    private static readonly double StepMilliseconds =
+        EnvDouble("DW2MP_STEP_MS", string.IsNullOrEmpty(Env("DW2MP_ROLE", "")) ? 100 : 0);
 
     private static readonly bool PinBlocks = Env("DW2MP_PIN_BLOCKS", "1") == "1";
 
@@ -120,6 +128,10 @@ public static class Determinism
         // the first cycle runs, or snapshot 0 is taken under different rules to the rest.
         FixedStep.Install(harmony, StepMilliseconds, PinBlocks, () => Interlocked.Read(ref _cycleCount), Log);
 
+        // A client has no clock of its own worth keeping: it reports the host's.
+        if (Env("DW2MP_ROLE", "").Trim().ToLowerInvariant() == "client")
+            FixedStep.InstallFollow(harmony, Log);
+
         if (Env("DW2MP_SEQUENTIAL", "0") == "1")
             Sequential.Install(harmony, Log);
 
@@ -137,6 +149,10 @@ public static class Determinism
 
         // NetSession reuses the apply path, so install it for either consumer.
         NetSession.Install(harmony, Log);
+
+        // Which DLC this game has, read after DWGame.Initialize; NetSession compares it
+        // with the peer's and refuses to exchange state on a mismatch.
+        ContentPacks.Install(harmony, Log);
 
         // A session means "generate the agreed galaxy", for BOTH roles. The client's copy
         // is a throwaway that only exists to give StartGameExisting a game context to
@@ -163,9 +179,12 @@ public static class Determinism
             // A flat cycle count used to be the whole message, and it says nothing about
             // WHY. DW2 auto-pauses on empire messages and waits for a click, which in an
             // unattended run looks exactly like a hang.
-            if (now == lastSeen)
+            // Under DW2's own clock a pause does not stop the cycles -- the server is still
+            // called every frame and does nothing -- so "is it paused" has to be asked, not
+            // inferred from a flat count.
+            if (now == lastSeen || IsPaused())
             {
-                Log($"# watchdog {secs}s: {now} cycle(s) — STALLED. {DescribeStall()}");
+                Log($"# watchdog {secs}s: {now} cycle(s) — {(now == lastSeen ? "STALLED" : "PAUSED")}. {DescribeStall()}");
                 if (KeepRunning) ClearStall();
             }
             else Log($"# watchdog {secs}s: {now} cycle(s)");
@@ -213,12 +232,40 @@ public static class Determinism
     private static readonly bool ClientSimulates = Env("DW2MP_CLIENT_SIMULATES", "0") == "1";
 
     /// <summary>Harmony prefix. Must never throw: this runs inside the simulation loop.</summary>
+    /// <summary>
+    /// Under DW2's own clock, UpdateGameAsServer is called EVERY FRAME and runs a logic
+    /// cycle only when GameLogicCycleLengthInMilliseconds (100) of wall time has passed
+    /// since the last -- the same gate it applies itself, on DateTime.Now, regardless of
+    /// game speed or pause. Counting every call made the tick run at frame rate: the first
+    /// real-clock run sent the "hourly" safety full state after three minutes and would
+    /// have sent a delta every 150 ms. So a tick is a call on which a logic cycle is due,
+    /// which is ~10/s in either role and at any speed. FixedStep keeps counting every
+    /// call, because there every call IS a cycle.
+    /// </summary>
+    private static bool LogicCycleDue(object server)
+    {
+        _cycleLengthField ??= AccessTools.Field(server.GetType(), "GameLogicCycleLengthInMilliseconds");
+        double length = _cycleLengthField?.GetValue(server) is int ms && ms > 0 ? ms : 100;
+
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double elapsedMs = (now - _lastTickStamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        if (_lastTickStamp != 0 && elapsedMs < length) return false;
+
+        _lastTickStamp = now;
+        return true;
+    }
+
+    private static FieldInfo _cycleLengthField;
+    private static long _lastTickStamp;
+
     private static void OnServerCycle(object __instance, object[] __args)
     {
         try
         {
             var galaxy = __args is { Length: > 0 } ? __args[0] : null;
             if (galaxy is null || !_galaxyType.IsInstanceOfType(galaxy)) return;
+
+            if (!FixedStep.Enabled && !LogicCycleDue(__instance)) return;
 
             long n = Interlocked.Increment(ref _cycleCount);
 
@@ -285,6 +332,20 @@ public static class Determinism
     /// Why has the server stopped cycling? Reads the three states that can stop it, so a
     /// stall reports a cause instead of a flat number.
     /// </summary>
+    private static bool IsPaused()
+    {
+        try
+        {
+            if (_server is { } server &&
+                AccessTools.PropertyGetter(server.GetType(), "IsRunning")?.Invoke(server, null) is false) return true;
+            var game = ApplyState.Game;
+            var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+            return game is not null && gameType is not null &&
+                   AccessTools.Method(gameType, "GetGamePaused", Type.EmptyTypes)?.Invoke(game, null) is true;
+        }
+        catch { return false; }
+    }
+
     private static string DescribeStall()
     {
         var parts = new List<string>();
@@ -361,8 +422,15 @@ public static class Determinism
 
             AccessTools.Method(type, "ResumeGame")?.Invoke(server, null);
 
-            float speed = (float)EnvDouble("DW2MP_GAME_SPEED", 4);
-            AccessTools.Method(type, "ChangeGameSpeed")?.Invoke(server, new object[] { speed });
+            // Only if asked. The harness used to force 4x here; in a lobby session the game
+            // starts at DW2's own 1x and the host's speed buttons are the speed control.
+            var speedEnv = Env("DW2MP_GAME_SPEED", "");
+            if (!string.IsNullOrEmpty(speedEnv))
+            {
+                float speed = (float)EnvDouble("DW2MP_GAME_SPEED", 1);
+                AccessTools.Method(type, "ChangeGameSpeed")?.Invoke(server, new object[] { speed });
+                Log($"# clock: game speed forced to {speed}x by DW2MP_GAME_SPEED");
+            }
         }
         catch (Exception ex)
         {

@@ -212,7 +212,7 @@ wire in normal play:
 
 | Message | Size | When |
 |---|---:|---|
-| Ship/colony/research/fleet delta | **~400–900 B** | every 30 ticks (~3 s) |
+| Ship/colony/research/fleet delta | **~400–900 B** | every 30 ticks — ~~(~3 s)~~ *~1 s since 2026-09-10: a tick is now one of DW2's own logic cycles, ~30/s, rather than a pinned 100 ms step* |
 | Structural summary | **25 B** | every 300 ticks |
 | Player command | ~39 B | as you act |
 | Full galaxy state | 4.3 MB | on join, and on a resync the client asks for |

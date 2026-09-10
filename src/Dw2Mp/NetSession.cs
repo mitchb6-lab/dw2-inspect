@@ -37,8 +37,9 @@ namespace Dw2Mp;
 ///     every N ticks, so the host visibly hitches on each sync. That is honest for a
 ///     prototype and is the first thing M4b should fix (snapshot off-thread, or delta).
 ///
-///   * THE SIMULATION ONLY ADVANCES IF GameServer.Now ADVANCES. Both ends need FixedStep
-///     or the host will sit inert and sync the same state forever.
+///   * THE SIMULATION ONLY ADVANCES IF GameServer.Now ADVANCES. The host runs DW2's own
+///     clock (so its speed buttons work); the client does not simulate and its clock
+///     FOLLOWS the host's, carried on every delta (FixedStep.FollowHost).
 ///
 /// Framing is length-prefixed: [int32 payload length][byte type][payload]. Deliberately
 /// dumb — a stream protocol that guesses at message boundaries is the classic way to
@@ -54,6 +55,7 @@ public static class NetSession
         StateSummary = 4,  // host -> client: tick + structural fingerprint. Tens of bytes.
         ResyncRequest = 5, // client -> host: "my structure disagrees, send me a full state"
         Delta = 6,         // host -> client: ship motion, applied IN PLACE. Hundreds of bytes.
+        Content = 7,       // both ways: installed content packs, once DWGame.Initialize knows them
     }
 
     public enum NetRole { Off, Host, Client }
@@ -112,6 +114,63 @@ public static class NetSession
 
     /// <summary>Host: remember the GameServer so relayed commands can be injected.</summary>
     public static void SetServer(object server) => _server ??= server;
+
+    // --------------------------------------------------- content parity
+    //
+    // A second compatibility axis beside the game version. Two 1.3.6.3 games with
+    // different DLC generate galaxies the other cannot draw -- see ContentPacks. Each
+    // side sends its pack list once it knows it; each side compares on receipt. On a
+    // mismatch the client never asks for a full state and the host never sends one, so
+    // the failure is a log line and two single-player games rather than a renderer
+    // crash on the joiner eighteen seconds after the join.
+
+    private static string _peerContent;
+    private static volatile bool _contentMismatch;
+    private static bool _contentRefusalLogged;
+
+    /// <summary>Called by ContentPacks once DWGame.Initialize has set the Installed flags.</summary>
+    public static void OnContentKnown()
+    {
+        if (!Active) return;
+        if (_connected) Send(Msg.Content, System.Text.Encoding.UTF8.GetBytes(ContentPacks.Mine));
+        if (_peerContent is not null) CompareContent();
+    }
+
+    private static void ReadContent(byte[] payload)
+    {
+        _peerContent = System.Text.Encoding.UTF8.GetString(payload);
+        _log("# net: peer content " + (_peerContent.Length == 0 ? "(none known)" : _peerContent.Replace(";", "  ")));
+        if (ContentPacks.Known) CompareContent();
+    }
+
+    private static void CompareContent()
+    {
+        var (theyHave, weHave) = ContentPacks.Compare(ContentPacks.Mine, _peerContent);
+        if (theyHave.Count == 0 && weHave.Count == 0)
+        {
+            _log("# net: content OK — both games have the same content packs");
+            return;
+        }
+
+        _contentMismatch = true;
+        var detail = new List<string>();
+        if (theyHave.Count > 0) detail.Add("peer has, we lack: " + string.Join(", ", theyHave));
+        if (weHave.Count > 0) detail.Add("we have, peer lacks: " + string.Join(", ", weHave));
+        _log("# net: *** CONTENT MISMATCH *** " + string.Join("; ", detail) +
+             " — state will NOT be exchanged. Both players need the same DLC installed and enabled.");
+    }
+
+    /// <summary>True when state must not cross the wire. Logs the refusal once.</summary>
+    private static bool ContentBlocksState(string what)
+    {
+        if (!_contentMismatch) return false;
+        if (!_contentRefusalLogged)
+        {
+            _contentRefusalLogged = true;
+            _log($"# net[{Role}]: refusing to {what} — content packs differ (see CONTENT MISMATCH above)");
+        }
+        return true;
+    }
 
     public static void Install(Harmony harmony, Action<string> log)
     {
@@ -173,7 +232,7 @@ public static class NetSession
     /// talk, and finding that out in the handshake is far better than finding out via a
     /// corrupt galaxy halfway through a session.
     /// </summary>
-    private const int ProtocolVersion = 1;
+    private const int ProtocolVersion = 2;
 
     /// <summary>
     /// The Hello payload: protocol version, game version, and mode.
@@ -456,6 +515,7 @@ public static class NetSession
         {
             _log($"# net[{Role}]: connected to launcher on 127.0.0.1:{_port}");
             Send(Msg.Hello, BuildHello());
+            if (ContentPacks.Known) Send(Msg.Content, System.Text.Encoding.UTF8.GetBytes(ContentPacks.Mine));
 
             while (_connected)
             {
@@ -497,6 +557,10 @@ public static class NetSession
 
                     case Msg.Hello:
                         ReadHello(payload);
+                        break;
+
+                    case Msg.Content:
+                        ReadContent(payload);
                         break;
 
                     default:
@@ -554,6 +618,7 @@ public static class NetSession
     public static void HostTick(object galaxy, long tick)
     {
         if (Role != NetRole.Host || !_connected) return;
+        if (ContentBlocksState("send state")) return;
 
         // Deltas first, and often: this is now the channel that makes the client's world
         // move. A few hundred bytes against 4.37 MB, and applied in place so it costs no
@@ -984,6 +1049,7 @@ public static class NetSession
     /// </summary>
     private static void RequestResync(string reason)
     {
+        if (ContentBlocksState("adopt the host's galaxy")) return;
         if (DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
 
         _lastResyncRequest = DateTime.UtcNow;
@@ -1037,6 +1103,7 @@ public static class NetSession
 
             if (StateDelta.Apply(galaxy, payload, out var info))
             {
+                FollowHostClock(tagged);
                 _deltasApplied++;
                 if (_deltasApplied % 50 == 1)
                     _log($"# net[client]: delta #{_deltasApplied} applied — {info}  [totals: {StateDelta.AppliedTotals()}] [{StateDelta.MutationFailureSummary()}]");
@@ -1086,20 +1153,55 @@ public static class NetSession
     /// <summary>Host: which full state the next deltas are relative to. Read on the sim thread.</summary>
     private static long CurrentBaseline => _syncsSent;
 
+    // The tag also carries the host's CLOCK: GameServer.Now as DateTime ticks, and the
+    // game speed (0 when paused). The client does not simulate, so its clock is whatever
+    // it is told; see FixedStep.FollowHost. 20 bytes on a message of hundreds.
+    private const int TagBytes = 8 + 8 + 4;
+
+    private static MethodInfo _serverNow, _serverSpeed, _serverIsRunning;
+
+    private static (long NowTicks, float Speed) HostClock()
+    {
+        try
+        {
+            if (_server is null) return (0, 0);
+            var t = _server.GetType();
+            _serverNow ??= AccessTools.PropertyGetter(t, "Now");
+            _serverSpeed ??= AccessTools.Method(t, "GetGameSpeed");
+            _serverIsRunning ??= AccessTools.PropertyGetter(t, "IsRunning");
+
+            var now = (DateTime)(_serverNow?.Invoke(_server, null) ?? DateTime.MinValue);
+            bool running = _serverIsRunning?.Invoke(_server, null) as bool? ?? true;
+            float speed = running ? (_serverSpeed?.Invoke(_server, null) as float? ?? 1f) : 0f;
+            return (now.Ticks, speed);
+        }
+        catch { return (0, 0); }
+    }
+
     private static byte[] TagDelta(byte[] delta)
     {
-        var tagged = new byte[delta.Length + 8];
+        var (nowTicks, speed) = HostClock();
+        var tagged = new byte[delta.Length + TagBytes];
         BitConverter.TryWriteBytes(tagged.AsSpan(0, 8), CurrentBaseline);
-        Buffer.BlockCopy(delta, 0, tagged, 8, delta.Length);
+        BitConverter.TryWriteBytes(tagged.AsSpan(8, 8), nowTicks);
+        BitConverter.TryWriteBytes(tagged.AsSpan(16, 4), speed);
+        Buffer.BlockCopy(delta, 0, tagged, TagBytes, delta.Length);
         return tagged;
     }
 
     private static (long Baseline, byte[] Delta) UntagDelta(byte[] tagged)
     {
-        if (tagged.Length < 8) return (-1, null);
+        if (tagged.Length < TagBytes) return (-1, null);
         var baseline = BitConverter.ToInt64(tagged, 0);
-        var delta = new byte[tagged.Length - 8];
-        Buffer.BlockCopy(tagged, 8, delta, 0, delta.Length);
+        var delta = new byte[tagged.Length - TagBytes];
+        Buffer.BlockCopy(tagged, TagBytes, delta, 0, delta.Length);
         return (baseline, delta);
+    }
+
+    /// <summary>Client: hand the host's clock from a delta tag to the follow clock.</summary>
+    private static void FollowHostClock(byte[] tagged)
+    {
+        if (tagged.Length < TagBytes) return;
+        FixedStep.FollowHost(BitConverter.ToInt64(tagged, 8), BitConverter.ToSingle(tagged, 16));
     }
 }

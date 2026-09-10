@@ -1936,3 +1936,98 @@ drops one for a state already superseded.
 The remaining 10 are **not attributed**. `ShipList.WriteToStream` does not skip destroyed
 ships, so it is not that. It is the open item going into the first two-machine test, where
 a real link will reorder things differently than loopback does.
+
+## The first two-PC run: content is a second compatibility axis — 2026-09-10
+
+Everything before this was two processes on one PC. The first real join, over Tailscale
+between two machines, **worked end to end** — handshake, 4.5 MB full state, adoption
+(`ships=189 empires=13`), 65 held deltas released, deltas applying — and then the joiner
+crashed 18 seconds later in `ScaledRenderer.LoadBillboardTextures`:
+
+```
+Missing texture: Ships/Planet Destroyers/FX/Shakturi/projectile
+```
+
+### Same version, different game
+
+Both games were 1.3.6.3 and the handshake said so. What differed was **DLC**. The texture is
+in `PlanetDestroyers.bundle`; `DWGame`'s static constructor assigns that bundle to the
+*Return of the Shakturi* content pack, and `DWGame.CheckBundleAllowed` mounts a pack's
+bundles only if `ContentPack.Installed` — set by the store's ownership check in
+`DWGame.Initialize` — is true. The host owns the pack, so its galaxy carries Planet
+Destroyer designs (component 397, *Super Inferno Torpedo*, `FlipbookTextureFilepath` = that
+path). The joiner's game never mounted the bundle, and the first frame that drew the
+adopted galaxy asked for a texture it did not have.
+
+The mod's own adoption checks passed: `all 140 component id(s) resolve in ComponentsStatic`
+was true because the component *definitions* ship with the base game — only the *bundle*
+is gated. A definition resolving says nothing about whether its assets are mounted.
+
+### Two checks, because one side of them lies harmlessly
+
+- **The launcher** sends each player's content packs — by which bundle files exist under
+  `data\db\bundles` — with their slot. Steam only downloads a DLC's depot when the account
+  owns it, so presence on disk is a good proxy and it costs nothing to check before the
+  game is even launched. The host compares on join, shows a dialog naming who has what,
+  and **Start session stays disabled**.
+- **The mod** reads the real `Installed` flags after `DWGame.Initialize` (they are false for
+  everything before that), exchanges them as a `Content` message, and on a mismatch **refuses
+  to exchange state in either direction**. Protocol version 1 → 2.
+
+Both are needed: the disk check runs early and is visible in the UI but is a proxy; the
+in-game check is authoritative but only fires once two games have loaded. A GOG or Matrix
+install, or a pack disabled in the game's own settings, is exactly the case where they
+would disagree.
+
+### Two more findings from the same run
+
+**"Speed stuck at max"** was the M2 harness leaking into the session. `FixedStep` pinned
+the host's clock to 100 ms per server cycle, so the speed setting had no effect on
+simulated time, while `StartTheClock` forced `ChangeGameSpeed(4)`, so the UI showed 4x. Ten
+cycles a second at 100 ms each is exactly 1x; the game ran at 1x with a 4x label and
+buttons that changed a number nothing read. In a lobby session `DW2MP_STEP_MS` now
+defaults to 0 — DW2's own `AdvancedStopwatch` clock, speed buttons and pause all work,
+start at 1x — and the forced speed is opt-in via `DW2MP_GAME_SPEED`. The harness scripts
+still set 100 explicitly, so the determinism runs are unchanged.
+
+The client needed its own answer: it does not simulate, so its `GameServer.Now` — which
+`Galaxy.GetServerNow()` and every date display, ETA and countdown read — was running from
+its own start at its own rate. **Every delta now carries the host's `Now` and speed** (20-byte
+tag: baseline, time ticks, speed; speed 0 when the host is paused), and the client's
+`get_Now`/`get_NowPrecise` return the host's time extrapolated at the host's speed since
+the last delta (`FixedStep.FollowHost`). Continuous, and it stops when the host pauses.
+
+**"The joiner cannot edit the empire"** in co-op is correct — one empire, the host
+configures it — but the form took the input and discarded it without saying so. The empire
+fields now carry a note in every state, and in co-op they lock once the session arrives
+and name the host's empire. Also fixed the same morning, before the run: the host accepted
+exactly one connection and stopped listening, so the joiner's own **Test** probe consumed
+the lobby (`f1b5554`).
+
+### What the run proved
+
+Adoption over a real link on the first attempt, with latency and a real TCP stack, behaved
+exactly as loopback had: 352 ms read, 38 ms apply, deltas held for the in-flight full
+state and released in order. The transport was never the problem. Content parity was —
+and it is the kind of problem that only two different machines can find.
+
+### The tick had to be redefined with the clock — same day
+
+Running DW2's own clock changed what a "tick" was. `UpdateGameAsServer` is called **every
+frame** and runs a logic cycle only when `GameLogicCycleLengthInMilliseconds` of wall time
+has passed (its own gate, on `DateTime.Now`, independent of speed and pause). Under
+FixedStep every call advanced the clock and so every call was a cycle; under the real clock
+the mod's tick ran at frame rate — the first real-clock loopback run sent the "hourly"
+safety full state after three minutes and would have sent a delta every 150 ms. A tick is
+now a call on which a logic cycle is due (`Determinism.LogicCycleDue`), ~30/s in either
+role at any speed; FixedStep runs are unchanged.
+
+Two more things the same run exposed, both fixed: the watchdog inferred "stalled" from a
+flat cycle count, which a pause no longer produces (the server is still called and does
+nothing) — it now asks `IsRunning`/`GetGamePaused` and reports `PAUSED`; and in a lobby
+session `DW2MP_KEEP_RUNNING` is now off, because a pause there is the host's decision and
+a watchdog that un-pauses the game the host just paused is a bug wearing a safety feature.
+
+Verified on loopback, 15 stars, 180 s: content OK both ways, host at 1x (67 s of game time
+per 67 s of wall time), deltas every ~1 s at 135 B, client following, **0 crash dumps, 0
+mutation failures**.

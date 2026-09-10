@@ -113,4 +113,57 @@ public static class FixedStep
     }
 
     private static bool SkipPrefix() => false;
+
+    // ------------------------------------------------------------ follow mode (client)
+    //
+    // A client does not simulate, so its own clock means nothing: Galaxy.GetServerNow()
+    // is what every date display, ETA and countdown reads, and left alone it would run
+    // from the client's own start time at the client's own rate. The host puts its Now
+    // and its speed on every delta; between deltas the client extrapolates at that speed
+    // from the moment the delta was applied, so the clock is continuous rather than
+    // stepping every three seconds, and it stops when the host pauses (speed 0).
+    //
+    // Speed is the host's alone. The client's speed buttons still exist in the UI and
+    // still call ChangeGameSpeed on its idle GameServer, and nothing reads that.
+
+    private static volatile bool _follow;
+    private static long _hostNowTicks;
+    private static float _hostSpeed;
+    private static readonly System.Diagnostics.Stopwatch _sinceHostTime = new();
+
+    /// <summary>True once the client has a host time to report.</summary>
+    public static bool Following => _follow && _hostNowTicks > 0;
+
+    public static void InstallFollow(Harmony harmony, Action<string> log)
+    {
+        var serverType = AccessTools.TypeByName("DistantWorlds.Types.GameServer");
+        if (serverType is null) { log("# clock: GameServer not found; client clock will not follow the host"); return; }
+
+        _follow = true;
+        PatchClock(harmony, serverType, "get_Now", nameof(FollowPrefix), log);
+        PatchClock(harmony, serverType, "get_NowPrecise", nameof(FollowPrefix), log);
+        log("# clock: client follows the host's time and speed (carried on every delta)");
+    }
+
+    /// <summary>Client: the host's clock as of the delta just applied.</summary>
+    public static void FollowHost(long hostNowTicks, float hostSpeed)
+    {
+        if (!_follow || hostNowTicks <= 0) return;
+        _hostNowTicks = hostNowTicks;
+        _hostSpeed = hostSpeed;
+        _sinceHostTime.Restart();
+    }
+
+    private static bool FollowPrefix(ref DateTime __result)
+    {
+        if (!Following) return true;  // nothing from the host yet: the real clock is fine
+
+        try
+        {
+            double elapsedMs = _sinceHostTime.Elapsed.TotalMilliseconds * _hostSpeed;
+            __result = new DateTime(_hostNowTicks).AddMilliseconds(elapsedMs);
+            return false;
+        }
+        catch { return true; }
+    }
 }

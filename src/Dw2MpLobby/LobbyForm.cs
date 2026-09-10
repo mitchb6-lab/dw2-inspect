@@ -27,6 +27,10 @@ public sealed class LobbyForm : Form
     private readonly ComboBox _government = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly Button _colour = new() { FlatStyle = FlatStyle.Flat };
 
+    /// <summary>Under the empire grid: says when these fields are not yours to set.</summary>
+    private readonly Label _empireNote = new() { AutoSize = true, ForeColor = Color.DarkSlateGray, Padding = new Padding(0, 4, 0, 0) };
+    private bool _contentWarned;
+
     // --- session ---
     private readonly RadioButton _roleHost = new() { Text = "Host", Checked = true };
     private readonly RadioButton _roleJoin = new() { Text = "Join" };
@@ -94,6 +98,8 @@ public sealed class LobbyForm : Form
 
         Log($"Game: {gamePath}");
         Log($"{_races.Count} races, {_governments.Count} governments loaded.");
+        var packs = GameData.InstalledContentPacks(gamePath);
+        Log("Content packs on disk: " + (packs.Count == 0 ? "none (base game only)" : string.Join(", ", packs)));
         RefreshMods();
         RefreshLocalAddresses();
     }
@@ -132,12 +138,12 @@ public sealed class LobbyForm : Form
         _transport.Items.AddRange(new object[] { "Direct TCP (LAN, or Tailscale/ZeroTier)", "Steam networking (not yet available)" });
         _transport.SelectedIndex = 0;
 
-        root.Controls.Add(Section("Your empire", Grid(
+        root.Controls.Add(Section("Your empire", Stack2(Grid(
             ("Player name", _playerName),
             ("Empire name", _empireName),
             ("Race", _race),
             ("Government", _government),
-            ("Colour", _colour))));
+            ("Colour", _colour)), _empireNote)));
 
         root.Controls.Add(Section("Connection", Grid(
             ("Role", Stack(_roleHost, _roleJoin)),
@@ -284,6 +290,7 @@ public sealed class LobbyForm : Form
         };
 
         _roleHost.CheckedChanged += (_, _) => UpdateRoleEnabled();
+        _mode.SelectedIndexChanged += (_, _) => UpdateEmpireEditable(null);
         _openLobby.Click += async (_, _) => await OpenLobby();
         _launch.Click += (_, _) => StartSession();
 
@@ -340,6 +347,69 @@ public sealed class LobbyForm : Form
         _myAddress.Enabled = _copyAddress.Enabled = host;
         _address.Enabled = _testConnection.Enabled = !host;
         _openLobby.Text = host ? "Open lobby" : "Connect to host";
+        UpdateEmpireEditable(null);
+    }
+
+    /// <summary>
+    /// In co-op there is ONE empire and the host configures it; the joiner's empire fields
+    /// are sent but never used. The first two-PC test reported that as "the joiner cannot
+    /// edit the empire" -- true, and the form should say so instead of taking the input
+    /// and discarding it. Before the session arrives the joiner does not know the mode,
+    /// so the fields stay editable with a note; once it arrives, co-op locks them.
+    /// </summary>
+    private void UpdateEmpireEditable(SessionDescriptor session)
+    {
+        bool host = _roleHost.Checked;
+        bool coop = _mode.SelectedIndex == 0;
+
+        if (host)
+        {
+            SetEmpireFields(true);
+            _empireNote.Text = coop ? "Co-op: this is the empire both players share." : "";
+            return;
+        }
+
+        if (session is null)
+        {
+            SetEmpireFields(true);
+            _empireNote.Text = "The host picks the mode. In co-op the host's empire is shared and these settings are not used; in competitive they are yours.";
+            return;
+        }
+
+        if (coop)
+        {
+            var theirs = session.Players.FirstOrDefault(p => p.Slot == 0)?.Empire;
+            var race = theirs is null ? "" : _races.FirstOrDefault(r => r.Id == theirs.RaceId)?.Name ?? $"race {theirs.RaceId}";
+            SetEmpireFields(false);
+            _empireNote.Text = theirs is null
+                ? "Co-op: the host's empire is shared. These settings are not used."
+                : $"Co-op: you play the host's empire \"{theirs.Name}\" ({race}). These settings are not used.";
+        }
+        else
+        {
+            SetEmpireFields(true);
+            _empireNote.Text = "Competitive: this is your own empire.";
+        }
+    }
+
+    private void SetEmpireFields(bool enabled) =>
+        _empireName.Enabled = _race.Enabled = _government.Enabled = _colour.Enabled = enabled;
+
+    /// <summary>A sentence naming the packs one side has and the other lacks, or null.</summary>
+    private static string ContentMismatch(SessionDescriptor session)
+    {
+        var host = session.Players.FirstOrDefault(p => p.Slot == 0);
+        var joiner = session.Players.FirstOrDefault(p => p.Slot != 0);
+        if (host is null || joiner is null) return null;
+
+        var hostOnly = host.ContentPacks.Except(joiner.ContentPacks).ToList();
+        var joinerOnly = joiner.ContentPacks.Except(host.ContentPacks).ToList();
+        if (hostOnly.Count == 0 && joinerOnly.Count == 0) return null;
+
+        var parts = new List<string>();
+        if (hostOnly.Count > 0) parts.Add($"{host.Name} (host) has {string.Join(", ", hostOnly)}; {joiner.Name} does not");
+        if (joinerOnly.Count > 0) parts.Add($"{joiner.Name} has {string.Join(", ", joinerOnly)}; {host.Name} (host) does not");
+        return string.Join(". ", parts) + ".";
     }
 
     private void UpdateStatus()
@@ -424,8 +494,26 @@ public sealed class LobbyForm : Form
             _playerList.Items.Add($"{p.Slot}: {p.Name} — \"{p.Empire.Name}\" ({race}, {gov}){me}");
         }
 
-        // Only the host starts, and only with someone to play with.
-        _launch.Enabled = _lobby.IsHost && session.Players.Count > 1;
+        // Once both slots are here, the DLC sets must agree -- see PlayerSlot.ContentPacks.
+        var mismatch = session.Players.Count > 1 ? ContentMismatch(session) : null;
+        if (mismatch is not null && !_contentWarned)
+        {
+            _contentWarned = true;
+            Log("CONTENT MISMATCH: " + mismatch);
+            MessageBox.Show(this,
+                mismatch + "\n\nBoth players need the same DLC installed and enabled. The session will not start until they match.",
+                "Content packs differ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        // The joiner learns the mode from the host here; in co-op their empire is not used.
+        if (!_lobby.IsHost)
+        {
+            _mode.SelectedIndex = session.Mode == "competitive" ? 1 : 0;
+            UpdateEmpireEditable(session);
+        }
+
+        // Only the host starts, only with someone to play with, and only on matching content.
+        _launch.Enabled = _lobby.IsHost && session.Players.Count > 1 && mismatch is null;
         _launch.Text = _lobby.IsHost
             ? (session.Players.Count > 1 ? "Start session" : "Waiting for a player...")
             : "Waiting for the host to start...";
@@ -486,6 +574,7 @@ public sealed class LobbyForm : Form
         {
             Slot = host ? 0 : 1,
             Name = _playerName.Text.Trim(),
+            ContentPacks = GameData.InstalledContentPacks(_gamePath),
             Empire = new EmpireConfig
             {
                 Name = _empireName.Text.Trim(),
@@ -538,8 +627,11 @@ public sealed class LobbyForm : Form
         // host's state over it.
 
         psi.Environment["DW2MP_DETERMINISM"] = "1";
-        psi.Environment["DW2MP_STEP_MS"] = "100";
         psi.Environment["DW2MP_PIN_BLOCKS"] = "1";
+        // A pause in a lobby session is the HOST's decision. The unattended harness auto-resumes
+        // DW2's message pauses; a person at the keyboard clicks through them, and would not
+        // thank a watchdog for un-pausing the game they just paused.
+        psi.Environment["DW2MP_KEEP_RUNNING"] = "0";
         psi.Environment["DW2MP_EXIT_WHEN_DONE"] = "0";
         psi.Environment["DW2MP_SNAPSHOT_CYCLES"] = "100000";
         psi.Environment["DW2MP_MAX_SNAPSHOTS"] = "2";

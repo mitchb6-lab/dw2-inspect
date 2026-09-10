@@ -76,6 +76,14 @@ public sealed class PlayerSlot
     public string Name { get; set; } = "Player";
 
     public EmpireConfig Empire { get; set; } = new();
+
+    /// <summary>
+    /// DLC present in this player's game folder, by content-pack name. Compared by the host
+    /// on join: a galaxy generated with a pack cannot be drawn by a game without it (the
+    /// first two-PC join crashed on a Planet Destroyer texture from Return of the Shakturi).
+    /// Presence on disk is the launcher's view; the mod checks ownership again in-game.
+    /// </summary>
+    public List<string> ContentPacks { get; set; } = new();
 }
 
 /// <summary>Maps one-to-one onto DW2's GameStartSettingsEmpire.</summary>
