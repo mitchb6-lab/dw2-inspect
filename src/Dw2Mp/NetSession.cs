@@ -652,7 +652,7 @@ public static class NetSession
 
             if (payload is null) return;
 
-            Send(Msg.Delta, payload);
+            Send(Msg.Delta, TagDelta(payload));
             _deltasSent++;
             _deltaBytes += payload.Length;
 
@@ -764,6 +764,7 @@ public static class NetSession
         {
             _syncsApplied++;
             _log($"# net[client]: APPLIED sync #{_syncsApplied}  {info}");
+            ReleaseHeldDeltas();
         }
         else _log("# net[client]: apply FAILED " + info);
     }
@@ -994,15 +995,16 @@ public static class NetSession
     }
 
     /// <summary>
-    /// Apply queued deltas to the live galaxy, on the main thread.
+    /// Apply queued deltas to the live galaxy, on the main thread, IN BASELINE ORDER.
     ///
-    /// Main thread because the renderer reads these same ship positions every frame, and a
-    /// Vector3 written field-by-field from another thread can be read half-updated. The
+    /// Main thread because the renderer reads these same ship positions every frame. The
     /// client's own simulation is stopped, so nothing else is writing them.
     ///
-    /// A delta that does not fit -- unknown ship, disagreeing count -- is a structural
-    /// divergence, not a bad packet. The rest of the queue is discarded (it is all relative
-    /// to a galaxy we evidently do not have) and a full state is requested.
+    /// Each delta carries the full-state number it was built against. A delta for the state
+    /// the client has applied is applied; one for a state still in transit is HELD and
+    /// re-queued when that state lands; one for a superseded state is dropped. Without this,
+    /// a delta that overtook its full state on the wire was applied to the galaxy the state
+    /// was about to replace, and everything it created vanished with that galaxy.
     /// </summary>
     private static void DrainDeltas()
     {
@@ -1011,8 +1013,28 @@ public static class NetSession
         var galaxy = ApplyState.CurrentGalaxy;
         if (galaxy is null) return;
 
-        while (_inboundDeltas.TryDequeue(out var payload))
+        while (_inboundDeltas.TryDequeue(out var tagged))
         {
+            var (baseline, payload) = UntagDelta(tagged);
+            if (payload is null) continue;
+
+            if (baseline > _syncsApplied)
+            {
+                // Built against a full state we have not applied yet. Keep it, in order.
+                _heldDeltas.Enqueue(tagged);
+                if (++_deltasHeld == 1 || _deltasHeld % 50 == 0)
+                    _log($"# net[client]: holding delta for full state #{baseline} (have #{_syncsApplied}); {_deltasHeld} held so far");
+                continue;
+            }
+
+            if (baseline < _syncsApplied)
+            {
+                // Built against a galaxy we have already replaced. Nothing in it is true now.
+                if (++_deltasDropped == 1 || _deltasDropped % 50 == 0)
+                    _log($"# net[client]: dropped delta for superseded full state #{baseline} (have #{_syncsApplied}); {_deltasDropped} dropped so far");
+                continue;
+            }
+
             if (StateDelta.Apply(galaxy, payload, out var info))
             {
                 _deltasApplied++;
@@ -1021,9 +1043,63 @@ public static class NetSession
                 continue;
             }
 
-            while (_inboundDeltas.TryDequeue(out _)) { }
-            RequestResync($"a delta did not fit: {info}");
+            // A delta that cannot be READ is a protocol problem, not a state one.
+            _log($"# net[client]: delta unreadable ({info}); requesting a full state");
+            RequestResync("delta unreadable: " + info);
             return;
         }
+    }
+
+    /// <summary>
+    /// After a full state lands, deltas held for it become applicable. Move them back to the
+    /// front of the inbound queue in the order they arrived.
+    /// </summary>
+    private static void ReleaseHeldDeltas()
+    {
+        if (_heldDeltas.IsEmpty) return;
+
+        var pending = new List<byte[]>();
+        while (_heldDeltas.TryDequeue(out var d)) pending.Add(d);
+        while (_inboundDeltas.TryDequeue(out var d)) pending.Add(d);
+        foreach (var d in pending) _inboundDeltas.Enqueue(d);
+
+        _log($"# net[client]: released {pending.Count} held delta(s) against full state #{_syncsApplied}");
+    }
+    // ------------------------------------------------ delta ordering against full states
+    //
+    // A delta is only meaningful against the full state it was built after. The host sends
+    // full states through the sender thread's one-slot outbox and deltas inline from
+    // HostTick, so a delta built AFTER snapshot T can reach the client BEFORE T does. Applied
+    // then, it lands on the galaxy T is about to replace and is lost with it; every ship it
+    // created is absent until the next full state, and every update naming one is skipped.
+    // That was the residual 1-20 "absent" per delta that survived fixing creation itself.
+    //
+    // So every delta carries the number of the full state it is relative to, and the client
+    //   applies it   if that number equals the full state it has applied,
+    //   holds it     if it is for a full state still in transit,
+    //   drops it     if it is for one already superseded.
+    // Held deltas are re-queued in order once their full state lands.
+
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _heldDeltas = new();
+    private static long _deltasHeld, _deltasDropped;
+
+    /// <summary>Host: which full state the next deltas are relative to. Read on the sim thread.</summary>
+    private static long CurrentBaseline => _syncsSent;
+
+    private static byte[] TagDelta(byte[] delta)
+    {
+        var tagged = new byte[delta.Length + 8];
+        BitConverter.TryWriteBytes(tagged.AsSpan(0, 8), CurrentBaseline);
+        Buffer.BlockCopy(delta, 0, tagged, 8, delta.Length);
+        return tagged;
+    }
+
+    private static (long Baseline, byte[] Delta) UntagDelta(byte[] tagged)
+    {
+        if (tagged.Length < 8) return (-1, null);
+        var baseline = BitConverter.ToInt64(tagged, 0);
+        var delta = new byte[tagged.Length - 8];
+        Buffer.BlockCopy(tagged, 8, delta, 0, delta.Length);
+        return (baseline, delta);
     }
 }
