@@ -375,6 +375,18 @@ public sealed class LobbyForm : Form
             _openLobby.Enabled = false;
             _lobby = new LobbySession((int)_port.Value, Log);
             _lobby.SessionChanged += () => BeginInvoke(RefreshPlayerList);
+            _lobby.ConnectionLost += () => BeginInvoke(() =>
+            {
+                // The peer is gone and nothing is listening. Hand the button back so the
+                // host can open again without restarting the launcher; the old session is
+                // discarded because its player list names someone who is not there.
+                _lobby?.Dispose();
+                _lobby = null;
+                _playerList.Items.Clear();
+                _launch.Enabled = false;
+                _openLobby.Enabled = true;
+                Log("Press Open lobby to listen again.");
+            });
 
             if (_roleHost.Checked)
             {

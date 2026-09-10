@@ -48,6 +48,9 @@ public sealed class LobbySession : IDisposable
 
     public event Action StartRequested;
 
+    /// <summary>The peer went away before the session started. Never raised after hand-over.</summary>
+    public event Action ConnectionLost;
+
     public LobbySession(int port, Action<string> log)
     {
         _port = port;
@@ -64,14 +67,79 @@ public sealed class LobbySession : IDisposable
         _listener.Start();
         _log($"Lobby open on port {_port}. Waiting for a player to join...");
 
-        try { _peer = await _listener.AcceptTcpClientAsync(ct); }
+        // Keep accepting until a connection actually JOINS. The first build accepted exactly
+        // one connection and stopped listening -- and on the first two-PC attempt that one
+        // connection was the joiner's own Test probe, which connects and hangs up without
+        // sending anything. The host then sat on "waiting for their empire" over a socket
+        // the probe had already closed, with nothing listening, and the real join found no
+        // host. A probe, a port scanner or a browser must not be able to consume the lobby.
+        try
+        {
+            while (true)
+            {
+                var peer = await _listener.AcceptTcpClientAsync(ct);
+                peer.NoDelay = true;
+                _peer = peer;
+                _stream = peer.GetStream();
+                _log($"A connection from {peer.Client.RemoteEndPoint}. Waiting for their empire...");
+
+                var (type, payload) = await ReceiveWithin(JoinGracePeriod, ct);
+
+                if (type == LobbyMsg.Join && await TryAdmit(payload))
+                    break;
+
+                _log(type is null
+                    ? "It hung up without joining -- a Test probe, most likely. Still waiting for a player..."
+                    : $"It sent {type} instead of joining; ignored. Still waiting for a player...");
+
+                _peer = null;
+                _stream = null;
+                peer.Dispose();
+            }
+        }
         finally { _listener.Stop(); }
 
-        _peer.NoDelay = true;
-        _stream = _peer.GetStream();
-        _log("A player connected. Waiting for their empire...");
-
         _ = Task.Run(() => ReadLoop(_cts.Token));
+    }
+
+    /// <summary>
+    /// How long a fresh connection has to send its Join before the host goes back to
+    /// listening. Long enough for a slow machine to serialise a slot; short enough that a
+    /// stray connection does not hold the lobby hostage.
+    /// </summary>
+    private static readonly TimeSpan JoinGracePeriod = TimeSpan.FromSeconds(15);
+
+    private async Task<(LobbyMsg? Type, byte[] Payload)> ReceiveWithin(TimeSpan limit, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(limit);
+        return await ReceiveAsync(timeout.Token);
+    }
+
+    /// <summary>
+    /// Host: take a joiner's slot into the session and echo the agreed session back with
+    /// THEIR slot marked, so both sides hold the same descriptor and differ only in mySlot.
+    /// The echo is the acknowledgement a joiner waits for.
+    /// </summary>
+    private async Task<bool> TryAdmit(byte[] payload)
+    {
+        PlayerSlot slot;
+        try { slot = JsonSerializer.Deserialize<PlayerSlot>(payload); }
+        catch (JsonException ex) { _log($"Join was not a player slot: {ex.Message}"); return false; }
+        if (slot is null) return false;
+
+        // The host owns slot numbering. A client that asked for a slot already taken must
+        // not silently overwrite the host's own empire.
+        slot.Slot = Session.Players.Count;
+        Session.Players.Add(slot);
+
+        _log($"{slot.Name} joined as \"{slot.Empire.Name}\" (slot {slot.Slot}).");
+
+        var forThem = CloneWithMySlot(Session, slot.Slot);
+        await SendAsync(LobbyMsg.Session, JsonSerializer.SerializeToUtf8Bytes(forThem));
+
+        SessionChanged?.Invoke();
+        return true;
     }
 
     /// <summary>Client: connect and offer our slot.</summary>
@@ -111,25 +179,10 @@ public sealed class LobbySession : IDisposable
                 switch (type)
                 {
                     case LobbyMsg.Join when IsHost:
-                    {
-                        var slot = JsonSerializer.Deserialize<PlayerSlot>(payload);
-                        if (slot is null) break;
-
-                        // The host owns slot numbering. A client that asked for a slot
-                        // already taken must not silently overwrite the host's own empire.
-                        slot.Slot = Session.Players.Count;
-                        Session.Players.Add(slot);
-
-                        _log($"{slot.Name} joined as \"{slot.Empire.Name}\" (slot {slot.Slot}).");
-
-                        // Echo the whole agreed session back, with THEIR slot marked, so
-                        // both sides hold the same descriptor and differ only in mySlot.
-                        var forThem = CloneWithMySlot(Session, slot.Slot);
-                        await SendAsync(LobbyMsg.Session, JsonSerializer.SerializeToUtf8Bytes(forThem));
-
-                        SessionChanged?.Invoke();
+                        // A second Join on an admitted connection (a client re-sending). The
+                        // first one, before this loop starts, is handled by HostAsync.
+                        await TryAdmit(payload);
                         break;
-                    }
 
                     case LobbyMsg.Session when !IsHost:
                         Session = JsonSerializer.Deserialize<SessionDescriptor>(payload);
@@ -149,8 +202,18 @@ public sealed class LobbySession : IDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { return; }
         catch (Exception ex) { _log($"Lobby connection lost: {ex.GetType().Name}: {ex.Message}"); }
+
+        // Reached on a clean hang-up (ReceiveAsync returned null) or an error -- never on
+        // cancellation, which is the hand-over to the relay and is not a loss. The form
+        // uses this to give Open lobby back; before it, a dropped lobby left the button
+        // greyed out and the only way on was to restart the launcher.
+        if (!ct.IsCancellationRequested)
+        {
+            _log("The other player disconnected from the lobby.");
+            ConnectionLost?.Invoke();
+        }
     }
 
     private static SessionDescriptor CloneWithMySlot(SessionDescriptor source, int mySlot)

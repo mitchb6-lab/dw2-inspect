@@ -259,3 +259,17 @@ joiner's log:
 
 If it all works, the next thing is to **play** — give orders on both sides and watch them
 land — because none of the automated runs had anybody at the keyboard.
+
+## Found on the first live attempt — 2026-09-10
+
+- **A Test probe used to kill the host lobby.** The host accepted exactly one connection
+  and stopped listening; the joiner's own **Test** was that connection. Fixed the same
+  hour: the host now keeps listening until a connection actually sends a Join, logs probes
+  as `It hung up without joining -- a Test probe, most likely`, and gives **Open lobby**
+  back if the peer drops. Verified with two probes on loopback. **Pull `main` before
+  building** — a host on the old build dies the moment you press Test.
+- **"host didn't acknowledge in time" is not a message this launcher produces**, in any
+  version. If you see it, you are running something other than `Dw2MpLobby.exe` built from
+  this repo. The acknowledgement in *this* protocol is the host echoing the agreed session
+  (`Session received: 2 player(s) ...` in the joiner's log) in reply to the Join.
+- The host's **Your address** now defaults to the Tailscale entry when one exists.
