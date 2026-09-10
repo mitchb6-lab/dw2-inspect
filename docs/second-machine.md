@@ -103,11 +103,13 @@ The window should report finding the game and loading **23 races**. If instead i
 
 ## Connecting
 
-Do these in order. **Do not launch until the host tells you they are in the galaxy** —
-the host does not listen until its game has loaded, and there is nothing to connect to
-before that.
+**The lobby comes first and the games launch together.** *(Corrected 2026-09-10, at the
+first live attempt — the previous text said to wait until the host was in-game. That was
+the old flow; the launcher now owns the connection.)* The host opens a lobby, you join it,
+both empires appear in the player list, and the **host** presses Start — which launches
+**both** games at once. You do not launch anything yourself.
 
-1. **Role → Join a session.**
+1. **Role → Join.**
 2. **Host address** — paste what the host sent you (see [Reaching the host](#reaching-the-host)).
    **Port** stays `47800`.
 3. Click **Test** (beside the address). The result appears in the log panel within a few seconds:
@@ -115,11 +117,19 @@ before that.
    - `No answer from …` or `Could not connect … ConnectionRefused` — the host is not in-game yet, the address is wrong, or the host's
      firewall is blocking the launcher (see [The host](#the-host-this-pc)). Do not launch;
      a four-minute game load to discover a typo is the thing this button exists to prevent.
-4. Configure your empire — name, race, government, colour. This reaches the host; the host
-   generates a galaxy containing both empires.
-5. **Join and launch.** DW2 starts. Expect **2–4 minutes** to load: your game generates a
-   throwaway galaxy for a game context, connects, receives the host's galaxy (~4 MB
-   compressed), and adopts it. After that your world moves only when the host's deltas say so.
+4. Configure your empire — name, race, government, colour — **before** the next step; it is
+   sent when you join the lobby.
+5. Click **Open lobby.** The log panel should show `Connected to <host>:47800. Sending your
+   empire...` and then `Session received: 2 player(s), ...`. The **Lobby** tab lists both
+   empires. Tell the host you are in.
+6. **Wait.** When the host presses **Start session**, your log shows `Host started the
+   session.` then `Launched. The game connects back on 127.0.0.1:<port>.` and DW2 starts by
+   itself. Expect **2–4 minutes** to load: your game generates a throwaway galaxy for a game
+   context, connects through the launcher, receives the host's galaxy (~4 MB compressed),
+   and adopts it. After that your world moves only when the host's deltas say so.
+
+**Leave the launcher window open for the whole session.** It is the transport: your game
+talks only to it on loopback, and it talks to the host. Closing it ends the session.
 
 ## Did it work?
 
@@ -186,7 +196,10 @@ listening.
 For mitch, or a session on the host machine. What the host has to have right, in the order
 it will bite:
 
-1. **The firewall does not cover the launcher.** *(Found 2026-09-10.)* The inbound Allow
+1. **The firewall does not cover the launcher.** *(Found 2026-09-10.) **Resolved the same day,
+   the easy way:** the first **Open lobby** raised the Windows Security Alert and allowing it
+   created two inbound Allow rules for `dw2mplobby.exe` (Public profile). The manual rule
+   below is only needed if that prompt was dismissed.* The inbound Allow
    rules on this PC are for `DistantWorlds2.exe`. Since the launcher took over the
    transport, **the listener on 47800 is in `Dw2MpLobby.exe`**, which has no rule — and the
    active network profile is **Public**, where Windows blocks unsolicited inbound to an
@@ -206,9 +219,12 @@ it will bite:
 
 3. **Same commit as the joiner.** `git rev-parse HEAD` on both, compared.
 
-4. **Host first, then tell the joiner.** Role → Host, empire, mode, **Host and launch**, wait
-   until in the galaxy, *then* say go. The joiner's Test button reports `No answer` until this
-   point and that is correct.
+4. **Open the lobby first, launch last.** Role → Host, empire, mode, galaxy size, then
+   **Open lobby** — the log says `Lobby open on port 47800. Waiting for a player to join...`
+   and the listener is up from this moment (the joiner's Test button answers now). When
+   the joiner appears in the player list, **Start session** becomes enabled; pressing it
+   launches both games. *(Corrected 2026-09-10: this said "Host and launch, wait until
+   in-game, then say go" — the old flow.)*
 
 5. **The host's log** is `%LOCALAPPDATA%\Dw2Mp\determinism-lobbyHost.log`. The lines that
    say the joiner arrived:

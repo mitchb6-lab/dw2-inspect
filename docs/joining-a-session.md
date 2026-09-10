@@ -358,3 +358,17 @@ frozen galaxy rather than a diverging one — worth knowing before you diagnose 
 - Two more things the new page records that this one assumed: the host's internet is
   Starlink (CGNAT — no port forwarding, so internet play needs Tailscale on both ends), and
   NordVPN was connected on the day of writing.
+
+### 2026-09-10 — the step-by-step above describes the OLD launch flow
+
+Found at the first live attempt. "Host and launch", "Join and launch", and "tell the joiner
+to connect only once you are in-game" are the flow from before the launcher owned the
+transport. **The real flow is lobby-first:** the host presses **Open lobby** (the listener
+is up from that moment — the joiner's **Test** answers immediately), the joiner sets their
+empire and presses **Open lobby** to join it, both appear in the player list, and the host's
+**Start session** launches **both** games together. Neither player launches the game by
+hand. The corrected steps are on [second-machine.md](second-machine.md#connecting); the
+numbered lists above are left as written and should be read with this note.
+
+The firewall gap recorded this morning closed itself at the same attempt: **Open lobby**
+raised the Windows Security Alert, and allowing it added the `dw2mplobby.exe` rules.
