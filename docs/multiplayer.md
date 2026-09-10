@@ -1857,3 +1857,82 @@ blind spot. A fix for one measurement trap paid for itself on an unrelated one.
 than unexercised, but lightly: one creation, no removal, and no case where two empires both own
 a fleet — which is precisely what the packed key exists to handle. That specific collision is
 still untested.
+
+## Designs, read-back, tombstones, and delta baselines — 2026-09-09/10
+
+Four findings from the last two loopback runs, each with a number. Full narrative is in
+the commit messages (`ae5d108`, `331dfaa`); this is the record.
+
+### The fleet key collision is tested — by construction, not by luck
+
+The previous section ended on "no case where two empires both own a fleet — untested".
+Waiting for the AI to form two fleets in two empires at once is a coin toss per run, so it
+was made deterministic instead: **`StateDelta.SelfTest()` runs at every launch** and checks
+that `PackFleetKey(1,1) != PackFleetKey(2,1)`, that packing round-trips across
+`{0, 1, 2, 255, 256, short.MaxValue, -1, -2, short.MinValue}²` (the sign bit of an `Int16`
+is exactly where a naive `<<16` would corrupt), and that a baseline keyed on the packed
+value keeps two empires' fleets apart. It logs `fleet key self-test PASS` or names the
+failing case. Two real fleets have since crossed end to end in one run (`fleets[n=2]`).
+
+### The ship-creation failure was a missing collection
+
+Client-side ship creation failed at `RegenerateSummary` with a `NullReferenceException`,
+100–173 times a run, and three hypotheses were wrong in a day (list membership first;
+`CheckAdd` a no-op; a skipped resolve pass). A probe that reads each input of
+`ShipSummary.DetermineShipSummary` **under its own try/catch** named it:
+
+```
+_Galaxy=ok Empire(item)=ok GetShipHull=NULL(HullId=?) BattleData=ok Components=ok _Design=ok
+```
+
+A ship resolves its hull through `Galaxy.Designs.GetById(DesignId)`, and the AI designs a
+ship and then builds one, so a created ship routinely names a design the client has never
+seen. **Designs are now a galaxy-level whole-object kind, membership only, written and read
+before ships.** Crash dumps 506–626 → **0**; mutation failures 100–173 → **0**; 1,373–1,439
+designs carried per run.
+
+The first version of that probe read every input in one block, and one
+`AmbiguousMatchException` on an overloaded member aborted it 100 times without answering.
+An instrument that can fail as a unit fails on the exact input it was built to see.
+
+### Every mutation is read back, and `Count` is not membership
+
+`catch { return false; }` had hidden the 173 failures above as a slowly widening ship-count
+gap. Every create and remove is now verified by `GetById` afterwards, with the *stage* of
+any failure logged once per distinct reason.
+
+With zero removal failures the client's ship count then swung to **178 more than the
+host's**. Read-back said the ships were gone; `Count` said otherwise:
+
+```
+NOTE — Ship removed by id but ShipList.Count did not drop (596 -> 596)
+```
+
+`IndexedList` removal clears the index and leaves a tombstone that only the simulation's
+compaction reclaims — and the client does not simulate. **On a non-simulating client,
+`Count` includes tombstones.** The host/client gap is not a sync metric there; the totals
+by kind are.
+
+### Deltas were overtaking their full state
+
+With creation never failing, 1–20 updates per delta were still "absent". The host sends
+full states through the sender thread's one-slot outbox and deltas inline from `HostTick`,
+so a delta built after snapshot T could arrive before T, be applied to the galaxy T was
+about to replace, and vanish with it.
+
+**Every delta now carries an 8-byte baseline** — the number of the full state it was built
+after. The client applies a delta whose baseline matches the full state it holds, holds
+one whose state is still in transit and re-queues it in order when that state lands, and
+drops one for a state already superseded.
+
+| | before | after |
+|---|---:|---:|
+| Deltas held at join, then released | — | 198 |
+| Held per later resync | — | 3 |
+| Dropped | — | 0 |
+| Sampled deltas with absent updates | 27 / 63 | **10 / 53** |
+| Crash dumps / mutation failures | 0 / 0 | 0 / 0 |
+
+The remaining 10 are **not attributed**. `ShipList.WriteToStream` does not skip destroyed
+ships, so it is not that. It is the open item going into the first two-machine test, where
+a real link will reorder things differently than loopback does.

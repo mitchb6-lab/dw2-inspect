@@ -112,6 +112,8 @@ DW2 ships no multiplayer. This repo contains a working host-authoritative protot
 two live game instances share a universe, with state syncing host→client and commands
 relaying client→host.
 
+- **[Connecting a second machine](docs/second-machine.md)** — **start here if you are on
+  the other PC**: clone, build, run, connect, and what a working join looks like in the log
 - **[How to join a session](docs/joining-a-session.md)** — the practical guide: what to
   send someone, the steps, and the troubleshooting
 - **[Architecture and evidence](docs/multiplayer.md)** — what was tried, what was measured,

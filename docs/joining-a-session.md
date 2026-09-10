@@ -7,13 +7,17 @@ How a second player connects to a session hosted on **this PC**.
 > | | |
 > |---|---|
 > | Two instances on one PC | **Working** (verified) |
-> | Two PCs on a LAN | **Should work — not yet tested** |
+> | Two PCs on a LAN | **Should work — first test 2026-09-10.** Setup for the other machine: [second-machine.md](second-machine.md) |
 > | Over the internet | **Works via a virtual LAN** (Tailscale/ZeroTier); see [Playing over the internet](#playing-over-the-internet) |
-> | Joiner's empire choice reaching the host | **Not yet** — see [Limitations](#limitations) |
+> | Joiner's empire choice reaching the host | ~~Not yet~~ **Working since 2026-09-08** |
 >
-> The networking is proven: state syncs host→client and commands relay client→host between
+> ~~The networking is proven: state syncs host→client and commands relay client→host between
 > two live games. What is *not* finished is the lobby handing the joiner's empire to the
-> host, so right now both players end up in the host's galaxy as configured by the host.
+> host, so right now both players end up in the host's galaxy as configured by the host.~~
+> *(Struck 2026-09-10: the empire handoff was finished on 2026-09-08 and this header still
+> denied it.)* Both players pick an empire in the lobby and the host generates the galaxy to
+> match. **If the other machine is building from GitHub rather than receiving files, read
+> [second-machine.md](second-machine.md) instead of the next section.**
 
 ---
 
@@ -64,9 +68,15 @@ If you want to check by hand anyway:
 Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' }
 ```
 
-**Firewall is already handled.** Windows has inbound Allow rules for
+~~**Firewall is already handled.** Windows has inbound Allow rules for
 `DistantWorlds2.exe` (TCP, any local port, all profiles). The listener runs *inside* that
-process, so port 47800 is already permitted — nothing to configure.
+process, so port 47800 is already permitted — nothing to configure.~~
+
+**WRONG since the launcher took over the transport — found 2026-09-10, before the first
+two-PC test.** The listener on 47800 now runs in **`Dw2MpLobby.exe`**, which has no firewall
+rule, and this PC's active network profile is Public. Loopback never showed it because
+loopback is not filtered. The rule to add (elevated PowerShell, by a person) is in
+[second-machine.md → The host](second-machine.md#the-host-this-pc).
 
 ---
 
@@ -246,8 +256,11 @@ listen until it is in-game. Reconnect after the host is in the galaxy.
 
 **Connection refused** — check the host is actually in-game, the address is current, and
 both machines are on the same network. If a **VPN is connected on either end it will
-break LAN discovery** — NordVPN is installed on this PC (currently disconnected); turn it
-off for a session.
+break LAN discovery** — NordVPN is installed on this PC ~~(currently disconnected)~~ *(it
+was connected on 2026-09-10 — check, do not assume)*; turn it off for a session.
+
+**Connection refused from another PC, but Test works on the host itself** — the firewall.
+See the struck paragraph under [Your network details](#your-network-details).
 
 **Client never finishes loading (both games on one PC)** — they starve each other on disk.
 Start the host, wait until it is in the galaxy, *then* start the client. This was a real
@@ -331,3 +344,17 @@ rather than deleted so a reader who remembers the old behaviour can see when it 
 
 Also added: the client no longer simulates locally, so a stalled connection now shows as a
 frozen galaxy rather than a diverging one — worth knowing before you diagnose it as a hang.
+
+### 2026-09-10 — preparing the first two-PC test
+
+- New page: **[second-machine.md](second-machine.md)** — clone, build, run and connect from a
+  machine that gets the code from GitHub rather than being handed files, written so a Claude
+  session on that machine can follow it. The section above ("What the other person needs")
+  still describes the hand-them-the-folder path, which also works.
+- **The firewall claim above was wrong** and would have failed the test at the first
+  connection: the listener moved from the game process into `Dw2MpLobby.exe` when the
+  launcher took over the transport, and only the game has a rule. Struck and corrected in
+  place; the rule to add is on the new page.
+- Two more things the new page records that this one assumed: the host's internet is
+  Starlink (CGNAT — no port forwarding, so internet play needs Tailscale on both ends), and
+  NordVPN was connected on the day of writing.
