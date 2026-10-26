@@ -43,3 +43,21 @@ line in this codebase. Call it before reading any body. After it, plain
 
 `docs/findings.md` records what has been learned with it, including why DW2 multiplayer
 cannot be modded in and why setting `PlayMode = Multiplayer` breaks the game.
+
+## Readable code -- mitch, 2026-10-26 (applies to every language here)
+
+Code must be readable and debuggable by a human, so mitch and outside programmers can troubleshoot it
+by hand. This came from an experienced C++/Lua programmer who offered to help and declined because of
+dense one-liner code.
+
+- **One statement per line.** Never chain statements with `;`; never put a loop, a conversion and an
+  early return on one line.
+- **One assignment per line.** No multi-target tuple assignments such as
+  `a.x, a.y, a.z, a.ttl = q.x, v[1], v[2], TTL[q.kind]`.
+- **Descriptive names** that say what a thing is: `API`, `projectile`, `query`, `velocity` -- never
+  `a`, `q`, `m`, `e`, `s` (short loop indices such as `i` are fine). Declare a variable where its block
+  starts, not in the middle of a line.
+- Example: not `local ffi=require('ffi');local C=ffi.C;local s=A.state`, but one line each, and
+  `local API = X4LAN_BUBBLE_API`, not `local A = X4LAN_BUBBLE_API`.
+- **When editing a file that has dense lines, unpack the ones in the function you touch.**
+- **Agents too:** every brief to a programmer, art or other agent repeats this rule.
