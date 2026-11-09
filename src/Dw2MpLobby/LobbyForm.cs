@@ -539,8 +539,9 @@ public sealed class LobbyForm : Form
         try
         {
             var session = _lobby.Session ?? BuildSession();
-            session.Save();
-            Log($"Wrote {SessionDescriptor.DefaultPath} (slot {session.MySlot} of {session.Players.Count})");
+            var sessionPath = SessionDescriptor.PathForRole(CurrentRole());
+            session.Save(sessionPath);
+            Log($"Wrote {sessionPath} (slot {session.MySlot} of {session.Players.Count})");
 
             // Reuse the lobby's connection rather than reconnecting: the peers are already
             // linked and already agree, and a second listen/dial cycle would race.
@@ -553,7 +554,7 @@ public sealed class LobbyForm : Form
 
             _relay.Start();
 
-            StartGame(session);
+            StartGame(session, sessionPath);
             _launch.Enabled = false;
             _openLobby.Enabled = false;
 
@@ -604,7 +605,15 @@ public sealed class LobbyForm : Form
         return session;
     }
 
-    private void StartGame(SessionDescriptor session)
+    /// <summary>"host" or "client": names this lobby's session file and the game's role.</summary>
+    private string CurrentRole()
+    {
+        if (_roleHost.Checked)
+            return "host";
+        return "client";
+    }
+
+    private void StartGame(SessionDescriptor session, string sessionPath)
     {
         var modDll = FindModDll()
             ?? throw new FileNotFoundException(
@@ -638,7 +647,7 @@ public sealed class LobbyForm : Form
         psi.Environment["DW2MP_ROLE"] = _roleHost.Checked ? "host" : "client";
         psi.Environment["DW2MP_MODE"] = session.Mode;
         psi.Environment["DW2MP_RUN_LABEL"] = _roleHost.Checked ? "lobbyHost" : "lobbyClient";
-        psi.Environment["DW2MP_SESSION"] = SessionDescriptor.DefaultPath;
+        psi.Environment["DW2MP_SESSION"] = sessionPath;
 
         // Phase 1: the game talks ONLY to us, on localhost. It is not told the peer
         // address or the peer port at all.

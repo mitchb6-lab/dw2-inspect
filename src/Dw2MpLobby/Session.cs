@@ -51,6 +51,18 @@ public sealed class SessionDescriptor
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Dw2Mp", "session.json");
 
+    /// <summary>
+    /// One file per role (session-host.json, session-client.json), so two lobbies on the same PC
+    /// do not share a single session.json. With one shared file, the joiner's copy (slot 1) could
+    /// overwrite the host's before the host's game read it, and the host would play the wrong empire.
+    /// </summary>
+    public static string PathForRole(string role)
+    {
+        var folder = Path.GetDirectoryName(DefaultPath)!;
+        var fileName = $"session-{role}.json";
+        return Path.Combine(folder, fileName);
+    }
+
     public void Save(string path = null)
     {
         path ??= DefaultPath;
