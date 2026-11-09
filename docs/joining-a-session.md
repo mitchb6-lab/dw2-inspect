@@ -28,7 +28,7 @@ How a second player connects to a session hosted on **this PC**.
 | **Distant Worlds 2** | Steam | Must be the **same build**. This PC runs **1.3.6.3**. |
 | **`Dw2MpLobby.exe`** | You send it | The launcher — it finds their game and starts it |
 | **`Dw2Mp.dll`** | You send it | The mod. Put it **beside** the lobby exe |
-| **A save file** | You send it | Temporary — see [Limitations](#limitations) |
+| ~~**A save file**~~ | ~~You send it~~ | *(Struck 2026-11-08: no save is shared since 2026-09-08; the host generates the agreed galaxy and sends its state on join.)* |
 
 They do **not** need .NET installed: DW2 ships its own .NET 8 runtime and the mod loads
 into it.
@@ -296,9 +296,12 @@ Things that will surprise you if you do not know them:
 - **The client is briefly behind on what EXISTS.** Deltas carry ships, colonies, fleets and
   characters as they are created and destroyed, so this is a second or two, not a session.
   Research progress and colony internals refresh on a slower schedule.
-- **Never tested across two machines.** Everything measured so far is two game processes on
+- ~~**Never tested across two machines.** Everything measured so far is two game processes on
   one PC. The transport is the same either way, but latency, MTU and a real network stack
-  are not exercised by loopback.
+  are not exercised by loopback.~~ *(Struck 2026-11-08: the first two-PC run was 2026-09-10,
+  over Tailscale. Handshake, full state and deltas worked; the joiner then crashed on a DLC
+  mismatch, which the launcher and mod now check. See multiplayer.md, "The first two-PC run".
+  A joiner's real orders reaching the host have still not been seen in a two-player game.)*
 
 ---
 

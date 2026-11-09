@@ -184,7 +184,7 @@ internet cannot work.** A virtual LAN is the only path, and neither end needs to
 anything else: the joiner types the host's Tailscale address (`100.x.y.z`) instead of the
 LAN one. Both install Tailscale, sign in to the same account or share the node, and the
 host reads the Tailscale entry from **Your address** — it is detected by adapter name and
-sorted above the LAN entry. *Tailscale is not yet installed on the host as of 2026-09-10.*
+sorted above the LAN entry. ~~*Tailscale is not yet installed on the host as of 2026-09-10.*~~ *(Struck 2026-11-08: it is installed, `C:\Program Files\Tailscale`, and the 2026-09-10 run used it.)*
 
 **Do not run a full-tunnel VPN (NordVPN and similar) on either end during a session.** It
 captures the route and the connection fails in a way that looks like the host is not
