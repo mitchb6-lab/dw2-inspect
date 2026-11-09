@@ -206,9 +206,40 @@ for ($i = 1; $i -le $Runs; $i++) {
         try { $proc.Kill($true) } catch { }
     }
 
-    if (-not $proc.WaitForExit($TimeoutMinutes * 60 * 1000)) {
+    # Wait for the run, but stop early if DW2's own log shows the save failed to load: the
+    # game then sits at a "Return to Main Menu" dialog until the timeout (2026-11-08: the
+    # save needed DLC that Steam had switched off).
+    $failurePatterns = @('There were problems loading Ship Hulls', 'Could not Load Savegame')
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $failureLine = $null
+
+    while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 10
+        $sessionText = Get-Content $gameLog -ErrorAction SilentlyContinue
+        $failureLine = $sessionText | Select-String -Pattern $failurePatterns -SimpleMatch | Select-Object -First 1
+        if ($failureLine) {
+            break
+        }
+    }
+
+    $missingPacks = Get-Content $gameLog -ErrorAction SilentlyContinue | Select-String -Pattern 'Content Pack NOT installed' -SimpleMatch
+    foreach ($missingPack in $missingPacks) {
+        Write-Warning "run ${i}: $($missingPack.Line)"
+    }
+
+    if ($failureLine) {
+        Write-Warning "run ${i}: DW2 could not load the save -- $($failureLine.Line). Check Steam DLC (Properties > DLC)."
+    }
+    elseif (-not $proc.HasExited) {
         Write-Warning "run $i hit the ${TimeoutMinutes}-minute timeout; killing it and using whatever it logged."
-        try { $proc.Kill($true) } catch { }
+    }
+
+    if (-not $proc.HasExited) {
+        try {
+            $proc.Kill($true)
+        }
+        catch {
+        }
     }
 
     $rows = Parse-RunLog $log

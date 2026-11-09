@@ -154,6 +154,10 @@ public static class Determinism
         // with the peer's and refuses to exchange state on a mismatch.
         ContentPacks.Install(harmony, Log);
 
+        // Every message dialog the game shows, written to this log: unattended runs cannot
+        // see the screen, and a load failure stops at a dialog (2026-11-08, missing DLC).
+        DialogLog.Install(harmony, Log);
+
         // A session means "generate the agreed galaxy", for BOTH roles. The client's copy
         // is a throwaway that only exists to give StartGameExisting a game context to
         // adopt the host's state into — which is what removes the need for players to
@@ -393,13 +397,25 @@ public static class Determinism
         {
             var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
             var game = ApplyState.Game;
+            var server = _server;
+
+            // No server means no galaxy was ever loaded (a load error or a dialog stopped it):
+            // there is nothing to resume, and saying "resumed" sent a 2026-11-08 diagnosis the
+            // wrong way for ten minutes.
+            if (server is null)
+            {
+                Log("# watchdog: nothing to resume -- no GameServer has run, so no galaxy is loaded. Read data\\Logs\\SessionLog.txt for a load error or dialog.");
+                return;
+            }
 
             if (gameType is not null && game is not null)
-                AccessTools.Field(gameType, "AutoPaused")?.SetValue(game, false);
+            {
+                var autoPausedField = AccessTools.Field(gameType, "AutoPaused");
+                autoPausedField?.SetValue(game, false);
+            }
 
-            if (_server is { } server)
-                AccessTools.Method(server.GetType(), "ResumeGame")?.Invoke(server, null);
-
+            var resumeMethod = AccessTools.Method(server.GetType(), "ResumeGame");
+            resumeMethod?.Invoke(server, null);
             Log("# watchdog: resumed the simulation (DW2 had paused it)");
         }
         catch (Exception ex)
