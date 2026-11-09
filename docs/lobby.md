@@ -112,13 +112,14 @@ relation tables, and a naive scan finds 418 of them instead of 23.
 
 **Not yet built:**
 
-- **Slot exchange.** The joining player's empire is currently known only to their own
+- ~~**Slot exchange.** The joining player's empire is currently known only to their own
   machine; the lobby does not yet send it to the host. Until it does, the host generates
   using its own configuration. This is the next piece and it is what makes competitive
-  mode meaningful.
-- The mod does not yet read `session.json` — it still takes its settings from environment
+  mode meaningful.~~
+- ~~The mod does not yet read `session.json` — it still takes its settings from environment
   variables. Wiring `DW2MP_SESSION` through to `MakeSave`-style generation is the other
-  half.
+  half.~~
+  *(Struck 2026-11-08: built 2026-09-08, see "Session-driven generation" below; the lobby sets `DW2MP_SESSION` and the mod loads it in `Determinism.cs`.)*
 - Flag selection (races carry `AlternateFlagFilenames`, currently unused).
 
 ---
@@ -279,9 +280,10 @@ each machine know which empire is its own without either side guessing.
 
 ### Still to do
 
-The mod does not yet read `session.json`, so the agreed empires do not yet shape the
+~~The mod does not yet read `session.json`, so the agreed empires do not yet shape the
 generated galaxy. `MakeSave` already proves that path works — it builds `GameStartSettings`
-with per-empire configuration and generates a galaxy — so this is wiring, not discovery.
+with per-empire configuration and generates a galaxy — so this is wiring, not discovery.~~
+*(Struck 2026-11-08: built 2026-09-08, see "Session-driven generation" below; the lobby sets `DW2MP_SESSION` and the mod loads it in `Determinism.cs`.)*
 
 ---
 
