@@ -70,7 +70,8 @@ public static class Program
         DesyncOffersBothButtonsThenOnlySaveAndQuit();
         DesyncSaveAndQuitIsAlwaysAllowed();
         DesyncSuccessClosesTheIncident();
-        DesyncMirrorsThePeersFailureCount();
+        DesyncCounterCannotBeDrivenFromTheWire();
+        DesyncTransitionsReportWhetherTheyHappened();
         DesyncSaveFileNameIsItsOwn();
 
         Console.WriteLine();
@@ -817,14 +818,58 @@ public static class Program
         Check("desync: an outcome with no resync in flight changes nothing", idle.Phase == DesyncPhase.Idle && idle.FailedResyncs == 0);
     }
 
-    private static void DesyncMirrorsThePeersFailureCount()
+    /// <summary>
+    /// Security review 2026-11-10: a peer must not be able to take the resync button away. The
+    /// only way the failure counter moves is a failed outcome while a resync is in flight, so a
+    /// flood of outcomes in any other phase, or any number the peer claims, changes nothing.
+    /// </summary>
+    private static void DesyncCounterCannotBeDrivenFromTheWire()
+    {
+        var awaiting = new DesyncPolicy();
+        awaiting.Detect();
+        for (int hostile = 0; hostile < 1000; hostile++)
+        {
+            awaiting.ResyncFinished(succeeded: false);
+        }
+
+        Check("desync: 1000 failed outcomes while awaiting a choice leave the counter at 0", awaiting.FailedResyncs == 0 && awaiting.OffersResync);
+        Check("desync: resync is still offered after the flood", awaiting.Choose(DesyncChoice.AttemptResync));
+
+        var idle = new DesyncPolicy();
+        for (int hostile = 0; hostile < 1000; hostile++)
+        {
+            idle.ResyncFinished(succeeded: false);
+        }
+
+        Check("desync: failed outcomes with no incident leave the policy idle", idle.Phase == DesyncPhase.Idle && idle.FailedResyncs == 0);
+
+        var quitting = new DesyncPolicy();
+        quitting.Detect();
+        quitting.Choose(DesyncChoice.SaveAndQuit);
+        quitting.ResyncFinished(succeeded: false);
+        Check("desync: an outcome while quitting changes nothing", quitting.Phase == DesyncPhase.Quitting && quitting.FailedResyncs == 0);
+
+        var inFlight = new DesyncPolicy();
+        inFlight.Detect();
+        inFlight.Choose(DesyncChoice.AttemptResync);
+        inFlight.ResyncFinished(succeeded: false);
+        inFlight.ResyncFinished(succeeded: false);
+        inFlight.ResyncFinished(succeeded: false);
+        Check("desync: repeated outcomes for ONE in-flight resync count once", inFlight.FailedResyncs == 1 && inFlight.OffersResync);
+    }
+
+    private static void DesyncTransitionsReportWhetherTheyHappened()
     {
         var policy = new DesyncPolicy();
+        Check("desync: an outcome with no resync in flight reports no transition", !policy.ResyncFinished(succeeded: true));
+
         policy.Detect();
-        policy.Mirror(2);
-        Check("desync: the peer's higher failure count is adopted", policy.FailedResyncs == 2 && !policy.OffersResync);
-        policy.Mirror(0);
-        Check("desync: a lower count from the peer is not adopted", policy.FailedResyncs == 2);
+        policy.Choose(DesyncChoice.AttemptResync);
+        Check("desync: a failed outcome for a live resync reports a transition", policy.ResyncFinished(succeeded: false) && policy.Phase == DesyncPhase.AwaitingChoice);
+        Check("desync: a second outcome for the same resync reports none", !policy.ResyncFinished(succeeded: false));
+
+        policy.Choose(DesyncChoice.AttemptResync);
+        Check("desync: a successful outcome for a live resync reports a transition", policy.ResyncFinished(succeeded: true) && policy.Phase == DesyncPhase.Idle);
     }
 
     private static void DesyncSaveFileNameIsItsOwn()

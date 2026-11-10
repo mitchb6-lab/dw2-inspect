@@ -11,8 +11,9 @@ namespace Dw2MpShared;
 /// such string passes through here first: control characters go, the length is capped, and
 /// the caller says how long is reasonable for that field (JoinPolicy holds the numbers).
 ///
-/// Shared source: compiled into the lobby and the test runner (the mod has no peer strings
-/// that reach a UI; its Content message is parsed by ContentPackWire).
+/// Shared source: compiled into the lobby, the test runner and, since the desync popup
+/// (2026-11-10), the mod: the fingerprints and game time a peer sends in a DesyncReport reach
+/// the mod log through here. The mod's Content message is still parsed by ContentPackWire.
 /// </summary>
 public static class PeerText
 {

@@ -27,8 +27,24 @@ public static class SnapshotHash
     /// <summary>True once both patches are in place. The harness reports when they are not.</summary>
     public static bool Installed => _installed;
 
+    /// <summary>
+    /// The game builds whose ShipHull.WriteToStream layout was read from the IL (the flag is the
+    /// FIRST bool the hull writes; the box follows MaximumSize, DisplaySize, Bonuses and
+    /// ResourcesRequired). The rule is positional, so on any other build the normalisation is
+    /// skipped and the harness says so, rather than silently zeroing some other bool.
+    /// </summary>
+    private static readonly string[] KnownBuildPrefixes = { "1.3.8.4" };
+
     public static void Install(Harmony harmony, Action<string> log)
     {
+        string gameVersion = NetSession.GameVersion();
+        bool knownBuild = KnownBuildPrefixes.Any(prefix => gameVersion.StartsWith(prefix, StringComparison.Ordinal));
+        if (!knownBuild)
+        {
+            log($"# hash: game build {gameVersion} is not one the hull layout was read from ({string.Join(", ", KnownBuildPrefixes)}); hull model caches are NOT normalised, so a cycle-1 divergence may be the renderer");
+            return;
+        }
+
         var hullType = AccessTools.TypeByName("DistantWorlds.Types.ShipHull");
         var helperType = AccessTools.TypeByName("DistantWorlds.Types.SerializationHelper");
 

@@ -10,9 +10,9 @@ namespace Dw2Mp;
 ///
 /// Detection stays where it was: the client compares the host's structural fingerprint with
 /// its own on every StateSummary, and three mismatches in a row are a divergence. What changes
-/// is what happens next. Instead of a silent correction, the client reports WHO diverged to the
-/// host (Msg.DesyncReport), the host pauses its simulation, and BOTH players get the game's own
-/// two-button message dialog:
+/// is what happens next. Instead of a silent correction, the client reports the divergence to
+/// the host (Msg.DesyncReport), the host pauses its simulation, and BOTH players get the game's
+/// own two-button message dialog:
 ///
 ///     1. Save and quit    -- this process saves Desync-&lt;date&gt;.DWGame and exits cleanly
 ///     2. Attempt resync   -- the host sends a fresh full state, the client adopts it, and the
@@ -23,27 +23,43 @@ namespace Dw2Mp;
 /// quit" is offered. Everything is logged, and DW2MP_FORCE_DESYNC_AT_CYCLE=N makes a client
 /// report a fake divergence once so the popup and the resync path can be exercised on one PC.
 ///
-/// Threading: reports and outcomes arrive on the network thread; the dialog must be shown on
-/// the main thread, so every popup is queued and NetSession.OnMainThreadUpdate drains it.
-/// Button clicks arrive on the UI thread. All game calls go through reflection, like the rest
-/// of this mod, so no new assembly reference is needed.
+/// Trust (security review, 2026-11-10): nothing a peer sends decides what this side offers.
+/// Each side counts its own failed resyncs from its own transitions; WHO desynced is read from
+/// this machine's session.json, never from the wire; reports are accepted at most once per 30 s;
+/// a resync that is not verified within 60 s counts as failed; a lost link resumes the host and
+/// resets the incident; and the dialog queue is capped. The wire carries only primitives and
+/// two fingerprints plus a game-time string, all sanitised before they reach the log.
+///
+/// Threading: reports, choices and outcomes arrive on the network thread; the dialog must be
+/// shown on the main thread, so every popup is queued and NetSession.OnMainThreadUpdate drains
+/// it. Button clicks arrive on the UI thread. Shared state is read and written under Gate. All
+/// game calls go through reflection, like the rest of this mod, so no new assembly reference is
+/// needed.
 /// </summary>
 public static class Desync
 {
-    private const int MaxNameLength = 64;
-
     private const int MaxFingerprintLength = 64;
+
+    private const int MaxGameTimeLength = 32;
 
     /// <summary>Summaries after the new full state that may still disagree before the attempt is called failed.</summary>
     private const int MismatchesBeforeResyncFails = 3;
+
+    /// <summary>A resync not verified by then has failed, whatever the peer says or does not say.</summary>
+    private static readonly TimeSpan ResyncTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>Reports accepted no more often than this; a flood raises one popup, not a hundred.</summary>
+    private static readonly TimeSpan MinTimeBetweenReports = TimeSpan.FromSeconds(30);
+
+    /// <summary>Dialogs waiting for the main thread; beyond this they are dropped.</summary>
+    private const int MaxPendingDialogs = 2;
 
     private static Action<string> _log = _ => { };
 
     private static readonly DesyncPolicy Policy = new();
 
+    /// <summary>Guards Policy and every field below it up to the dev-flag section.</summary>
     private static readonly object Gate = new();
-
-    private static readonly Queue<PendingDialog> PendingDialogs = new();
 
     private static DesyncWho _who = new();
 
@@ -55,15 +71,23 @@ public static class Desync
 
     private static int _mismatchesDuringResync;
 
-    private static long _lastClientTick;
+    private static DateTime _resyncDeadlineUtc = DateTime.MaxValue;
 
-    private static bool _pauseHeld;
+    private static DateTime _lastReportAcceptedUtc = DateTime.MinValue;
+
+    private static volatile bool _pauseHeld;
+
+    private static readonly Queue<PendingDialog> PendingDialogs = new();
+
+    private static bool _loggedDialogDrop;
+
+    private static long _lastClientTick;
 
     private static bool _uiAvailable;
 
     private static readonly long ForceAtCycle = EnvLong("DW2MP_FORCE_DESYNC_AT_CYCLE", 0);
 
-    private static bool _forceSpent;
+    private static volatile bool _forceSpent;
 
     private static bool _forceLogged;
 
@@ -80,7 +104,7 @@ public static class Desync
     public static bool HoldsPause => _pauseHeld;
 
     /// <summary>The client is waiting for the summary that decides a resync attempt.</summary>
-    public static bool VerifyingResync => Policy.Phase == DesyncPhase.Resyncing && NetSession.Role == NetSession.NetRole.Client;
+    public static bool VerifyingResync => CurrentPhase() == DesyncPhase.Resyncing && NetSession.Role == NetSession.NetRole.Client;
 
     public static void Install(Action<string> log)
     {
@@ -90,6 +114,14 @@ public static class Desync
         if (ForceAtCycle > 0)
         {
             log($"# desync: DW2MP_FORCE_DESYNC_AT_CYCLE={ForceAtCycle} -- this client will report a fake divergence once it reaches that cycle");
+        }
+    }
+
+    private static DesyncPhase CurrentPhase()
+    {
+        lock (Gate)
+        {
+            return Policy.Phase;
         }
     }
 
@@ -103,6 +135,9 @@ public static class Desync
             return false;
         }
 
+        string gameTime = GameTimeText();
+        DesyncWho who;
+
         lock (Gate)
         {
             if (!Policy.Detect())
@@ -113,17 +148,18 @@ public static class Desync
             _forceSpent = true;
             _who = MyIdentity();
             _hostTickAtDetection = hostTick;
-            _gameTimeAtDetection = GameTimeText();
+            _gameTimeAtDetection = gameTime;
+            who = _who;
         }
 
-        _log($"# desync: DETECTED -- {_who.Describe()} diverged at host tick {hostTick}, game time {_gameTimeAtDetection}: host {hostFingerprint} vs mine {myFingerprint}");
+        _log($"# desync: DETECTED -- {who.Describe()} diverged at host tick {hostTick}, game time {gameTime}: host {hostFingerprint} vs mine {myFingerprint}");
 
-        NetSession.SendDesync(NetSession.Msg.DesyncReport, BuildReport(hostTick, hostFingerprint, myFingerprint));
+        NetSession.SendDesync(NetSession.Msg.DesyncReport, BuildReport(hostTick, hostFingerprint, myFingerprint, gameTime));
         QueueChoiceDialog("");
         return true;
     }
 
-    /// <summary>Host, network thread.</summary>
+    /// <summary>Host, network thread. Who desynced comes from THIS machine's session, not the wire.</summary>
     public static void OnReportReceived(byte[] payload)
     {
         try
@@ -131,28 +167,32 @@ public static class Desync
             using var input = new MemoryStream(payload, writable: false);
             using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
 
-            var who = new DesyncWho
-            {
-                PlayerName = Cap(reader.ReadString(), MaxNameLength),
-                Slot = reader.ReadInt32(),
-                IsHost = reader.ReadBoolean(),
-            };
             long hostTick = reader.ReadInt64();
-            string hostFingerprint = Cap(reader.ReadString(), MaxFingerprintLength);
-            string theirFingerprint = Cap(reader.ReadString(), MaxFingerprintLength);
-            string gameTime = Cap(reader.ReadString(), 32);
+            string hostFingerprint = PeerText.Sanitise(reader.ReadString(), MaxFingerprintLength);
+            string theirFingerprint = PeerText.Sanitise(reader.ReadString(), MaxFingerprintLength);
+            string gameTime = PeerText.Sanitise(reader.ReadString(), MaxGameTimeLength);
+
+            var who = PeerIdentity();
+            var now = DateTime.UtcNow;
 
             lock (Gate)
             {
-                if (!Policy.Detect())
+                if (now - _lastReportAcceptedUtc < MinTimeBetweenReports)
                 {
-                    _log($"# desync: report from {who.Describe()} ignored -- one is already being handled");
+                    _log($"# desync: report from {who.Describe()} ignored -- one was accepted {(now - _lastReportAcceptedUtc).TotalSeconds:F0} s ago (floor {MinTimeBetweenReports.TotalSeconds:F0} s)");
                     return;
                 }
 
+                if (!Policy.Detect())
+                {
+                    _log($"# desync: report from {who.Describe()} ignored -- one is already being handled (phase {Policy.Phase})");
+                    return;
+                }
+
+                _lastReportAcceptedUtc = now;
                 _who = who;
                 _hostTickAtDetection = hostTick;
-                _gameTimeAtDetection = gameTime;
+                _gameTimeAtDetection = gameTime.Length > 0 ? gameTime : "unknown game time";
             }
 
             _log($"# desync: REPORTED by {who.Describe()} at host tick {hostTick}, game time {gameTime}: host {hostFingerprint} vs theirs {theirFingerprint}");
@@ -171,20 +211,29 @@ public static class Desync
     private static void ChooseLocally(DesyncChoice choice)
     {
         bool accepted;
+        DesyncPhase phaseAfter;
         lock (Gate)
         {
             accepted = Policy.Choose(choice);
+            phaseAfter = Policy.Phase;
         }
 
         if (!accepted)
         {
-            _log($"# desync: {choice} pressed but not valid in phase {Policy.Phase}; ignored");
+            _log($"# desync: {choice} pressed but not valid in phase {phaseAfter}; ignored");
+
+            // The player is still owed a choice: never leave a paused host with no dialog.
+            if (phaseAfter == DesyncPhase.AwaitingChoice)
+            {
+                QueueChoiceDialog("That option is no longer available. ");
+            }
+
             return;
         }
 
-        string myName = MyIdentity().PlayerName;
-        _log($"# desync: {myName} chose {choice} ({Policy.FailedResyncs} resync(s) failed so far)");
-        NetSession.SendDesync(NetSession.Msg.DesyncChoice, BuildChoice(choice, myName));
+        string myName = MyIdentity().Describe();
+        _log($"# desync: {myName} chose {choice}");
+        NetSession.SendDesync(NetSession.Msg.DesyncChoice, BuildChoice(choice));
 
         if (choice == DesyncChoice.SaveAndQuit)
         {
@@ -204,19 +253,19 @@ public static class Desync
             using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
 
             var choice = (DesyncChoice)reader.ReadByte();
-            string chooser = Cap(reader.ReadString(), MaxNameLength);
-            int failedOnPeer = reader.ReadInt32();
+            string chooser = PeerIdentity().Describe();
 
             bool accepted;
+            DesyncPhase phaseBefore;
             lock (Gate)
             {
-                Policy.Mirror(failedOnPeer);
+                phaseBefore = Policy.Phase;
                 accepted = Policy.Choose(choice);
             }
 
             if (!accepted)
             {
-                _log($"# desync: peer {chooser} chose {choice} but we are in phase {Policy.Phase}; ignored");
+                _log($"# desync: peer {chooser} chose {choice} but we are in phase {phaseBefore}; ignored");
                 return;
             }
 
@@ -242,32 +291,47 @@ public static class Desync
         }
     }
 
-    /// <summary>Both roles: the host serves a full state at its next tick; the client arms the verification.</summary>
+    /// <summary>Both roles, after an ACCEPTED resync choice: the host serves a full state at its next tick; the client arms the verification.</summary>
     private static void StartResync(string chooser)
     {
+        int attempt;
+        lock (Gate)
+        {
+            _resyncDeadlineUtc = DateTime.UtcNow + ResyncTimeout;
+            _syncsAppliedWhenResyncAsked = NetSession.SyncsApplied;
+            _mismatchesDuringResync = 0;
+            attempt = Policy.NextAttemptNumber;
+        }
+
         if (NetSession.Role == NetSession.NetRole.Host)
         {
-            NetSession.MarkResyncRequested();
+            NetSession.MarkResyncRequestedForDesync();
         }
         else
         {
-            lock (Gate)
-            {
-                _syncsAppliedWhenResyncAsked = NetSession.SyncsApplied;
-                _mismatchesDuringResync = 0;
-            }
-
             NetSession.RequestResyncForDesync($"desync popup: {chooser} chose attempt resync");
         }
 
-        _log($"# desync: resync attempt {Policy.FailedResyncs + 1} of {DesyncPolicy.MaxResyncAttempts} started by {chooser}");
-        QueueInfoDialog("Resyncing...", $"{chooser} chose Attempt resync. The host is sending a fresh full state; the next check after it lands decides. Attempt {Policy.FailedResyncs + 1} of {DesyncPolicy.MaxResyncAttempts}.");
+        _log($"# desync: resync attempt {attempt} of {DesyncPolicy.MaxResyncAttempts} started by {chooser}; deadline {ResyncTimeout.TotalSeconds:F0} s");
+        QueueInfoDialog("Resyncing...", $"{chooser} chose Attempt resync. The host is sending a fresh full state; the next check after it lands decides. Attempt {attempt} of {DesyncPolicy.MaxResyncAttempts}.");
     }
 
     /// <summary>Client, network thread: a summary arrived while a resync is being verified.</summary>
     public static void OnSummaryDuringResync(bool matched, int syncsApplied, long hostTick)
     {
-        bool landed = syncsApplied > _syncsAppliedWhenResyncAsked;
+        bool landed;
+        int mismatches = 0;
+
+        lock (Gate)
+        {
+            landed = syncsApplied > _syncsAppliedWhenResyncAsked;
+            if (landed && !matched)
+            {
+                _mismatchesDuringResync++;
+                mismatches = _mismatchesDuringResync;
+            }
+        }
+
         if (!landed)
         {
             return;
@@ -275,35 +339,57 @@ public static class Desync
 
         if (matched)
         {
-            FinishResync(true, hostTick);
+            ConcludeResync(true, $"structure agrees at host tick {hostTick}");
             return;
-        }
-
-        int mismatches;
-        lock (Gate)
-        {
-            _mismatchesDuringResync++;
-            mismatches = _mismatchesDuringResync;
         }
 
         if (mismatches >= MismatchesBeforeResyncFails)
         {
-            FinishResync(false, hostTick);
+            ConcludeResync(false, $"{mismatches} summaries still disagreed after the new full state (host tick {hostTick})");
         }
     }
 
-    private static void FinishResync(bool succeeded, long hostTick)
+    /// <summary>
+    /// The one place a resync ends, on either role. Only a REAL transition (a resync was in
+    /// flight) sends the outcome, resumes the host or shows a dialog.
+    /// </summary>
+    private static void ConcludeResync(bool succeeded, string why)
     {
+        bool transitioned;
+        int failed;
+        bool offersResync;
         lock (Gate)
         {
-            Policy.ResyncFinished(succeeded);
+            transitioned = Policy.ResyncFinished(succeeded);
+            failed = Policy.FailedResyncs;
+            offersResync = Policy.OffersResync;
+            _resyncDeadlineUtc = DateTime.MaxValue;
         }
 
-        NetSession.SendDesync(NetSession.Msg.DesyncOutcome, BuildOutcome(succeeded));
-        ShowOutcome(succeeded, hostTick);
+        if (!transitioned)
+        {
+            _log($"# desync: resync outcome ({(succeeded ? "success" : "failure")}, {why}) arrived with no resync in flight; ignored");
+            return;
+        }
+
+        if (NetSession.Role == NetSession.NetRole.Client)
+        {
+            NetSession.SendDesync(NetSession.Msg.DesyncOutcome, BuildOutcome(succeeded));
+        }
+
+        if (succeeded)
+        {
+            _log($"# desync: RESYNC SUCCEEDED -- {why}");
+            ResumeHostIfHeld();
+            QueueInfoDialog("Resync succeeded", $"{WhoText()} is back in sync with the host. The game continues.");
+            return;
+        }
+
+        _log($"# desync: RESYNC FAILED -- {why}; attempt {failed} of {DesyncPolicy.MaxResyncAttempts}; {(offersResync ? "one more attempt is offered" : "only Save and quit is offered now")}");
+        QueueChoiceDialog($"Resync attempt {failed} failed: {why}. ");
     }
 
-    /// <summary>Host, network thread: the client verified the resync.</summary>
+    /// <summary>Host, network thread: the client verified the resync. Counts only while one is in flight.</summary>
     public static void OnOutcomeReceived(byte[] payload)
     {
         try
@@ -312,15 +398,7 @@ public static class Desync
             using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
 
             bool succeeded = reader.ReadBoolean();
-            int failedOnPeer = reader.ReadInt32();
-
-            lock (Gate)
-            {
-                Policy.ResyncFinished(succeeded);
-                Policy.Mirror(failedOnPeer);
-            }
-
-            ShowOutcome(succeeded, _hostTickAtDetection);
+            ConcludeResync(succeeded, succeeded ? "the joiner verified the new full state" : "the joiner reports the structure still disagrees");
         }
         catch (Exception ex)
         {
@@ -328,18 +406,43 @@ public static class Desync
         }
     }
 
-    private static void ShowOutcome(bool succeeded, long hostTick)
+    /// <summary>Main thread: a resync nobody verified in time is a failed resync.</summary>
+    private static void CheckResyncDeadline()
     {
-        if (succeeded)
+        bool overdue;
+        lock (Gate)
         {
-            _log($"# desync: RESYNC SUCCEEDED -- structure agrees again (host tick {hostTick})");
-            ResumeHostIfHeld();
-            QueueInfoDialog("Resync succeeded", $"{_who.Describe()} is back in sync with the host. The game continues.");
-            return;
+            overdue = Policy.Phase == DesyncPhase.Resyncing && DateTime.UtcNow > _resyncDeadlineUtc;
         }
 
-        _log($"# desync: RESYNC FAILED -- attempt {Policy.FailedResyncs} of {DesyncPolicy.MaxResyncAttempts}; {(Policy.OffersResync ? "one more attempt is offered" : "only Save and quit is offered now")}");
-        QueueChoiceDialog($"Resync attempt {Policy.FailedResyncs} failed: the structure still disagreed after the new full state. ");
+        if (overdue)
+        {
+            ConcludeResync(false, $"not verified within {ResyncTimeout.TotalSeconds:F0} s");
+        }
+    }
+
+    /// <summary>NetSession's receive loop ended: resume if we hold the pause, forget the incident, drop queued popups.</summary>
+    public static void OnDisconnected()
+    {
+        bool hadIncident;
+        lock (Gate)
+        {
+            hadIncident = Policy.Phase != DesyncPhase.Idle;
+            Policy.Reset();
+            _resyncDeadlineUtc = DateTime.MaxValue;
+        }
+
+        lock (PendingDialogs)
+        {
+            PendingDialogs.Clear();
+        }
+
+        ResumeHostIfHeld();
+
+        if (hadIncident)
+        {
+            _log("# desync: link to the launcher lost during a desync; incident reset, host resumed if it was paused");
+        }
     }
 
     // ------------------------------------------------------------- save and quit
@@ -392,7 +495,7 @@ public static class Desync
 
     private static void PauseHost()
     {
-        if (NetSession.Role != NetSession.NetRole.Host)
+        if (NetSession.Role != NetSession.NetRole.Host || _pauseHeld)
         {
             return;
         }
@@ -453,7 +556,7 @@ public static class Desync
     /// <summary>Called every client tick so the force flag knows where the game is.</summary>
     public static void NoteTick(long tick)
     {
-        _lastClientTick = tick;
+        Interlocked.Exchange(ref _lastClientTick, tick);
     }
 
     /// <summary>
@@ -463,7 +566,7 @@ public static class Desync
     /// </summary>
     public static string MaybeForceDivergence(string myFingerprint)
     {
-        if (ForceAtCycle <= 0 || _forceSpent || _lastClientTick < ForceAtCycle)
+        if (ForceAtCycle <= 0 || _forceSpent || Interlocked.Read(ref _lastClientTick) < ForceAtCycle)
         {
             return myFingerprint;
         }
@@ -471,7 +574,7 @@ public static class Desync
         if (!_forceLogged)
         {
             _forceLogged = true;
-            _log($"# desync: FORCING a fake divergence from cycle {_lastClientTick} (DW2MP_FORCE_DESYNC_AT_CYCLE)");
+            _log($"# desync: FORCING a fake divergence from cycle {Interlocked.Read(ref _lastClientTick)} (DW2MP_FORCE_DESYNC_AT_CYCLE)");
         }
 
         return "FORCED-DESYNC-" + myFingerprint;
@@ -494,9 +597,27 @@ public static class Desync
         public Action OnClick;
     }
 
+    /// <summary>The detection facts, copied under the gate, for dialog text.</summary>
+    private static (DesyncWho Who, string GameTime, long HostTick, bool OffersResync, string Options) SnapshotForDialog()
+    {
+        lock (Gate)
+        {
+            return (_who, _gameTimeAtDetection, _hostTickAtDetection, Policy.OffersResync, Policy.OptionsText());
+        }
+    }
+
+    private static string WhoText()
+    {
+        lock (Gate)
+        {
+            return _who.Describe();
+        }
+    }
+
     private static void QueueChoiceDialog(string prefix)
     {
-        string text = prefix + DesyncPolicy.Describe(_who, _gameTimeAtDetection, _hostTickAtDetection) + "\n\n" + Policy.OptionsText();
+        var facts = SnapshotForDialog();
+        string text = prefix + DesyncPolicy.Describe(facts.Who, facts.GameTime, facts.HostTick) + "\n\n" + facts.Options;
 
         var saveAndQuit = new DialogButton
         {
@@ -506,7 +627,7 @@ public static class Desync
         };
 
         DialogButton attemptResync = null;
-        if (Policy.OffersResync)
+        if (facts.OffersResync)
         {
             attemptResync = new DialogButton
             {
@@ -542,13 +663,26 @@ public static class Desync
 
         lock (PendingDialogs)
         {
+            if (PendingDialogs.Count >= MaxPendingDialogs)
+            {
+                if (!_loggedDialogDrop)
+                {
+                    _loggedDialogDrop = true;
+                    _log($"# desync: more than {MaxPendingDialogs} popups waiting for the main thread; dropping the newest (logged once)");
+                }
+
+                return;
+            }
+
             PendingDialogs.Enqueue(new PendingDialog { Title = title, Text = text, First = first, Second = second });
         }
     }
 
-    /// <summary>Main thread (DWGame.Update, via NetSession). Shows whatever the network thread queued.</summary>
+    /// <summary>Main thread (DWGame.Update, via NetSession). Shows whatever the network thread queued and enforces the resync deadline.</summary>
     public static void OnMainThreadUpdate()
     {
+        CheckResyncDeadline();
+
         PendingDialog next = null;
         lock (PendingDialogs)
         {
@@ -668,47 +802,33 @@ public static class Desync
 
     // ------------------------------------------------------------- payloads
 
-    private static byte[] BuildReport(long hostTick, string hostFingerprint, string myFingerprint)
+    /// <summary>Protocol 3: host tick, both fingerprints, game time. Who desynced is NOT on the wire; each side reads its own session.</summary>
+    private static byte[] BuildReport(long hostTick, string hostFingerprint, string myFingerprint, string gameTime)
     {
         using var buffer = new MemoryStream();
         using var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8);
 
-        writer.Write(_who.PlayerName ?? "");
-        writer.Write(_who.Slot);
-        writer.Write(_who.IsHost);
         writer.Write(hostTick);
         writer.Write(hostFingerprint ?? "");
         writer.Write(myFingerprint ?? "");
-        writer.Write(_gameTimeAtDetection ?? "");
+        writer.Write(gameTime ?? "");
         writer.Flush();
         return buffer.ToArray();
     }
 
-    private static byte[] BuildChoice(DesyncChoice choice, string chooser)
+    private static byte[] BuildChoice(DesyncChoice choice)
     {
-        using var buffer = new MemoryStream();
-        using var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8);
-
-        writer.Write((byte)choice);
-        writer.Write(chooser ?? "");
-        writer.Write(Policy.FailedResyncs);
-        writer.Flush();
-        return buffer.ToArray();
+        return new[] { (byte)choice };
     }
 
     private static byte[] BuildOutcome(bool succeeded)
     {
-        using var buffer = new MemoryStream();
-        using var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8);
-
-        writer.Write(succeeded);
-        writer.Write(Policy.FailedResyncs);
-        writer.Flush();
-        return buffer.ToArray();
+        return new[] { succeeded ? (byte)1 : (byte)0 };
     }
 
     // ------------------------------------------------------------- helpers
 
+    /// <summary>This machine, from its own session.json.</summary>
     private static DesyncWho MyIdentity()
     {
         bool isHost = NetSession.Role == NetSession.NetRole.Host;
@@ -724,7 +844,33 @@ public static class Desync
         var mySlot = session?.Players?.FirstOrDefault(player => player.Slot == session.MySlot);
         if (mySlot is not null)
         {
-            who.PlayerName = Cap(mySlot.Name, MaxNameLength);
+            who.PlayerName = PeerText.Sanitise(mySlot.Name, 64);
+        }
+
+        return who;
+    }
+
+    /// <summary>
+    /// The other machine, from THIS machine's session.json: the first player who is not us. The
+    /// session is two players today; a peer cannot rename itself on the wire.
+    /// </summary>
+    private static DesyncWho PeerIdentity()
+    {
+        bool peerIsHost = NetSession.Role != NetSession.NetRole.Host;
+        var session = MakeSave.Session;
+
+        var who = new DesyncWho
+        {
+            IsHost = peerIsHost,
+            Slot = -1,
+            PlayerName = "",
+        };
+
+        var peerSlot = session?.Players?.FirstOrDefault(player => player.Slot != session.MySlot);
+        if (peerSlot is not null)
+        {
+            who.Slot = peerSlot.Slot;
+            who.PlayerName = PeerText.Sanitise(peerSlot.Name, 64);
         }
 
         return who;
@@ -747,22 +893,6 @@ public static class Desync
         }
 
         return "unknown game time";
-    }
-
-    private static string Cap(string text, int maxLength)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return "";
-        }
-
-        var cleaned = new string(text.Where(character => !char.IsControl(character)).ToArray()).Trim();
-        if (cleaned.Length <= maxLength)
-        {
-            return cleaned;
-        }
-
-        return cleaned.Substring(0, maxLength);
     }
 
     private static long EnvLong(string name, long fallback)

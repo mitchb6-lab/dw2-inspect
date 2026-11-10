@@ -705,6 +705,15 @@ public sealed class LobbyForm : Form
         // address or the peer port at all.
         psi.Environment["DW2MP_LOCAL_PORT"] = _localGamePort.ToString();
 
+        // The fake-desync dev flag must not leak from this shell into a real session: a joiner
+        // that inherited it would raise the desync popup on a healthy game. It only passes
+        // through when the developer switch DW2MP_DEV=1 is set as well.
+        bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
+        if (!developerMode)
+        {
+            psi.Environment.Remove("DW2MP_FORCE_DESYNC_AT_CYCLE");
+        }
+
         Log($"Launching {psi.FileName}");
         Process.Start(psi);
     }
