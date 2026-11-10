@@ -16,10 +16,16 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
-  <!-- The code under test is the shared source the mod and the lobby both compile in. -->
+  <!--
+    The code under test: the shared source the mod and the lobby both compile in, plus the
+    lobby's pure join policy and the session types it operates on (no WinForms in either).
+  -->
   <ItemGroup>
     <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
     <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
+    <Compile Include="..\Shared\PeerText.cs" Link="Shared\PeerText.cs" />
+    <Compile Include="..\Dw2MpLobby\Session.cs" Link="Lobby\Session.cs" />
+    <Compile Include="..\Dw2MpLobby\JoinPolicy.cs" Link="Lobby\JoinPolicy.cs" />
   </ItemGroup>
 
 </Project>

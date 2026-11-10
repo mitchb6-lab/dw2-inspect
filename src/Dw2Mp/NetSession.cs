@@ -575,8 +575,16 @@ public static class NetSession
                     // Only the client applies state, and only the host injects commands.
                     // Anything arriving for the wrong role means the peers disagree about
                     // who is hosting, which is worth saying out loud.
+                    // The receive side honours the same block as the send side: a peer that
+                    // failed the handshake must not get its state or commands applied here
+                    // just because it sent them anyway.
                     case Msg.FullState when Role == NetRole.Client:
                     {
+                        if (IncompatibilityBlocksState("accept a full state"))
+                        {
+                            break;
+                        }
+
                         byte[] raw = Decompress(payload);
                         _inbound.Enqueue(raw);
                         _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued)");
@@ -584,6 +592,11 @@ public static class NetSession
                     }
 
                     case Msg.Delta when Role == NetRole.Client:
+                        if (IncompatibilityBlocksState("accept a delta"))
+                        {
+                            break;
+                        }
+
                         _inboundDeltas.Enqueue(payload);
                         break;
 
@@ -600,6 +613,11 @@ public static class NetSession
                         break;
 
                     case Msg.Command when Role == NetRole.Host:
+                        if (IncompatibilityBlocksState("inject a command"))
+                        {
+                            break;
+                        }
+
                         InjectCommand(payload);
                         break;
 

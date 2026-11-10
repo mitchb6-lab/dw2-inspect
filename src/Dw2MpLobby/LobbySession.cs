@@ -27,6 +27,11 @@ public enum LobbyMsg : byte
 ///
 /// Framing matches the game protocol — [int32 length][byte type][payload] — so there is one
 /// framing convention in the codebase rather than two subtly different ones.
+///
+/// Everything that arrives here was typed or built on the other machine. A frame is at most
+/// MaxFrameLength; a slot is sanitised and validated (JoinPolicy) before any of its strings
+/// reach a log, the player list or session.json; a connection that throws is dropped and the
+/// host keeps listening. The check itself is cooperative -- see JoinPolicy.
 /// </summary>
 public sealed class LobbySession : IDisposable
 {
@@ -38,6 +43,17 @@ public sealed class LobbySession : IDisposable
     private NetworkStream _stream;
 
     private readonly CancellationTokenSource _cts = new();
+
+    /// <summary>
+    /// The largest lobby frame accepted. Every lobby message is a small JSON document -- two
+    /// slots with five packs each is under 4 KB -- so 64 KB leaves room and stops a stranger
+    /// from making the host allocate 8 MB per connection. The relay reads the stream after
+    /// hand-over with its own limits.
+    /// </summary>
+    private const int MaxFrameLength = 64 * 1024;
+
+    /// <summary>The longest refusal sentence a joiner will show or log. Ours are about 300 characters.</summary>
+    private const int MaxRefusalLength = 600;
 
     public bool IsHost { get; private set; }
 
@@ -54,8 +70,9 @@ public sealed class LobbySession : IDisposable
     public event Action ConnectionLost;
 
     /// <summary>
-    /// Joiner only: the host refused our Join, or sent a Session from a launcher build we
-    /// cannot accept. Carries the sentence to show the player. The connection is finished.
+    /// Joiner only: the host refused our Join, or sent a Session this launcher cannot accept.
+    /// Carries the sentence to show the player, already safe to display. The connection is
+    /// finished.
     /// </summary>
     public event Action<string> Refused;
 
@@ -86,49 +103,85 @@ public sealed class LobbySession : IDisposable
             while (true)
             {
                 var peer = await _listener.AcceptTcpClientAsync(ct);
-                peer.NoDelay = true;
-                _peer = peer;
-                _stream = peer.GetStream();
-                _log($"A connection from {peer.Client.RemoteEndPoint}. Waiting for their empire...");
-
-                var (type, payload) = await ReceiveWithin(JoinGracePeriod, ct);
-
-                if (type == LobbyMsg.Join)
+                bool admitted = await HandleConnection(peer, ct);
+                if (admitted)
                 {
-                    var admission = await TryAdmit(payload);
-                    if (admission == Admission.Admitted)
-                    {
-                        break;
-                    }
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _listener.Stop();
+        }
 
-                    if (admission == Admission.Refused)
-                    {
-                        // TryAdmit has logged the reason and sent it to them. They can fix
-                        // it and join again without the host touching anything.
-                        _log("Still waiting for a player...");
-                    }
-                    else
-                    {
-                        _log("It sent a Join that was not a player slot; ignored. Still waiting for a player...");
-                    }
-                }
-                else if (type is null)
-                {
-                    _log("It hung up without joining -- a Test probe, most likely. Still waiting for a player...");
-                }
-                else
-                {
-                    _log($"It sent {type} instead of joining; ignored. Still waiting for a player...");
-                }
+        _ = Task.Run(() => ReadLoop(_cts.Token));
+    }
 
+    /// <summary>
+    /// One connection: wait for its Join, then admit it or drop it. True when admitted, in
+    /// which case the connection is now the session's. Whatever the connection does -- a
+    /// malformed slot, a reset mid-frame, anything that throws -- is logged and the host
+    /// goes back to listening; before 2026-11-09 one bad Join ended the lobby.
+    /// </summary>
+    private async Task<bool> HandleConnection(TcpClient peer, CancellationToken ct)
+    {
+        bool admitted = false;
+
+        try
+        {
+            peer.NoDelay = true;
+            _peer = peer;
+            _stream = peer.GetStream();
+            _log($"A connection from {peer.Client.RemoteEndPoint}. Waiting for their empire...");
+
+            var (type, payload) = await ReceiveWithin(JoinGracePeriod, ct);
+
+            if (type == LobbyMsg.Join)
+            {
+                var admission = await TryAdmit(payload);
+                admitted = admission == Admission.Admitted;
+
+                if (admission == Admission.Refused)
+                {
+                    // TryAdmit has logged the reason and sent it to them. They can fix it
+                    // and join again without the host touching anything.
+                    _log("Still waiting for a player...");
+                }
+                else if (admission == Admission.NotAPlayerSlot)
+                {
+                    _log("It sent a Join that was not a player slot; ignored. Still waiting for a player...");
+                }
+            }
+            else if (type is null)
+            {
+                _log("It hung up without joining -- a Test probe, most likely. Still waiting for a player...");
+            }
+            else
+            {
+                _log($"It sent {type} instead of joining; ignored. Still waiting for a player...");
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The host closed the lobby; that is not the connection's fault and must stop HostAsync.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log($"That connection failed: {ex.GetType().Name}: {ex.Message}. Still waiting for a player...");
+        }
+        finally
+        {
+            if (!admitted)
+            {
                 _peer = null;
                 _stream = null;
                 peer.Dispose();
             }
         }
-        finally { _listener.Stop(); }
 
-        _ = Task.Run(() => ReadLoop(_cts.Token));
+        return admitted;
     }
 
     /// <summary>
@@ -157,8 +210,9 @@ public sealed class LobbySession : IDisposable
     /// THEIR slot marked, so both sides hold the same descriptor and differ only in mySlot.
     /// The echo is the acknowledgement a joiner waits for.
     ///
-    /// Before any of that, the slot must pass ReasonToRefuse. A refused joiner gets the
-    /// reason as a Refused message and is dropped; the host goes back to listening.
+    /// Before any of that the slot is sanitised and validated (a slot that is not a player
+    /// is dropped), then must pass JoinPolicy.ReasonToRefuse (a player who does not match
+    /// gets the reason as a Refused message). The host goes back to listening either way.
     /// </summary>
     private async Task<Admission> TryAdmit(byte[] payload)
     {
@@ -173,95 +227,49 @@ public sealed class LobbySession : IDisposable
             return Admission.NotAPlayerSlot;
         }
 
-        if (slot is null)
+        // Everything in the slot was typed or built on the other machine. Cap and strip it
+        // before it can reach a log line, the player list or session.json -- then make sure
+        // it describes a player at all.
+        JoinPolicy.SanitiseSlot(slot);
+        var problem = JoinPolicy.ValidateSlot(slot);
+        if (problem is not null)
         {
+            _log($"Join was not a usable player slot: {problem}.");
             return Admission.NotAPlayerSlot;
         }
 
-        var reason = ReasonToRefuse(slot);
+        var host = Session.Players.FirstOrDefault(player => player.Slot == 0);
+
+        var reason = JoinPolicy.ReasonToRefuse(host, slot);
         if (reason is not null)
         {
             await RefuseAsync(slot, reason);
             return Admission.Refused;
         }
 
+        var warning = JoinPolicy.GameVersionWarning(host, slot);
+        if (warning is not null)
+        {
+            _log("Note: " + warning);
+        }
+
         // The host owns slot numbering. A client that asked for a slot already taken must
         // not silently overwrite the host's own empire.
         slot.Slot = Session.Players.Count;
+
+        // Echo first, add second: a send that fails leaves the host's session exactly as it
+        // was, instead of holding a slot for a player who never got the acknowledgement.
+        var agreed = CloneWithMySlot(Session, slot.Slot);
+        agreed.Players.Add(slot);
+        await SendAsync(LobbyMsg.Session, JsonSerializer.SerializeToUtf8Bytes(agreed));
+
         Session.Players.Add(slot);
 
         _log($"{slot.Name} joined as \"{slot.Empire.Name}\" (slot {slot.Slot}). " +
              $"Game {slot.GameVersion}, content packs: {DescribeInstalled(slot)}.");
 
-        var forThem = CloneWithMySlot(Session, slot.Slot);
-        await SendAsync(LobbyMsg.Session, JsonSerializer.SerializeToUtf8Bytes(forThem));
-
         SessionChanged?.Invoke();
         return Admission.Admitted;
-    }
-
-    /// <summary>
-    /// The three things that must agree before a session can start, checked in the order a
-    /// player should fix them: launcher build, then game build, then content packs. Null
-    /// means admit. Every sentence names both sides, because the player reading it is on
-    /// one of them and needs to know which.
-    /// </summary>
-    private string ReasonToRefuse(PlayerSlot joiner)
-    {
-        var host = Session.Players.FirstOrDefault(player => player.Slot == 0);
-        var hostLabel = host is null ? "the host" : $"{host.Name} (host)";
-        var joinerLabel = string.IsNullOrWhiteSpace(joiner.Name) ? "the joiner" : joiner.Name;
-
-        if (joiner.LobbyProtocol != LobbyProtocol.Version)
-        {
-            var theirProtocol = joiner.LobbyProtocol == 0 ? "1 or older" : joiner.LobbyProtocol.ToString();
-            return $"{joinerLabel}'s launcher speaks lobby protocol {theirProtocol}; {hostLabel} speaks {LobbyProtocol.Version}. " +
-                   "Both players need the same Dw2Mp build: install the same package on both PCs.";
-        }
-
-        if (host is null)
-        {
-            return null;
-        }
-
-        var hostGame = host.GameVersion ?? "unknown";
-        var joinerGame = joiner.GameVersion ?? "unknown";
-        bool bothGameVersionsKnown = hostGame != "unknown" && joinerGame != "unknown";
-        bool sameGameVersion = string.Equals(hostGame, joinerGame, StringComparison.Ordinal);
-        if (bothGameVersionsKnown && !sameGameVersion)
-        {
-            return $"Game builds differ: {hostLabel} has Distant Worlds 2 {hostGame}, {joinerLabel} has {joinerGame}. " +
-                   "Both players need the same game build.";
-        }
-
-        var difference = ContentDifference(host, joiner);
-        var sentence = difference.Describe(hostLabel, joinerLabel);
-        if (sentence is not null)
-        {
-            return "Content packs differ. " + sentence + " " +
-                   "Both players need the same DLC installed and ticked in Steam (Distant Worlds 2 > Properties > DLC).";
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Compares two slots' content packs. Both protocol-2 slots carry full details (every
-    /// known pack, installed or not, with its version); a protocol-1 slot carries only the
-    /// names of installed packs, so the comparison falls back to names when either side has
-    /// no details. Used by the host on join and by the form as a belt-and-braces check.
-    /// </summary>
-    public static ContentPackDifference ContentDifference(PlayerSlot ours, PlayerSlot theirs)
-    {
-        bool ourDetailsKnown = ours.ContentPackDetails is not null && ours.ContentPackDetails.Count > 0;
-        bool theirDetailsKnown = theirs.ContentPackDetails is not null && theirs.ContentPackDetails.Count > 0;
-
-        if (ourDetailsKnown && theirDetailsKnown)
-        {
-            return ContentPackCompare.Compare(ours.ContentPackDetails, theirs.ContentPackDetails);
-        }
-
-        return ContentPackCompare.CompareNames(ours.ContentPacks, theirs.ContentPacks);
     }
 
     private static string DescribeInstalled(PlayerSlot slot)
@@ -315,7 +323,10 @@ public sealed class LobbySession : IDisposable
     /// <summary>Host only: tell the client to launch, then launch ourselves.</summary>
     public async Task StartAsync()
     {
-        if (!IsHost || Session is null) return;
+        if (!IsHost || Session is null)
+        {
+            return;
+        }
 
         await SendAsync(LobbyMsg.Start, Array.Empty<byte>());
         _log("Start sent to the other player.");
@@ -328,45 +339,42 @@ public sealed class LobbySession : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 var (type, payload) = await ReceiveAsync(ct);
-                if (type is null) break;
+                if (type is null)
+                {
+                    break;
+                }
 
                 switch (type)
                 {
                     case LobbyMsg.Join when IsHost:
-                        // A second Join on an admitted connection (a client re-sending). The
-                        // first one, before this loop starts, is handled by HostAsync.
-                        await TryAdmit(payload);
+                        // A second Join on the admitted connection. The first, handled by
+                        // HostAsync, is this player's slot; a repeat used to append a second
+                        // slot for the same player (until 2026-11-09). It is ignored.
+                        _log("The joined player sent another Join; ignored, their slot is already in the session.");
                         break;
 
                     case LobbyMsg.Session when !IsHost:
                     {
-                        Session = JsonSerializer.Deserialize<SessionDescriptor>(payload);
-
-                        // A host that admitted us without checking our protocol is an older
-                        // launcher, and it echoes its own number here. Stop before it starts
-                        // a game whose session file we would read differently.
-                        int hostProtocol = Session?.ProtocolVersion ?? 0;
-                        if (hostProtocol != LobbyProtocol.Version)
+                        bool accepted = AcceptSession(payload);
+                        if (!accepted)
                         {
-                            var reason = $"The host's launcher speaks lobby protocol {hostProtocol}; this one speaks {LobbyProtocol.Version}. " +
-                                         "Both players need the same Dw2Mp build: install the same package on both PCs.";
-                            _log("REFUSING the host's session: " + reason);
-                            Session = null;
-                            Refused?.Invoke(reason);
                             return;
                         }
 
-                        _log($"Session received: {Session.Players.Count} player(s), mode {Session.Mode}, " +
-                             $"you are slot {Session.MySlot}.");
-                        SessionChanged?.Invoke();
                         break;
                     }
 
                     case LobbyMsg.Refused when !IsHost:
                     {
-                        var reason = Encoding.UTF8.GetString(payload);
-                        _log("The host refused the join: " + reason);
-                        Refused?.Invoke(reason);
+                        // The host's sentence goes into a dialog, so it is capped and stripped
+                        // of control characters first, and labelled as the host's words. The
+                        // log pane gets a one-line version: a newline there forges a log line.
+                        var rawReason = Encoding.UTF8.GetString(payload);
+                        var oneLine = PeerText.Sanitise(rawReason, MaxRefusalLength);
+                        var forDialog = PeerText.SanitiseMultiline(rawReason, MaxRefusalLength);
+
+                        _log("The host refused the join: " + oneLine);
+                        Refused?.Invoke("The host's launcher said:\n\n" + forDialog);
                         return;
                     }
 
@@ -381,8 +389,14 @@ public sealed class LobbySession : IDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { return; }
-        catch (Exception ex) { _log($"Lobby connection lost: {ex.GetType().Name}: {ex.Message}"); }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _log($"Lobby connection lost: {ex.GetType().Name}: {ex.Message}");
+        }
 
         // Reached on a clean hang-up (ReceiveAsync returned null) or an error -- never on
         // cancellation, which is the hand-over to the relay and is not a loss. The form
@@ -393,6 +407,56 @@ public sealed class LobbySession : IDisposable
             _log("The other player disconnected from the lobby.");
             ConnectionLost?.Invoke();
         }
+    }
+
+    /// <summary>
+    /// Joiner: the host's Session, checked before it becomes ours. False means the session was
+    /// refused (the player has been told why through Refused) and the read loop must stop.
+    /// </summary>
+    private bool AcceptSession(byte[] payload)
+    {
+        SessionDescriptor received;
+        try
+        {
+            received = JsonSerializer.Deserialize<SessionDescriptor>(payload);
+        }
+        catch (JsonException ex)
+        {
+            RefuseHostSession($"The host sent a session this launcher cannot read (not valid JSON: {ex.Message}).");
+            return false;
+        }
+
+        // A host that admitted us without checking our protocol is an older launcher, and
+        // it echoes its own number here. Stop before it starts a game whose session file we
+        // would read differently.
+        int hostProtocol = received?.ProtocolVersion ?? 0;
+        if (hostProtocol != LobbyProtocol.Version)
+        {
+            RefuseHostSession($"The host's launcher speaks lobby protocol {hostProtocol}; this one speaks {LobbyProtocol.Version}. " +
+                              "Both players need the same Dw2Mp build: install the same package on both PCs.");
+            return false;
+        }
+
+        // Same caps and checks the host applies to a Join, so what reaches the player list
+        // and session.json is a session, not whatever a stranger put on the wire.
+        var problem = JoinPolicy.ValidateSession(received);
+        if (problem is not null)
+        {
+            RefuseHostSession($"The host sent a session this launcher cannot read ({problem}).");
+            return false;
+        }
+
+        Session = received;
+        _log($"Session received: {Session.Players.Count} player(s), mode {Session.Mode}, you are slot {Session.MySlot}.");
+        SessionChanged?.Invoke();
+        return true;
+    }
+
+    private void RefuseHostSession(string reason)
+    {
+        _log("REFUSING the host's session: " + reason);
+        Session = null;
+        Refused?.Invoke(reason);
     }
 
     private static SessionDescriptor CloneWithMySlot(SessionDescriptor source, int mySlot)
@@ -421,20 +485,39 @@ public sealed class LobbySession : IDisposable
         header[4] = (byte)type;
 
         await _stream.WriteAsync(header);
-        if (payload.Length > 0) await _stream.WriteAsync(payload);
+        if (payload.Length > 0)
+        {
+            await _stream.WriteAsync(payload);
+        }
+
         await _stream.FlushAsync();
     }
 
     private async Task<(LobbyMsg? Type, byte[] Payload)> ReceiveAsync(CancellationToken ct)
     {
         var header = new byte[5];
-        if (!await ReadExactly(header, 5, ct)) return (null, null);
+        bool gotHeader = await ReadExactly(header, 5, ct);
+        if (!gotHeader)
+        {
+            return (null, null);
+        }
 
         int length = BitConverter.ToInt32(header, 0);
-        if (length < 0 || length > 8 * 1024 * 1024) return (null, null);
+        if (length < 0 || length > MaxFrameLength)
+        {
+            _log($"Dropped a lobby frame claiming {length:N0} bytes (limit {MaxFrameLength:N0}).");
+            return (null, null);
+        }
 
         var payload = length == 0 ? Array.Empty<byte>() : new byte[length];
-        if (length > 0 && !await ReadExactly(payload, length, ct)) return (null, null);
+        if (length > 0)
+        {
+            bool gotPayload = await ReadExactly(payload, length, ct);
+            if (!gotPayload)
+            {
+                return (null, null);
+            }
+        }
 
         return ((LobbyMsg)header[4], payload);
     }
@@ -446,10 +529,20 @@ public sealed class LobbySession : IDisposable
         while (offset < count)
         {
             int read;
-            try { read = await _stream.ReadAsync(buffer.AsMemory(offset, count - offset), ct); }
-            catch { return false; }
+            try
+            {
+                read = await _stream.ReadAsync(buffer.AsMemory(offset, count - offset), ct);
+            }
+            catch
+            {
+                return false;
+            }
 
-            if (read <= 0) return false;
+            if (read <= 0)
+            {
+                return false;
+            }
+
             offset += read;
         }
 
@@ -459,7 +552,14 @@ public sealed class LobbySession : IDisposable
     public void Dispose()
     {
         _cts.Cancel();
-        try { _listener?.Stop(); } catch { }
+        try
+        {
+            _listener?.Stop();
+        }
+        catch
+        {
+        }
+
         _cts.Dispose();
     }
 }
