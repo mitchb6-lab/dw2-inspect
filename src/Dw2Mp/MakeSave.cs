@@ -453,27 +453,52 @@ public static class MakeSave
         _log($"# makesave: player empire added (list count now {count})");
     }
 
+    /// <summary>
+    /// Holds the exit timer. A System.Threading.Timer nobody references is collected before it
+    /// fires; on 2026-11-09 the game sat for 13 minutes after "exiting shortly" for that reason.
+    /// </summary>
+    private static Timer _exitTimer;
+
     private static void SaveIt()
     {
         _saved = true;
 
-        // SaveGame takes a PATH relative to the working directory, not a save name.
-        // Passing a bare name writes "data/<name>" with no extension, which the game's
-        // own load screen will not see. Discovered by finding the file in the wrong place.
-        var path = Path.Combine("data", "SavedGames", SaveName + ".DWGame");
+        // DWGame.SaveGame(filePath) opens the stream through Stride's
+        // VirtualFileSystem.ApplicationData, whose root is <game>\data. So the path is relative to
+        // data\ and must NOT start with "data\": on 1.3.8.4 that produced
+        // data\data\SavedGames\<name>.DWGame and a DirectoryNotFoundException the game logged only
+        // to its own SessionLog. A bare name lands in data\ itself, where the load screen never
+        // looks. "SavedGames/<name>.DWGame" is what the game's own autosave uses.
+        var virtualPath = "SavedGames/" + SaveName + ".DWGame";
+        var gameDirectory = AppContext.BaseDirectory;
+        var expectedFile = Path.Combine(gameDirectory, "data", "SavedGames", SaveName + ".DWGame");
 
-        _log($"# makesave: saving to '{path}'");
-        AccessTools.Method(_game.GetType(), "CheckCreateSaveGameFolder")?.Invoke(_game, null);
-        _saveGame.Invoke(_game, new object[] { path });
+        _log($"# makesave: saving to '{virtualPath}' (expect {expectedFile})");
+        var createSaveFolder = AccessTools.Method(_game.GetType(), "CheckCreateSaveGameFolder");
+        createSaveFolder?.Invoke(_game, null);
+        _saveGame.Invoke(_game, new object[] { virtualPath });
 
-        _log("# makesave: SaveGame returned; exiting shortly");
+        // SaveGame writes synchronously (Galaxy.WriteToStream inside a using block) and swallows
+        // its own exception into "Error while saving game", so "SaveGame returned" proves nothing.
+        // Read the file back, the same way every other mutation in this mod is verified.
+        var exitCode = 1;
+        if (File.Exists(expectedFile))
+        {
+            var savedFile = new FileInfo(expectedFile);
+            _log($"# makesave: SAVED {savedFile.Length:N0} bytes -> {expectedFile}");
+            exitCode = 0;
+        }
+        else
+        {
+            _log($"# makesave: SAVE FAILED -- no file at {expectedFile}. Read data\\Logs\\SessionLog.txt for 'Error while saving game'.");
+        }
 
-        // Give the writer a moment; SaveGame may complete asynchronously.
-        new Timer(_ =>
+        _log("# makesave: exiting shortly");
+        _exitTimer = new Timer(_ =>
         {
             _log("# makesave: done");
-            Environment.Exit(0);
-        }, null, TimeSpan.FromSeconds(20), Timeout.InfiniteTimeSpan);
+            Determinism.ExitProcess(exitCode);
+        }, null, TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
     }
 
     private static void SetField(object target, string name, object value)

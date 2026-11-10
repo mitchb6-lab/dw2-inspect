@@ -127,9 +127,35 @@ function Parse-RunLog {
 $game = Find-GamePath -Explicit $GamePath
 Write-Host "Game: $game   (mode: $Mode)"
 
+# A stale data\SessionActive (the last session never ran DWGame.Destroy, which is the only
+# thing that removes it) makes DW2 open a Win32 "Send Error Information" prompt before Stride
+# starts, and wait for a click. No SessionLog, no GameServer, nothing in the mod log. Seen
+# 2026-11-09 after a run had left through Environment.Exit. With no game running the lock
+# can only be stale, so say so now instead of spending 90 s per run finding out. The file
+# is not deleted here: this script does not write into the game folder.
+$sessionLock = Join-Path $game 'data\SessionActive'
+$gameProcesses = @(Get-Process -Name 'DistantWorlds2' -ErrorAction SilentlyContinue)
+
+if ((Test-Path $sessionLock) -and $gameProcesses.Count -eq 0) {
+    $lockMarker = (Get-Content $sessionLock -Raw -ErrorAction SilentlyContinue)
+    if ($lockMarker) {
+        $lockMarker = $lockMarker.Trim()
+    }
+    Write-Warning "Stale session lock: $sessionLock ('$lockMarker')."
+    Write-Warning "DW2 will stop at its 'Send Error Information' prompt and never load a game."
+    Write-Warning 'Delete that one file (nothing else in data\ is involved) and run again.'
+    exit 1
+}
+
 if ($Mode -eq 'continue') {
+    # --continue is MenuRenderer.ContinueGameClick: it lists data\SavedGames\*.DWGame through the
+    # game's virtual file system and loads the one with the greatest last-write time
+    # (Enumerable.MaxBy on GetLastWriteTime). Mirror that exactly, or this line names a save the
+    # game will not load -- the alphabetical first was a DLC autosave on 2026-11-09 while the game
+    # loaded a newer base-game save.
     $saves = @(Get-ChildItem (Join-Path $game 'data\SavedGames') -File -ErrorAction SilentlyContinue |
-               Where-Object { $_.Name -ne 'PlaceHolder' -and $_.Extension -ne '.vdf' })
+               Where-Object { $_.Extension -eq '.DWGame' } |
+               Sort-Object LastWriteTime -Descending)
 
     if ($saves.Count -eq 0) {
         Write-Host ''
