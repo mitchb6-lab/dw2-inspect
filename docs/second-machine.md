@@ -20,7 +20,7 @@ this page is about your end.
 | | Requirement | How to check |
 |---|---|---|
 | OS | Windows 10/11, x64 | — |
-| Game | **Distant Worlds 2 on Steam, build 1.3.6.3** | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
+| Game | **Distant Worlds 2 on Steam, build ~~1.3.6.3~~ 1.3.8.4** *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)* | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
 | **DLC** | **the same content packs as the host** — the host has all four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* | run the launcher: it logs `Content packs on disk: …` on its Log tab at start, and refuses to start a session whose two players differ |
 | .NET SDK | **9.0 or later** | `dotnet --list-sdks` |
 | git | any | `git --version` |
@@ -31,7 +31,7 @@ this page is about your end.
 **The game version must match exactly.** The handshake compares it and logs
 `*** GAME VERSION MISMATCH ***` and stops if it does not. State transfer is DW2's own
 serialised galaxy, so different builds exchange bytes that deserialise into nonsense.
-The host is on **1.3.6.3**. If yours differs, one of you updates through Steam; there is
+The host is on ~~**1.3.6.3**~~ **1.3.8.4** *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)*. If yours differs, one of you updates through Steam; there is
 no workaround.
 
 **The game must be installed before you build.** The mod compiles against
