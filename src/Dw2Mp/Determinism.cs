@@ -164,6 +164,13 @@ public static class Determinism
         // see the screen, and a load failure stops at a dialog (2026-11-08, missing DLC).
         DialogLog.Install(harmony, Log);
 
+        // Harness runs only: an autosave becomes the newest .DWGame, and the next --continue
+        // run loads it instead of the pinned save (2026-11-10, two runs compared two games).
+        if (AutosaveBlock.Enabled)
+        {
+            AutosaveBlock.Install(harmony, Log);
+        }
+
         // A session means "generate the agreed galaxy", for BOTH roles. The client's copy
         // is a throwaway that only exists to give StartGameExisting a game context to
         // adopt the host's state into — which is what removes the need for players to
