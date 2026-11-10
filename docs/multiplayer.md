@@ -2199,4 +2199,21 @@ session (the lobby is a WinForms launcher with no headless mode, so an agent can
 unattended). To exercise it on one PC: start the lobby as host and joiner, set
 `DW2MP_FORCE_DESYNC_AT_CYCLE=600` in the joiner's environment before launching, and read both
 mod logs for `# desync:` lines; the popup should appear on both after the third summary past
-cycle 600. The message-parsing change should get the game-security review before it ships.
+cycle 600.
+
+**Security review, same day (game-security on c9e152e), applied on `fix/desync-popup-1110`:**
+nothing from the wire decides what a side offers. The failure counter is no longer mirrored
+from the peer (one `DesyncChoice` with `int.MaxValue` used to remove the resync button); each
+side counts its own transitions, and an outcome only counts while a resync is in flight (tested
+with 1,000 hostile outcomes). Who desynced is read from this machine's `session.json`, never
+from the wire, and the report, choice and outcome payloads now carry only primitives plus two
+fingerprints and a game-time string, sanitised with `PeerText` (now linked into the mod) and
+capped at 1 KB per frame -- a bigger desync frame drops the connection. A resync not verified
+within 60 s fails; a lost launcher link resumes the host and resets the incident; reports are
+accepted at most once per 30 s; the dialog queue holds two; a rejected local press re-shows the
+choice so a paused host is never left without a dialog; the host ignores served-state requests
+within 600 ticks of the last except one per accepted desync choice; the three message cases
+honour the handshake block; the lobby strips `DW2MP_FORCE_DESYNC_AT_CYCLE` from the child
+environment unless `DW2MP_DEV=1`; and `SnapshotHash` skips its positional normalisation (and
+says so) on a game build other than 1.3.8.4. The popup keeps mitch's two options; a third button
+is his call.

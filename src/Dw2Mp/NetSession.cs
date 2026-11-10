@@ -335,7 +335,8 @@ public static class NetSession
         catch (Exception ex) { _log("# net: malformed Hello: " + ex.Message); }
     }
 
-    private static string GameVersion()
+    /// <summary>DistantWorlds.Types' assembly version, e.g. 1.3.8.4; SnapshotHash pins its stream layout to it.</summary>
+    internal static string GameVersion()
     {
         try
         {
@@ -630,14 +631,29 @@ public static class NetSession
                     // at the host; a choice may come from either side; the outcome is the
                     // client's verification. Payload parsing lives in Desync and is defensive.
                     case Msg.DesyncReport when Role == NetRole.Host:
+                        if (IncompatibilityBlocksState("handle a desync message"))
+                        {
+                            break;
+                        }
+
                         Desync.OnReportReceived(payload);
                         break;
 
                     case Msg.DesyncChoice:
+                        if (IncompatibilityBlocksState("handle a desync message"))
+                        {
+                            break;
+                        }
+
                         Desync.OnChoiceReceived(payload);
                         break;
 
                     case Msg.DesyncOutcome when Role == NetRole.Host:
+                        if (IncompatibilityBlocksState("handle a desync message"))
+                        {
+                            break;
+                        }
+
                         Desync.OnOutcomeReceived(payload);
                         break;
 
@@ -656,7 +672,15 @@ public static class NetSession
             }
         }
         catch (Exception ex) { _log($"# net[{Role}]: " + ex.GetType().Name + ": " + ex.Message); }
-        finally { _connected = false; _log($"# net[{Role}]: disconnected from launcher"); }
+        finally
+        {
+            _connected = false;
+            _log($"# net[{Role}]: disconnected from launcher");
+
+            // A desync popup must not outlive the link: a paused host with no peer would
+            // otherwise stay paused for a resync that can never be verified.
+            Desync.OnDisconnected();
+        }
     }
 
     // --------------------------------------------- host: what goes on the wire, and why
@@ -725,9 +749,26 @@ public static class NetSession
         bool asked = _resyncRequested;
         bool overdue = tick - _lastSyncTick >= MaxTicksBetweenFullStates;
 
+        // A floor on SERVED full states (security review 2026-11-10): a peer sending
+        // ResyncRequest every frame would otherwise have the host serialise 4.4 MB every
+        // tick. One request within the floor is honoured per desync choice accepted on the
+        // popup; the join bootstrap (nothing served yet) is never throttled.
+        bool withinFloor = _syncsSent > 0 && tick - _lastSyncTick < MinTicksBetweenServedStates;
+        if (asked && withinFloor && !_desyncServeExemption)
+        {
+            _resyncRequested = false;
+            asked = false;
+            _throttledServeRequests++;
+            if (_throttledServeRequests == 1 || _throttledServeRequests % 50 == 0)
+            {
+                _log($"# net[host]: resync request ignored -- {tick - _lastSyncTick} ticks since the last full state (floor {MinTicksBetweenServedStates}); {_throttledServeRequests} ignored so far");
+            }
+        }
+
         if (!asked && !overdue) return;
 
         _resyncRequested = false;
+        _desyncServeExemption = false;
         _lastSyncTick = tick;
         if (asked) _resyncsServed++;
 
@@ -951,6 +992,14 @@ public static class NetSession
         if (length < 0 || length > 256 * 1024 * 1024)
         {
             _log($"# net: refusing implausible frame length {length}");
+            return (null, null);
+        }
+
+        // Per-type cap for the desync messages: they carry a few primitives and short strings.
+        // A bigger one is not ours; returning null ends the receive loop and the link.
+        if (IsDesyncMessage(type) && length > MaxDesyncFrameBytes)
+        {
+            _log($"# net: {type} frame of {length:N0}B exceeds the {MaxDesyncFrameBytes}B cap; dropping the connection");
             return (null, null);
         }
 
@@ -1181,10 +1230,30 @@ public static class NetSession
         RequestResync(reason, force: true);
     }
 
-    /// <summary>Host: serve a full state at the next HostTick, as if the client had asked.</summary>
-    internal static void MarkResyncRequested()
+    /// <summary>
+    /// Host: serve a full state at the next HostTick, as if the client had asked. Called once
+    /// per desync choice accepted on the popup, which is the one case allowed inside the
+    /// served-state floor.
+    /// </summary>
+    internal static void MarkResyncRequestedForDesync()
     {
+        _desyncServeExemption = true;
         _resyncRequested = true;
+    }
+
+    /// <summary>Ticks between served full states below which a plain ResyncRequest is ignored (~60 s at 10 ticks/s).</summary>
+    private const long MinTicksBetweenServedStates = 600;
+
+    private static volatile bool _desyncServeExemption;
+
+    private static long _throttledServeRequests;
+
+    /// <summary>Desync frames are a few primitives and short strings; anything bigger is not ours and ends the link.</summary>
+    private const int MaxDesyncFrameBytes = 1024;
+
+    private static bool IsDesyncMessage(Msg type)
+    {
+        return type == Msg.DesyncReport || type == Msg.DesyncChoice || type == Msg.DesyncOutcome;
     }
 
     internal static int SyncsApplied => _syncsApplied;

@@ -47,9 +47,12 @@ public sealed class DesyncWho
 /// detected desync have an option come up that says who desynced. in the pop up lets have two
 /// options save and quit 1 attempt resync 2".
 ///
-/// One instance per process, mirrored on both peers through the DesyncChoice and DesyncOutcome
-/// messages, so both popups offer the same buttons. No game types here: this file is compiled
-/// into the mod and into src\Dw2MpTests, where it is tested.
+/// One instance per process. Both peers walk the same transitions (detect, choose, finish), so
+/// their failure counts agree WITHOUT trusting a number from the wire: the 2026-11-10 security
+/// review found that mirroring the peer's count let one message with int.MaxValue remove the
+/// resync button on the other side. Every transition method returns whether a transition
+/// happened, so callers only pause, resume or show a dialog on a real change of state. No game
+/// types here: this file is compiled into the mod and into src\Dw2MpTests, where it is tested.
 /// </summary>
 public sealed class DesyncPolicy
 {
@@ -106,31 +109,28 @@ public sealed class DesyncPolicy
         return false;
     }
 
-    /// <summary>The resync was verified (or not). Success closes the incident; failure returns to the choice with one more failure on the counter.</summary>
-    public void ResyncFinished(bool succeeded)
+    /// <summary>
+    /// The resync was verified (or not, or timed out). Only counts while a resync is actually in
+    /// flight: an outcome arriving in any other phase changes nothing and returns false, so a peer
+    /// cannot run the counter up by sending outcomes. Success closes the incident; failure
+    /// returns to the choice with one more failure on the counter.
+    /// </summary>
+    public bool ResyncFinished(bool succeeded)
     {
         if (Phase != DesyncPhase.Resyncing)
         {
-            return;
+            return false;
         }
 
         if (succeeded)
         {
             Reset();
-            return;
+            return true;
         }
 
         FailedResyncs++;
         Phase = DesyncPhase.AwaitingChoice;
-    }
-
-    /// <summary>Adopt the peer's failure count when it is ahead of ours, so both popups agree on what is offered.</summary>
-    public void Mirror(int failedResyncsOnPeer)
-    {
-        if (failedResyncsOnPeer > FailedResyncs)
-        {
-            FailedResyncs = failedResyncsOnPeer;
-        }
+        return true;
     }
 
     public void Reset()
