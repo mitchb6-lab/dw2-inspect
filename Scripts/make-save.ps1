@@ -180,7 +180,7 @@ if (-not $started -and -not $process.HasExited) {
     Write-Warning 'STARTUP STALL -- DW2 wrote no SessionLog in 90s. This is not a save failure.'
     Write-Warning "Look at the game window: a Win32 prompt such as 'Send Error Information' blocks it before Stride starts."
     try {
-        $process.Kill($true)
+        $process.Kill()
     }
     catch {
     }
@@ -210,11 +210,15 @@ elseif (-not $process.HasExited) {
     Write-Warning "Hit the ${TimeoutMinutes}-minute timeout without the game exiting."
 }
 
+# Kill() with NO argument. Under Windows PowerShell 5.1 (.NET Framework) Process has no
+# Kill(Boolean) overload; that call throws, an empty catch swallowed it, and the first
+# version of this script left a DW2 alive at a Win32 prompt for an hour.
 if (-not $process.HasExited) {
     try {
-        $process.Kill($true)
+        $process.Kill()
     }
     catch {
+        Write-Warning "Could not end DW2 (pid $($process.Id)): $($_.Exception.Message)"
     }
 }
 
