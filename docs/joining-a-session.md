@@ -25,7 +25,7 @@ How a second player connects to a session hosted on **this PC**.
 
 | Item | Where from | Notes |
 |---|---|---|
-| **Distant Worlds 2** | Steam | Must be the **same build**. This PC runs **1.3.6.3**. |
+| **Distant Worlds 2** | Steam | Must be the **same build**. This PC runs ~~**1.3.6.3**~~ **1.3.8.4** *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)*. |
 | **`Dw2MpLobby.exe`** | You send it | The launcher — it finds their game and starts it |
 | **`Dw2Mp.dll`** | You send it | The mod. Put it **beside** the lobby exe |
 | ~~**A save file**~~ | ~~You send it~~ | *(Struck 2026-11-08: no save is shared since 2026-09-08; the host generates the agreed galaxy and sends its state on join.)* |
@@ -249,7 +249,7 @@ library. Either pass the install folder as the first argument, or set `DW2_PATH`
 
 **`*** GAME VERSION MISMATCH ***` in the log** — different DW2 builds. State transfer is
 the game's own serialised galaxy, so mismatched builds exchange bytes that deserialise
-into nonsense. Both must be on the same version; this PC is on 1.3.6.3.
+into nonsense. Both must be on the same version; this PC is on ~~1.3.6.3~~ 1.3.8.4 *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)*.
 
 **Joiner connects then nothing happens** — the host had not finished loading. It does not
 listen until it is in-game. Reconnect after the host is in the galaxy.

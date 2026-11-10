@@ -2,6 +2,8 @@
 
 Notes from using this tool on **Distant Worlds 2 v1.3.6.3** (Steam appid `1531540`).
 
+*Added 2026-11-09: the game is now 1.3.8.4 (verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608). The notes above were taken on 1.3.6.3 and have not been re-checked on 1.3.8.4.*
+
 ---
 
 ## 1. What the game is built on
