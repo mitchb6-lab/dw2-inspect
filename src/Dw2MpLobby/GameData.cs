@@ -153,6 +153,11 @@ public static class GameData
         {
             return null;
         }
+        catch (FormatException)
+        {
+            // Nested past KeyValuesText.MaxDepth: not a Steam file. No Steam view, then.
+            return null;
+        }
     }
 
     /// <summary>

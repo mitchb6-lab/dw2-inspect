@@ -58,6 +58,7 @@ public sealed class SteamAppManifest
         return Path.Combine(steamAppsDir, fileName);
     }
 
+    /// <summary>Parses the file's text. Throws FormatException if it nests deeper than KeyValuesText.MaxDepth.</summary>
     public static SteamAppManifest Parse(string text)
     {
         var manifest = new SteamAppManifest();
@@ -142,8 +143,15 @@ internal static class KeyValuesText
     {
         var tokens = Tokenise(text ?? "");
         int position = 0;
-        return ParseBlock(tokens, ref position);
+        return ParseBlock(tokens, ref position, 0);
     }
+
+    /// <summary>
+    /// Steam's files nest three levels deep. A file that nests past this is not one of
+    /// Steam's, and recursing into it would be a stack overflow waiting for a long enough
+    /// run of braces; Parse throws FormatException instead.
+    /// </summary>
+    public const int MaxDepth = 64;
 
     public static Dictionary<string, object> Child(Dictionary<string, object> block, string key)
     {
@@ -177,8 +185,13 @@ internal static class KeyValuesText
         return value as string;
     }
 
-    private static Dictionary<string, object> ParseBlock(List<Token> tokens, ref int position)
+    private static Dictionary<string, object> ParseBlock(List<Token> tokens, ref int position, int depth)
     {
+        if (depth > MaxDepth)
+        {
+            throw new FormatException($"KeyValues text nests deeper than {MaxDepth} levels");
+        }
+
         var block = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
         while (position < tokens.Count)
@@ -207,7 +220,7 @@ internal static class KeyValuesText
             if (valueToken.Kind == TokenKind.Open)
             {
                 position++;
-                var child = ParseBlock(tokens, ref position);
+                var child = ParseBlock(tokens, ref position, depth + 1);
                 block[keyToken.Text] = child;
                 continue;
             }

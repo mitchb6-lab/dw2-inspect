@@ -586,3 +586,21 @@ and the in-game `Hello` refusal. When it is tried: the host's Log tab should sho
 `REFUSED Taylor: Content packs differ. …` and go on listening; Taylor's lobby should show the
 dialog and have *Open lobby* enabled again; after Taylor fixes the DLC and joins again, the
 host should admit with `Taylor joined as … Game 1.3.8.4+…, content packs: …`.
+
+**What this check is, and is not.** It is **cooperative**: each launcher reports its own
+packs, build and protocol, and the other side believes it. It saves two honest players an
+afternoon lost to a mismatch; it is no defence against a modified launcher that lies, and the
+game-security review of 2026-11-09 asked for that to be said plainly. What that review did
+harden, same day: every string from the other machine is capped and stripped of control
+characters before it reaches the log pane, the player list or `session.json`
+(`JoinPolicy.SanitiseSlot`, `PeerText`); a Join with no empire, an empty name, a null pack
+entry or more than 32 packs is "not a player slot" and is dropped; a protocol-2 slot with no
+`contentPackDetails` is refused rather than compared by names (which would have skipped the
+version check); a lobby frame is at most 64 KB; a connection that throws is logged and the
+host keeps listening; a repeat Join on an admitted connection is ignored instead of
+appending a second slot; the joiner validates the host's Session (empire present, at most 8
+players, `mySlot` names a player) and shows the host's refusal sentence capped at 600
+characters under "The host's launcher said:"; the lobby logs any fault on its UI thread to
+`%LOCALAPPDATA%\Dw2Mp\lobby-errors.log` instead of dying; the `.acf` parser refuses nesting
+past 64 levels; and in the mod, the receive side now honours the handshake block too (a
+peer that failed it cannot have its state or commands applied just because it sent them).

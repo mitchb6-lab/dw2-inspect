@@ -23,6 +23,7 @@
   <ItemGroup>
     <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
     <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
+    <Compile Include="..\Shared\PeerText.cs" Link="Shared\PeerText.cs" />
   </ItemGroup>
 
 </Project>

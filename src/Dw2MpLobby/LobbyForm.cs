@@ -410,7 +410,7 @@ public sealed class LobbyForm : Form
             return null;
         }
 
-        var difference = LobbySession.ContentDifference(host, joiner);
+        var difference = JoinPolicy.ContentDifference(host, joiner);
         var hostLabel = $"{host.Name} (host)";
         return difference.Describe(hostLabel, joiner.Name);
     }
