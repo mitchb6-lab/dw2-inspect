@@ -32,6 +32,8 @@
   -->
   <ItemGroup>
     <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
+    <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
+    <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />
   </ItemGroup>
 
   <!--

@@ -47,7 +47,7 @@ namespace Dw2Mp;
 /// </summary>
 public static class NetSession
 {
-    private enum Msg : byte
+    internal enum Msg : byte
     {
         Hello = 1,
         FullState = 2,     // deflate-compressed galaxy bytes — the CORRECTION channel
@@ -56,6 +56,9 @@ public static class NetSession
         ResyncRequest = 5, // client -> host: "my structure disagrees, send me a full state"
         Delta = 6,         // host -> client: ship motion, applied IN PLACE. Hundreds of bytes.
         Content = 7,       // both ways: installed content packs, once DWGame.Initialize knows them
+        DesyncReport = 8,  // client -> host: who diverged, at which host tick, both fingerprints (protocol 3)
+        DesyncChoice = 9,  // either way: the popup button a player pressed (1 save and quit, 2 attempt resync)
+        DesyncOutcome = 10 // client -> host: the resync it verified, succeeded or failed, with the failure count
     }
 
     public enum NetRole { Off, Host, Client }
@@ -265,7 +268,9 @@ public static class NetSession
     /// talk, and finding that out in the handshake is far better than finding out via a
     /// corrupt galaxy halfway through a session.
     /// </summary>
-    private const int ProtocolVersion = 2;
+    // 3 (2026-11-10): three desync messages added (DesyncReport, DesyncChoice, DesyncOutcome).
+    // Hello itself is unchanged, so a protocol-2 peer still reads it and logs its own mismatch.
+    private const int ProtocolVersion = 3;
 
     /// <summary>
     /// The Hello payload: protocol version, game version, and mode.
@@ -621,6 +626,21 @@ public static class NetSession
                         InjectCommand(payload);
                         break;
 
+                    // The desync popup (mitch, in chat 2026-11-10). A report only makes sense
+                    // at the host; a choice may come from either side; the outcome is the
+                    // client's verification. Payload parsing lives in Desync and is defensive.
+                    case Msg.DesyncReport when Role == NetRole.Host:
+                        Desync.OnReportReceived(payload);
+                        break;
+
+                    case Msg.DesyncChoice:
+                        Desync.OnChoiceReceived(payload);
+                        break;
+
+                    case Msg.DesyncOutcome when Role == NetRole.Host:
+                        Desync.OnOutcomeReceived(payload);
+                        break;
+
                     case Msg.Hello:
                         ReadHello(payload);
                         break;
@@ -863,6 +883,9 @@ public static class NetSession
     /// </summary>
     private static void OnMainThreadUpdate()
     {
+        // Both roles: a queued desync popup is shown here, on the only thread that may touch the UI.
+        Desync.OnMainThreadUpdate();
+
         if (Role != NetRole.Client) return;
 
         DrainDeltas();
@@ -1082,7 +1105,17 @@ public static class NetSession
 
             if (galaxy is null) return;
 
-            var mine = ApplyState.StructuralFingerprint(galaxy);
+            // The dev flag DW2MP_FORCE_DESYNC_AT_CYCLE replaces our fingerprint until the
+            // popup has been raised, so the whole path can be walked on one PC.
+            var mine = Desync.MaybeForceDivergence(ApplyState.StructuralFingerprint(galaxy));
+
+            // A resync chosen on the popup is verified here: the first summaries after the
+            // new full state has landed decide whether it worked.
+            if (Desync.VerifyingResync)
+            {
+                Desync.OnSummaryDuringResync(mine == hostFingerprint, _syncsApplied, hostTick);
+                return;
+            }
 
             if (mine == hostFingerprint)
             {
@@ -1098,8 +1131,20 @@ public static class NetSession
             // Report the divergence whether or not we act on it: the rate floor lives in
             // RequestResync, so a run of mismatches we decline to serve still shows up.
             if (_consecutiveMismatches == MismatchesBeforeResync)
+            {
                 _log($"# net[client]: structure diverged — host {hostFingerprint} vs mine {mine} " +
                      $"at host tick {hostTick}");
+
+                // mitch, in chat 2026-11-10: a detected desync raises the in-game popup
+                // (who desynced; 1 save and quit, 2 attempt resync) instead of a silent
+                // correction. The silent path stays as the fallback when the dialog API
+                // is not available.
+                bool popupRaised = Desync.OnDivergenceConfirmed(hostTick, hostFingerprint, mine);
+                if (popupRaised)
+                {
+                    return;
+                }
+            }
 
             RequestResync($"structure diverged for {_consecutiveMismatches} summaries");
         }
@@ -1113,10 +1158,12 @@ public static class NetSession
     /// Ask the host for a full state, subject to the rate floor. One place, so the join
     /// bootstrap and the divergence path cannot drift apart on their limiting.
     /// </summary>
-    private static void RequestResync(string reason)
+    private static void RequestResync(string reason, bool force = false)
     {
         if (IncompatibilityBlocksState("adopt the host's galaxy")) return;
-        if (DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
+
+        // A player who pressed "Attempt resync" must not be refused by the rate floor.
+        if (!force && DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
 
         _lastResyncRequest = DateTime.UtcNow;
         _consecutiveMismatches = 0;
@@ -1124,6 +1171,41 @@ public static class NetSession
 
         Send(Msg.ResyncRequest, Array.Empty<byte>());
         _log($"# net[client]: requested full state #{_resyncsRequested} — {reason}");
+    }
+
+    // ------------------------------------------------------------- desync popup glue
+
+    /// <summary>Client: the popup's "Attempt resync", exempt from the rate floor.</summary>
+    internal static void RequestResyncForDesync(string reason)
+    {
+        RequestResync(reason, force: true);
+    }
+
+    /// <summary>Host: serve a full state at the next HostTick, as if the client had asked.</summary>
+    internal static void MarkResyncRequested()
+    {
+        _resyncRequested = true;
+    }
+
+    internal static int SyncsApplied => _syncsApplied;
+
+    /// <summary>Send one of the desync messages, or nothing when the launcher link is down.</summary>
+    internal static void SendDesync(Msg type, byte[] payload)
+    {
+        if (!_connected || _stream is null)
+        {
+            _log($"# net[{Role}]: {type} not sent -- not connected");
+            return;
+        }
+
+        try
+        {
+            Send(type, payload);
+        }
+        catch (Exception ex)
+        {
+            _log($"# net[{Role}]: {type} send failed " + ex.GetType().Name + ": " + ex.Message);
+        }
     }
 
     /// <summary>
