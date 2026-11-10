@@ -85,6 +85,59 @@ function Find-GamePath {
     throw 'Could not find Distant Worlds 2. Pass -GamePath or set DW2_PATH.'
 }
 
+# This script may remove ITS OWN session lock after a launch it had to end by force, and
+# nothing else (mitch, 2026-11-10). Own means: no DistantWorlds2 process is running, and the
+# lock's "Session Started" time falls inside this launch's window. Anything else -- a lock
+# from before the launch, or from a session mitch started -- is left for a human with the
+# fail-fast message. DW2 writes the marker as "Session Started dd-MM-yyyy HH-mm-ss.fff".
+function Remove-OwnSessionLock {
+    param(
+        [string]   $LockPath,
+        [datetime] $LaunchedAt,
+        [string]   $Label
+    )
+
+    if (-not (Test-Path $LockPath)) {
+        return $true
+    }
+
+    $liveGames = @(Get-Process -Name 'DistantWorlds2' -ErrorAction SilentlyContinue)
+    if ($liveGames.Count -gt 0) {
+        Write-Warning "${Label}: DistantWorlds2.exe (pid $($liveGames[0].Id)) is still running; leaving $LockPath alone."
+        return $false
+    }
+
+    $marker = Get-Content $LockPath -Raw -ErrorAction SilentlyContinue
+    if ($marker) {
+        $marker = $marker.Trim()
+    }
+
+    $match = [regex]::Match("$marker", 'Session Started (\d{2})-(\d{2})-(\d{4}) (\d{2})-(\d{2})-(\d{2})\.(\d{3})')
+    if (-not $match.Success) {
+        Write-Warning "${Label}: could not read a session time from '$marker'; leaving $LockPath alone."
+        return $false
+    }
+
+    $day = [int] $match.Groups[1].Value
+    $month = [int] $match.Groups[2].Value
+    $year = [int] $match.Groups[3].Value
+    $hour = [int] $match.Groups[4].Value
+    $minute = [int] $match.Groups[5].Value
+    $second = [int] $match.Groups[6].Value
+    $sessionStarted = New-Object DateTime $year, $month, $day, $hour, $minute, $second
+
+    $windowStart = $LaunchedAt.AddSeconds(-5)
+    $windowEnd = Get-Date
+    if (($sessionStarted -lt $windowStart) -or ($sessionStarted -gt $windowEnd)) {
+        Write-Warning "${Label}: $LockPath says '$marker', which is not from this launch (launched $($LaunchedAt.ToString('yyyy-MM-dd HH:mm:ss'))); leaving it alone."
+        return $false
+    }
+
+    Remove-Item $LockPath -Force -ErrorAction Stop
+    Write-Host "${Label}: removed this launch's own session lock ('$marker')."
+    return $true
+}
+
 # ---------------------------------------------------------------------------
 
 $game = Find-GamePath -Explicit $GamePath
@@ -153,6 +206,8 @@ $arguments = @('--skip-splash', '--low-level-inject', $modDll)
 $exe = Join-Path $game 'DistantWorlds2.exe'
 
 Write-Host "Launching DistantWorlds2.exe $($arguments -join ' ')"
+$launchedAt = Get-Date
+$endedByForce = $false
 $process = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $game -PassThru -WindowStyle Minimized
 
 # STARTUP GUARD, as in determinism-run.ps1: prove the engine is alive before waiting on it.
@@ -179,10 +234,12 @@ for ($second = 0; $second -lt 90; $second++) {
 if (-not $started -and -not $process.HasExited) {
     Write-Warning 'STARTUP STALL -- DW2 wrote no SessionLog in 90s. This is not a save failure.'
     Write-Warning "Look at the game window: a Win32 prompt such as 'Send Error Information' blocks it before Stride starts."
+    $endedByForce = $true
     try {
         $process.Kill()
     }
     catch {
+        Write-Warning "Could not end DW2 (pid $($process.Id)): $($_.Exception.Message)"
     }
 }
 
@@ -214,6 +271,7 @@ elseif (-not $process.HasExited) {
 # Kill(Boolean) overload; that call throws, an empty catch swallowed it, and the first
 # version of this script left a DW2 alive at a Win32 prompt for an hour.
 if (-not $process.HasExited) {
+    $endedByForce = $true
     try {
         $process.Kill()
     }
@@ -251,6 +309,13 @@ if ($saveAfter) {
     }
 }
 $lockLeft = Test-Path $sessionLock
+if ($lockLeft -and $endedByForce) {
+    # Only after a launch this script ended itself, and only this launch's own lock.
+    $lockRemoved = Remove-OwnSessionLock -LockPath $sessionLock -LaunchedAt $launchedAt -Label 'make-save'
+    if ($lockRemoved) {
+        $lockLeft = $false
+    }
+}
 
 if ($saveIsNew) {
     $sizeMb = [math]::Round($saveAfter.Length / 1MB, 1)
