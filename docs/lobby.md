@@ -543,7 +543,11 @@ sees a disconnect.
 
 **One comparison.** `src\Shared\ContentPackCompare.cs` is compiled into the mod, the lobby
 and `src\Dw2MpTests` (a console runner with no framework; `dotnet run --project
-src\Dw2MpTests` prints 44 checks and exits 1 on a failure). `src\Shared\SteamAppManifest.cs`
+src\Dw2MpTests` prints ~~44 checks~~ one line per check and exits 1 on a failure;
+(corrected 2026-11-10: 44 was the count when this was written; the runner has grown with
+the join hardening and the desync work, and on main at 9998017 its source has 133 checks.
+That count is read from the source, not from a run -- the PC that made this audit has no
+.NET SDK). `src\Shared\SteamAppManifest.cs`
 parses the `.acf`. The mod's `Content` message format is unchanged, so the in-game
 `NetSession.ProtocolVersion` stays 2; what changed in the mod is that a protocol or
 game-version mismatch in `Hello` now blocks state exchange the way a content mismatch did.
