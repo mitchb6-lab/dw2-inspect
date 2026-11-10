@@ -178,6 +178,32 @@ if (-not (Test-Path $modDll)) { throw "Mod not found at $modDll" }
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
+# The save --continue will load: the newest .DWGame by write time, exactly as
+# MenuRenderer.ContinueGameClick picks it. Every run must load the SAME one, or the
+# comparison is between two different games. On 2026-11-10 run 1 autosaved at cycle 6,000,
+# run 2 loaded that autosave, and the result read as "diverged at the first snapshot".
+function Get-NewestSave {
+    param([string] $GameDir)
+
+    $newest = Get-ChildItem (Join-Path $GameDir 'data\SavedGames') -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -eq '.DWGame' } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+
+    if ($null -eq $newest) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Name          = $newest.Name
+        LastWriteTime = $newest.LastWriteTime
+    }
+}
+
+$pinnedSave = $null
+$saveChanged = $false
+$stoppedEarly = $false
+
 $results = @{}
 
 for ($i = 1; $i -le $Runs; $i++) {
@@ -195,6 +221,30 @@ for ($i = 1; $i -le $Runs; $i++) {
     $env:DW2MP_EXIT_WHEN_DONE   = '1'
     $env:DW2MP_STEP_MS          = $StepMs.ToString([System.Globalization.CultureInfo]::InvariantCulture)
     $env:DW2MP_PIN_BLOCKS       = if ($PinBlocks) { '1' } else { '0' }
+
+    # No autosaves during a harness run: one would become the newest save and the next run
+    # would load it. It also rotates through the player's own Autosave slots.
+    $env:DW2MP_BLOCK_AUTOSAVE   = '1'
+
+    # Disarm the other launch modes explicitly. The mod reads its switches from the
+    # environment, and a variable left in this shell by make-save.ps1 (DW2MP_MAKE_SAVE=1)
+    # turned both runs of 2026-11-10 into "generate a new galaxy and save over the pinned
+    # save" -- with --continue on the command line and nothing in this script saying so.
+    $env:DW2MP_MAKE_SAVE        = '0'
+    $env:DW2MP_SESSION          = ''
+    $env:DW2MP_ROLE             = ''
+
+    if ($Mode -eq 'continue') {
+        $newestSave = Get-NewestSave -GameDir $game
+        if ($null -eq $pinnedSave) {
+            $pinnedSave = $newestSave
+        }
+        elseif ($null -ne $newestSave -and (($newestSave.Name -ne $pinnedSave.Name) -or ($newestSave.LastWriteTime -ne $pinnedSave.LastWriteTime))) {
+            Write-Warning "run ${i}: the newest save is now $($newestSave.Name) ($($newestSave.LastWriteTime)), not $($pinnedSave.Name) ($($pinnedSave.LastWriteTime))."
+            Write-Warning "run ${i}: --continue will load a DIFFERENT game than run 1 did. A previous run wrote a save; the comparison is void."
+            $saveChanged = $true
+        }
+    }
 
     $startFlag = if ($Mode -eq 'continue') { '--continue' } else { '--new-game' }
     $args = @('--skip-splash', $startFlag, '--low-level-inject', $modDll)
@@ -229,7 +279,7 @@ for ($i = 1; $i -le $Runs; $i++) {
         Write-Warning "run ${i}: STARTUP STALL -- DW2 wrote no SessionLog in 90s. This is not a measurement failure."
         $dumps = @(Get-ChildItem (Join-Path $game 'data\Logs') -Filter '*CrashDump*' -File -ErrorAction SilentlyContinue).Count
         if ($dumps -gt 500) { Write-Warning "  $dumps crash dumps in data\Logs -- clear them; the pile alone stops the game launching." }
-        try { $proc.Kill($true) } catch { }
+        try { $proc.Kill() } catch { }
     }
 
     # Wait for the run, but stop early if DW2's own log shows the save failed to load: the
@@ -260,17 +310,36 @@ for ($i = 1; $i -le $Runs; $i++) {
         Write-Warning "run $i hit the ${TimeoutMinutes}-minute timeout; killing it and using whatever it logged."
     }
 
+    # Kill() with NO argument. Under Windows PowerShell 5.1 (.NET Framework) Process has no
+    # Kill(Boolean) overload; that call throws, the empty catch swallowed it, and every timed-out
+    # DW2 of 2026-11-10 stayed alive holding Dw2Mp.dll and the session lock.
+    $endedByForce = $false
     if (-not $proc.HasExited) {
+        $endedByForce = $true
         try {
-            $proc.Kill($true)
+            $proc.Kill()
         }
         catch {
+            Write-Warning "run ${i}: could not end DW2 (pid $($proc.Id)): $($_.Exception.Message)"
         }
     }
 
-    $rows = Parse-RunLog $log
+    # @() because a run with ONE snapshot comes back as a single object, whose Count is empty
+    # and which cannot be indexed in the comparison below.
+    $rows = @(Parse-RunLog $log)
     $results[$label] = $rows
     Write-Host "  $($rows.Count) snapshot(s) recorded"
+
+    # A run this script had to end by force never ran DWGame.Destroy, so data\SessionActive
+    # is now stale and every later run would sit at "Send Error Information" for its whole
+    # timeout (run 2 of 2026-11-10 did exactly that). Stop here and say so. The lock is not
+    # deleted by this script.
+    if ($endedByForce -and (Test-Path $sessionLock) -and $i -lt $Runs) {
+        Write-Warning "run ${i} was ended by force, so $sessionLock is now stale. Later runs would stall at 'Send Error Information'; stopping."
+        Write-Warning 'Delete that one file and run again.'
+        $stoppedEarly = $true
+        break
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +347,23 @@ for ($i = 1; $i -le $Runs; $i++) {
 
 Write-Host ''
 Write-Host '=== Result ==='
+
+if ($saveChanged) {
+    Write-Host 'NO VERDICT: the runs did not all load the same save (see the warnings above).' -ForegroundColor Yellow
+    Write-Host 'Hashes from different games say nothing about determinism. Remove or rename the'
+    Write-Host 'newer save so the pinned one is the newest .DWGame again, then run again.'
+    Write-Host ''
+    Write-Host "Logs: $logDir"
+    exit 1
+}
+
+if ($stoppedEarly) {
+    Write-Host 'NO VERDICT: a run had to be ended by force and the rest were not attempted (see above).' -ForegroundColor Yellow
+    Write-Host 'A comparison with one side missing is not a divergence.'
+    Write-Host ''
+    Write-Host "Logs: $logDir"
+    exit 1
+}
 
 $baseline = $results['run1']
 if (-not $baseline -or $baseline.Count -eq 0) {
