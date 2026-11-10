@@ -16,4 +16,13 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
+  <!--
+    Shared SOURCE with the mod (see src\Shared): the content-pack comparison and the Steam
+    app-manifest reader. Linked, not referenced, so the lobby still has no dependencies.
+  -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
+    <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
+  </ItemGroup>
+
 </Project>

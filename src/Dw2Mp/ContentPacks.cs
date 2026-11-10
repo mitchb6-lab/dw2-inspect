@@ -1,4 +1,5 @@
 using System.Reflection;
+using Dw2MpShared;
 using HarmonyLib;
 
 namespace Dw2Mp;
@@ -21,10 +22,17 @@ namespace Dw2Mp;
 /// The game version handshake could not see this: both were 1.3.6.3. Content is a second
 /// axis of compatibility and gets its own check. Read AFTER DWGame.Initialize, because
 /// Installed is false for everything until then.
+///
+/// How the game decides (DWGame.Initialize, 1.3.8.4 on 2026-11-09): for each pack in DWGame.ContentPacks it
+/// calls the store delegate DWGame.CheckContentPackInstalled(name) -- Steam, GOG or Matrix
+/// assign it before Initialize -- and on true sets ContentPack.Installed, logs
+/// "Content Pack installed: X", and for two packs flips a Galaxy flag
+/// (SetShakturiInstalled, SetPirateExpansionInstalled) that gates their bundles. On false it
+/// logs "Content Pack NOT installed: X". So Installed is the game's own word, not a guess.
 /// </summary>
 public static class ContentPacks
 {
-    /// <summary>"Name=1;Name=0;..." sorted by name; null until Initialize has run.</summary>
+    /// <summary>"Name=1;Name=0;..." sorted by name (ContentPackWire); null until Initialize has run.</summary>
     public static string Mine { get; private set; }
 
     public static bool Known => Mine is not null;
@@ -36,81 +44,88 @@ public static class ContentPacks
         _log = log;
 
         var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
-        var init = gameType is null ? null : AccessTools.Method(gameType, "Initialize");
-        if (init is null) { log("# content: DWGame.Initialize not found; content packs unchecked"); return; }
+        var initialize = gameType is null ? null : AccessTools.Method(gameType, "Initialize");
+        if (initialize is null)
+        {
+            log("# content: DWGame.Initialize not found; content packs unchecked");
+            return;
+        }
 
-        harmony.Patch(init, postfix: new HarmonyMethod(typeof(ContentPacks).GetMethod(
-            nameof(AfterInitialize), BindingFlags.NonPublic | BindingFlags.Static)));
+        var postfixMethod = typeof(ContentPacks).GetMethod(nameof(AfterInitialize), BindingFlags.NonPublic | BindingFlags.Static);
+        harmony.Patch(initialize, postfix: new HarmonyMethod(postfixMethod));
     }
 
     private static void AfterInitialize()
     {
         try
         {
-            Mine = Describe();
-            _log("# content: packs " + (Mine.Length == 0 ? "(none known)" : Mine.Replace(";", "  ")));
+            var entries = ReadFromGame();
+            Mine = ContentPackWire.Format(entries);
+
+            var summary = Mine.Length == 0 ? "(none known)" : Mine.Replace(";", "  ");
+            _log("# content: packs " + summary);
+
             NetSession.OnContentKnown();
         }
         catch (Exception ex)
         {
-            _log("# content: could not read content packs " + ex.GetType().Name + ": " + (ex.InnerException ?? ex).Message);
+            var cause = ex.InnerException ?? ex;
+            _log("# content: could not read content packs " + ex.GetType().Name + ": " + cause.Message);
         }
     }
 
     /// <summary>
-    /// Reads DWGame.ContentPacks (a List of ContentPack) and renders each as Name=0|1.
-    /// The pack's Name is a property, Installed is a field -- the same pattern that made
-    /// Empire.Name a trap, so both are looked up by kind rather than guessed.
+    /// Reads DWGame.ContentPacks (a ContentPackList of DistantWorlds.Types.ContentPack).
+    /// The pack's Name is a property, Installed and SteamAppId are fields -- the same pattern
+    /// that made Empire.Name a trap, so each is looked up by kind rather than guessed.
     /// </summary>
-    private static string Describe()
+    private static List<ContentPackEntry> ReadFromGame()
     {
-        var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
-        var packs = AccessTools.Field(gameType, "ContentPacks")?.GetValue(null) as System.Collections.IEnumerable;
-        if (packs is null) return "";
+        var entries = new List<ContentPackEntry>();
 
-        var parts = new List<string>();
+        var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+        var packsField = AccessTools.Field(gameType, "ContentPacks");
+        var packs = packsField?.GetValue(null) as System.Collections.IEnumerable;
+        if (packs is null)
+        {
+            return entries;
+        }
+
         foreach (var pack in packs)
         {
-            if (pack is null) continue;
-            var t = pack.GetType();
-            var name = AccessTools.Property(t, "Name")?.GetValue(pack) as string ?? "?";
-            var installed = AccessTools.Field(t, "Installed")?.GetValue(pack) as bool? ?? false;
-            parts.Add(name.Replace(";", ",").Replace("=", "-") + "=" + (installed ? "1" : "0"));
+            if (pack is null)
+            {
+                continue;
+            }
+
+            var packType = pack.GetType();
+            var name = AccessTools.Property(packType, "Name")?.GetValue(pack) as string ?? "?";
+            var installed = AccessTools.Field(packType, "Installed")?.GetValue(pack) as bool? ?? false;
+            var steamAppId = AccessTools.Field(packType, "SteamAppId")?.GetValue(pack) as uint? ?? 0;
+
+            var entry = new ContentPackEntry
+            {
+                Name = name,
+                Installed = installed,
+                SteamAppId = steamAppId,
+                Note = "DWGame.Initialize",
+            };
+            entries.Add(entry);
         }
 
-        parts.Sort(StringComparer.Ordinal);
-        return string.Join(";", parts);
+        return entries;
     }
 
     /// <summary>
-    /// Packs the peer has that we lack, and vice versa. Both directions matter: a galaxy
-    /// generated WITH a pack cannot be drawn without it, and one generated without it may
-    /// still confuse a game that has it (races and events the host never enabled).
+    /// Packs the peer has that we lack, and vice versa, from two wire strings. Both
+    /// directions matter: a galaxy generated WITH a pack cannot be drawn without it, and one
+    /// generated without it may still confuse a game that has it (races and events the host
+    /// never enabled). The comparison itself is ContentPackCompare, shared with the lobby.
     /// </summary>
-    public static (List<string> TheyHaveWeLack, List<string> WeHaveTheyLack) Compare(string mine, string theirs)
+    public static ContentPackDifference Compare(string mine, string theirs)
     {
-        static Dictionary<string, bool> Parse(string s)
-        {
-            var map = new Dictionary<string, bool>(StringComparer.Ordinal);
-            foreach (var part in (s ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
-            {
-                int eq = part.LastIndexOf('=');
-                if (eq <= 0) continue;
-                map[part[..eq]] = part[(eq + 1)..] == "1";
-            }
-            return map;
-        }
-
-        var a = Parse(mine);
-        var b = Parse(theirs);
-        var theyHave = new List<string>();
-        var weHave = new List<string>();
-
-        foreach (var (name, installed) in b)
-            if (installed && !(a.TryGetValue(name, out var ours) && ours)) theyHave.Add(name);
-        foreach (var (name, installed) in a)
-            if (installed && !(b.TryGetValue(name, out var theirsToo) && theirsToo)) weHave.Add(name);
-
-        return (theyHave, weHave);
+        var ours = ContentPackWire.Parse(mine);
+        var peers = ContentPackWire.Parse(theirs);
+        return ContentPackCompare.Compare(ours, peers);
     }
 }

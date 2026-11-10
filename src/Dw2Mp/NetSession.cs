@@ -115,60 +115,93 @@ public static class NetSession
     /// <summary>Host: remember the GameServer so relayed commands can be injected.</summary>
     public static void SetServer(object server) => _server ??= server;
 
-    // --------------------------------------------------- content parity
+    // --------------------------------------------------- compatibility: three axes
     //
-    // A second compatibility axis beside the game version. Two 1.3.6.3 games with
-    // different DLC generate galaxies the other cannot draw -- see ContentPacks. Each
-    // side sends its pack list once it knows it; each side compares on receipt. On a
-    // mismatch the client never asks for a full state and the host never sends one, so
-    // the failure is a log line and two single-player games rather than a renderer
-    // crash on the joiner eighteen seconds after the join.
+    // Protocol version and game version travel in Hello; content packs travel in Content
+    // once DWGame.Initialize knows them (see ContentPacks). Each side compares on receipt.
+    // Any mismatch on any axis blocks state in BOTH directions: the client never asks for a
+    // full state and the host never sends one, so the failure is a log line and two
+    // single-player games rather than a corrupt galaxy or a renderer crash on the joiner
+    // eighteen seconds after the join. The lobby refuses these same mismatches before the
+    // games are even launched; this is the safety net for a session started some other way.
 
     private static string _peerContent;
-    private static volatile bool _contentMismatch;
-    private static bool _contentRefusalLogged;
+
+    /// <summary>Why state must not cross the wire; null while the peers are compatible.</summary>
+    private static volatile string _incompatibility;
+    private static bool _incompatibilityLogged;
+
+    /// <summary>The first reason wins, so the log names the root cause and not a consequence.</summary>
+    private static void MarkIncompatible(string reason)
+    {
+        if (_incompatibility is null)
+        {
+            _incompatibility = reason;
+        }
+    }
 
     /// <summary>Called by ContentPacks once DWGame.Initialize has set the Installed flags.</summary>
     public static void OnContentKnown()
     {
-        if (!Active) return;
-        if (_connected) Send(Msg.Content, System.Text.Encoding.UTF8.GetBytes(ContentPacks.Mine));
-        if (_peerContent is not null) CompareContent();
+        if (!Active)
+        {
+            return;
+        }
+
+        if (_connected)
+        {
+            Send(Msg.Content, System.Text.Encoding.UTF8.GetBytes(ContentPacks.Mine));
+        }
+
+        if (_peerContent is not null)
+        {
+            CompareContent();
+        }
     }
 
     private static void ReadContent(byte[] payload)
     {
         _peerContent = System.Text.Encoding.UTF8.GetString(payload);
-        _log("# net: peer content " + (_peerContent.Length == 0 ? "(none known)" : _peerContent.Replace(";", "  ")));
-        if (ContentPacks.Known) CompareContent();
+
+        var summary = _peerContent.Length == 0 ? "(none known)" : _peerContent.Replace(";", "  ");
+        _log("# net: peer content " + summary);
+
+        if (ContentPacks.Known)
+        {
+            CompareContent();
+        }
     }
 
     private static void CompareContent()
     {
-        var (theyHave, weHave) = ContentPacks.Compare(ContentPacks.Mine, _peerContent);
-        if (theyHave.Count == 0 && weHave.Count == 0)
+        var difference = ContentPacks.Compare(ContentPacks.Mine, _peerContent);
+        if (difference.IsCompatible)
         {
             _log("# net: content OK — both games have the same content packs");
             return;
         }
 
-        _contentMismatch = true;
-        var detail = new List<string>();
-        if (theyHave.Count > 0) detail.Add("peer has, we lack: " + string.Join(", ", theyHave));
-        if (weHave.Count > 0) detail.Add("we have, peer lacks: " + string.Join(", ", weHave));
-        _log("# net: *** CONTENT MISMATCH *** " + string.Join("; ", detail) +
-             " — state will NOT be exchanged. Both players need the same DLC installed and enabled.");
+        var sentence = difference.Describe("this game", "the other game");
+        MarkIncompatible("content packs differ: " + sentence);
+        _log("# net: *** CONTENT MISMATCH *** " + sentence +
+             " — state will NOT be exchanged. Both players need the same DLC installed and enabled in Steam.");
     }
 
     /// <summary>True when state must not cross the wire. Logs the refusal once.</summary>
-    private static bool ContentBlocksState(string what)
+    private static bool IncompatibilityBlocksState(string what)
     {
-        if (!_contentMismatch) return false;
-        if (!_contentRefusalLogged)
+        var reason = _incompatibility;
+        if (reason is null)
         {
-            _contentRefusalLogged = true;
-            _log($"# net[{Role}]: refusing to {what} — content packs differ (see CONTENT MISMATCH above)");
+            return false;
         }
+
+        if (!_incompatibilityLogged)
+        {
+            _incompatibilityLogged = true;
+            _log($"# net[{Role}]: refusing to {what} — {reason}");
+        }
+
         return true;
     }
 
@@ -269,15 +302,30 @@ public static class NetSession
             string mine = GameVersion();
             _log($"# net: peer protocol={protocol} game={gameVersion} mode={mode}");
 
-            if (protocol != ProtocolVersion)
-                _log($"# net: *** PROTOCOL MISMATCH *** peer={protocol} ours={ProtocolVersion} — expect failure");
+            bool sameProtocol = protocol == ProtocolVersion;
+            bool sameGameVersion = string.Equals(gameVersion, mine, StringComparison.Ordinal);
 
-            if (!string.Equals(gameVersion, mine, StringComparison.Ordinal))
+            // An older peer reads the same first three fields, so it logs its own
+            // PROTOCOL MISMATCH line against OUR number. Fields are only ever appended to
+            // Hello for that reason; a reordered Hello would leave the old side reading junk.
+            if (!sameProtocol)
+            {
+                MarkIncompatible($"network protocol mismatch (peer {protocol}, ours {ProtocolVersion}); both players need the same mod build");
+                _log($"# net: *** PROTOCOL MISMATCH *** peer={protocol} ours={ProtocolVersion} — " +
+                     "state will NOT be exchanged. Both players need the same Dw2Mp build.");
+            }
+
+            if (!sameGameVersion)
+            {
+                MarkIncompatible($"game version mismatch (peer {gameVersion}, ours {mine}); both players need the same DW2 build");
                 _log($"# net: *** GAME VERSION MISMATCH *** peer={gameVersion} ours={mine} — " +
-                     "state transfer will not deserialise correctly");
+                     "state will NOT be exchanged; it would not deserialise correctly.");
+            }
 
-            if (protocol == ProtocolVersion && gameVersion == mine)
+            if (sameProtocol && sameGameVersion)
+            {
                 _log("# net: handshake OK — protocol and game version match");
+            }
         }
         catch (Exception ex) { _log("# net: malformed Hello: " + ex.Message); }
     }
@@ -618,7 +666,7 @@ public static class NetSession
     public static void HostTick(object galaxy, long tick)
     {
         if (Role != NetRole.Host || !_connected) return;
-        if (ContentBlocksState("send state")) return;
+        if (IncompatibilityBlocksState("send state")) return;
 
         // Deltas first, and often: this is now the channel that makes the client's world
         // move. A few hundred bytes against 4.37 MB, and applied in place so it costs no
@@ -1049,7 +1097,7 @@ public static class NetSession
     /// </summary>
     private static void RequestResync(string reason)
     {
-        if (ContentBlocksState("adopt the host's galaxy")) return;
+        if (IncompatibilityBlocksState("adopt the host's galaxy")) return;
         if (DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
 
         _lastResyncRequest = DateTime.UtcNow;

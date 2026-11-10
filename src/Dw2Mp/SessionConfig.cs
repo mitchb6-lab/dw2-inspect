@@ -12,6 +12,13 @@ namespace Dw2Mp;
 /// </summary>
 public sealed class SessionConfig
 {
+    /// <summary>
+    /// The session.json shape this mod reads. Mirrors Dw2MpLobby's LobbyProtocol.Version; the
+    /// two are bumped together. 2 (2026-11-09): players carry lobbyProtocol, gameVersion and
+    /// contentPackDetails, and the lobby refuses a join whose packs or versions differ.
+    /// </summary>
+    public const int ExpectedProtocolVersion = 2;
+
     public int ProtocolVersion { get; set; }
     public string Mode { get; set; } = "coop-shared";
     public string HostAddress { get; set; } = "127.0.0.1";
@@ -69,6 +76,18 @@ public sealed class SessionConfig
 
             log($"# session: mode={config.Mode} players={config.Players.Count} mySlot={config.MySlot} " +
                 $"stars={config.Galaxy.Stars} ai={config.Galaxy.AiEmpires} seed={config.Galaxy.Seed}");
+
+            // A loud line rather than a refusal: the lobby writes this file fresh at every
+            // launch, so a mismatch means the lobby and the mod on THIS machine are from
+            // different builds. The game still generates the agreed galaxy from the fields
+            // both versions share, and the in-game handshake (NetSession.ReadHello) is what
+            // decides whether state may cross the wire.
+            if (config.ProtocolVersion != ExpectedProtocolVersion)
+            {
+                log($"# session: *** PROTOCOL MISMATCH *** session file is protocol {config.ProtocolVersion}, " +
+                    $"this mod expects {ExpectedProtocolVersion} — the lobby and the mod are from different builds; " +
+                    "install both from the same package");
+            }
 
             foreach (var p in config.Players)
                 log($"#   slot {p.Slot}: {p.Name} — {p.Empire.Name} (race {p.Empire.RaceId}, gov {p.Empire.GovernmentId})");

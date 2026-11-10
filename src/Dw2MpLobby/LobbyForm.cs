@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Dw2MpShared;
 
 namespace Dw2MpLobby;
 
@@ -97,9 +98,9 @@ public sealed class LobbyForm : Form
         WireEvents();
 
         Log($"Game: {gamePath}");
+        Log($"Game build: {GameData.ReadGameVersion(gamePath)}");
         Log($"{_races.Count} races, {_governments.Count} governments loaded.");
-        var packs = GameData.InstalledContentPacks(gamePath);
-        Log("Content packs on disk: " + (packs.Count == 0 ? "none (base game only)" : string.Join(", ", packs)));
+        LogContentPacks(GameData.ReadContentPacks(gamePath));
         RefreshMods();
         RefreshLocalAddresses();
     }
@@ -395,21 +396,64 @@ public sealed class LobbyForm : Form
     private void SetEmpireFields(bool enabled) =>
         _empireName.Enabled = _race.Enabled = _government.Enabled = _colour.Enabled = enabled;
 
-    /// <summary>A sentence naming the packs one side has and the other lacks, or null.</summary>
+    /// <summary>
+    /// A sentence naming the packs one side has and the other lacks, or null. The host
+    /// refuses such a join before it reaches the session (LobbySession.ReasonToRefuse); this
+    /// is the belt-and-braces check on whatever session both sides ended up holding.
+    /// </summary>
     private static string ContentMismatch(SessionDescriptor session)
     {
-        var host = session.Players.FirstOrDefault(p => p.Slot == 0);
-        var joiner = session.Players.FirstOrDefault(p => p.Slot != 0);
-        if (host is null || joiner is null) return null;
+        var host = session.Players.FirstOrDefault(player => player.Slot == 0);
+        var joiner = session.Players.FirstOrDefault(player => player.Slot != 0);
+        if (host is null || joiner is null)
+        {
+            return null;
+        }
 
-        var hostOnly = host.ContentPacks.Except(joiner.ContentPacks).ToList();
-        var joinerOnly = joiner.ContentPacks.Except(host.ContentPacks).ToList();
-        if (hostOnly.Count == 0 && joinerOnly.Count == 0) return null;
+        var difference = LobbySession.ContentDifference(host, joiner);
+        var hostLabel = $"{host.Name} (host)";
+        return difference.Describe(hostLabel, joiner.Name);
+    }
 
-        var parts = new List<string>();
-        if (hostOnly.Count > 0) parts.Add($"{host.Name} (host) has {string.Join(", ", hostOnly)}; {joiner.Name} does not");
-        if (joinerOnly.Count > 0) parts.Add($"{joiner.Name} has {string.Join(", ", joinerOnly)}; {host.Name} (host) does not");
-        return string.Join(". ", parts) + ".";
+    /// <summary>
+    /// One line per known pack on the Log tab, so a player can read off exactly what this
+    /// machine will report to the other side -- and see "unticked in Steam" when that is why.
+    /// </summary>
+    private void LogContentPacks(List<ContentPackEntry> packs)
+    {
+        var installedNames = GameData.InstalledNames(packs);
+        if (installedNames.Count == 0)
+        {
+            Log("Content packs installed: none (base game only)");
+        }
+        else
+        {
+            Log("Content packs installed: " + string.Join(", ", installedNames));
+        }
+
+        foreach (var pack in packs)
+        {
+            var state = pack.Installed ? "installed" : "NOT installed";
+            var version = string.IsNullOrEmpty(pack.Version) ? "" : $", depot manifest {pack.Version}";
+            Log($"  {pack.Name}: {state} ({pack.Note}{version}; Steam app {pack.SteamAppId})");
+        }
+    }
+
+    /// <summary>
+    /// Joiner: the host would not admit us, or sent a session from a launcher build we
+    /// cannot accept. The connection is finished either way; show exactly why, then hand
+    /// the buttons back so the player can fix it and try again.
+    /// </summary>
+    private void OnRefused(string reason)
+    {
+        _lobby?.Dispose();
+        _lobby = null;
+        _playerList.Items.Clear();
+        _launch.Enabled = false;
+        _launch.Text = "Start session";
+        _openLobby.Enabled = true;
+        Log("Press Open lobby to try again once that is fixed.");
+        MessageBox.Show(this, reason, "Cannot start this session", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     private void UpdateStatus()
@@ -457,6 +501,7 @@ public sealed class LobbyForm : Form
                 _openLobby.Enabled = true;
                 Log("Press Open lobby to listen again.");
             });
+            _lobby.Refused += reason => BeginInvoke(() => OnRefused(reason));
 
             if (_roleHost.Checked)
             {
@@ -571,11 +616,18 @@ public sealed class LobbyForm : Form
     {
         bool host = _roleHost.Checked;
 
+        // Read fresh at every build rather than once at startup: a player who unticks a DLC
+        // in Steam while the lobby is open should be reported as they are now.
+        var contentPackDetails = GameData.ReadContentPacks(_gamePath);
+
         var mine = new PlayerSlot
         {
             Slot = host ? 0 : 1,
             Name = _playerName.Text.Trim(),
-            ContentPacks = GameData.InstalledContentPacks(_gamePath),
+            LobbyProtocol = LobbyProtocol.Version,
+            GameVersion = GameData.ReadGameVersion(_gamePath),
+            ContentPacks = GameData.InstalledNames(contentPackDetails),
+            ContentPackDetails = contentPackDetails,
             Empire = new EmpireConfig
             {
                 Name = _empireName.Text.Trim(),

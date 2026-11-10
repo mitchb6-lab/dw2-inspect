@@ -1,8 +1,13 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using Dw2MpShared;
 
 namespace Dw2MpLobby;
+
+/// <summary>A content pack as DW2 defines it (1.3.8.4, 2026-11-09): name, Steam DLC app id, the bundle files that ship with it.</summary>
+public sealed record KnownContentPack(string Name, uint SteamAppId, string[] Bundles);
 
 public sealed record RaceOption(int Id, string Name, Color DefaultColor)
 {
@@ -23,29 +28,167 @@ public sealed record GovernmentOption(int Id, string Name)
 /// </summary>
 public static class GameData
 {
+    /// <summary>Distant Worlds 2 on Steam. Its appmanifest_1531540.acf lists the DLC depots.</summary>
+    public const uint Dw2SteamAppId = 1531540;
+
     /// <summary>
-    /// The content packs DW2 1.3.6.3 knows, by the bundle files that ship with each --
-    /// transcribed from DWGame's static constructor. Steam only downloads a DLC's depot
-    /// when the account owns it, so a pack whose bundles are all on disk is, for the
-    /// launcher's purposes, installed. The mod re-checks real ownership in-game.
+    /// The content packs DW2 knows (1.3.8.4, 2026-11-09) -- name, Steam DLC app id and the
+    /// bundle files that ship with each -- transcribed from DWGame's static constructor
+    /// (dw2inspect il "DistantWorlds2.DWGame::.cctor"). Steam only downloads a DLC's depot
+    /// when the account owns it and has it ticked, so a pack whose bundles are all on disk
+    /// is, for the launcher's purposes, installed. The mod re-checks real ownership in-game.
     /// </summary>
-    private static readonly (string Name, string[] Bundles)[] KnownContentPacks =
+    private static readonly KnownContentPack[] KnownContentPacks =
     {
-        ("Factions - Ikkuro and Dhayut",    new[] { "Ikkuro.bundle", "Dhayut.bundle" }),
-        ("Factions - Quameno and Gizureans", new[] { "Quameno.bundle", "Gizurean.bundle" }),
-        ("Return of the Shakturi",           new[] { "Shakturi.bundle", "Creatures_Shakturi.bundle", "PlanetDestroyers.bundle" }),
-        ("Factions - Atuuk and Wekkarus",    new[] { "Atuuk.bundle", "Wekkarus.bundle" }),
-        ("Shadows Rising",                   new[] { "ShadowsRising.bundle" }),
+        new("Factions - Ikkuro and Dhayut",     2140010, new[] { "Ikkuro.bundle", "Dhayut.bundle" }),
+        new("Factions - Quameno and Gizureans", 2409480, new[] { "Quameno.bundle", "Gizurean.bundle" }),
+        new("Return of the Shakturi",           2926560, new[] { "Shakturi.bundle", "Creatures_Shakturi.bundle", "PlanetDestroyers.bundle" }),
+        new("Factions - Atuuk and Wekkarus",    3350550, new[] { "Atuuk.bundle", "Wekkarus.bundle" }),
+        new("Shadows Rising",                   3989670, new[] { "ShadowsRising.bundle" }),
     };
 
-    /// <summary>Names of the content packs whose bundles are all present under datadbundles.</summary>
+    /// <summary>
+    /// Every known content pack as this machine sees it. "Installed" means the pack's bundle
+    /// files are all on disk AND Steam has not got it unticked (Properties > DLC). The version
+    /// is the Steam depot manifest id when the game is in a Steam library; otherwise null.
+    ///
+    /// Read-only: the app manifest is Steam's file and is only ever read here.
+    /// </summary>
+    public static List<ContentPackEntry> ReadContentPacks(string gamePath)
+    {
+        var bundlesDir = Path.Combine(gamePath, "data", "db", "bundles");
+        var steamManifest = ReadSteamManifest(gamePath);
+        var entries = new List<ContentPackEntry>();
+
+        foreach (var known in KnownContentPacks)
+        {
+            bool bundlesOnDisk = true;
+            foreach (var bundle in known.Bundles)
+            {
+                var bundlePath = Path.Combine(bundlesDir, bundle);
+                if (!File.Exists(bundlePath))
+                {
+                    bundlesOnDisk = false;
+                }
+            }
+
+            bool disabledInSteam = steamManifest is not null && steamManifest.DisabledDlcAppIds.Contains(known.SteamAppId);
+
+            string depotManifest = null;
+            if (steamManifest is not null)
+            {
+                steamManifest.DepotManifestByDlcAppId.TryGetValue(known.SteamAppId, out depotManifest);
+            }
+
+            string note;
+            if (disabledInSteam)
+            {
+                note = bundlesOnDisk ? "unticked in Steam, bundles still on disk" : "unticked in Steam";
+            }
+            else if (bundlesOnDisk)
+            {
+                note = "bundles on disk";
+            }
+            else
+            {
+                note = "bundles not on disk";
+            }
+
+            var entry = new ContentPackEntry
+            {
+                Name = known.Name,
+                Installed = bundlesOnDisk && !disabledInSteam,
+                SteamAppId = known.SteamAppId,
+                Version = string.IsNullOrEmpty(depotManifest) ? null : depotManifest,
+                Note = note,
+            };
+            entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    public static List<string> InstalledNames(IEnumerable<ContentPackEntry> entries)
+    {
+        var names = new List<string>();
+        foreach (var entry in entries)
+        {
+            if (entry.Installed)
+            {
+                names.Add(entry.Name);
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// Steam's app manifest for the game, or null when the game is not in a Steam library,
+    /// the file is missing, or it cannot be read. Null means "no Steam view", not "no DLC";
+    /// the bundle check still decides what is installed.
+    /// </summary>
+    public static SteamAppManifest ReadSteamManifest(string gamePath)
+    {
+        var manifestPath = SteamAppManifest.PathForGame(gamePath, Dw2SteamAppId);
+        if (manifestPath is null)
+        {
+            return null;
+        }
+
+        if (!File.Exists(manifestPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var text = File.ReadAllText(manifestPath);
+            return SteamAppManifest.Parse(text);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// DistantWorlds2.exe's product version, e.g. "1.3.6.3", or "unknown". The same string
+    /// Scripts\package-joiner.ps1 writes into VERSION.txt, so the two can be compared by eye.
+    /// </summary>
+    public static string ReadGameVersion(string gamePath)
+    {
+        var exePath = Path.Combine(gamePath, "DistantWorlds2.exe");
+        if (!File.Exists(exePath))
+        {
+            return "unknown";
+        }
+
+        try
+        {
+            var info = FileVersionInfo.GetVersionInfo(exePath);
+            var version = info.ProductVersion;
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                version = info.FileVersion;
+            }
+
+            return string.IsNullOrWhiteSpace(version) ? "unknown" : version.Trim();
+        }
+        catch (Exception)
+        {
+            return "unknown";
+        }
+    }
+
+    /// <summary>Names of the installed content packs: the protocol-1 field a protocol-1 host still reads.</summary>
     public static List<string> InstalledContentPacks(string gamePath)
     {
-        var dir = Path.Combine(gamePath, "data", "db", "bundles");
-        var found = new List<string>();
-        foreach (var (name, bundles) in KnownContentPacks)
-            if (bundles.All(b => File.Exists(Path.Combine(dir, b)))) found.Add(name);
-        return found;
+        var entries = ReadContentPacks(gamePath);
+        return InstalledNames(entries);
     }
 
     public static string FindGamePath(string explicitPath = null)

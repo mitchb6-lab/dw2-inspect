@@ -46,18 +46,36 @@ else is identical on both.
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "mode": "coop-shared",
   "hostAddress": "127.0.0.1",
   "port": 47800,
   "galaxy": { "stars": 30, "aiEmpires": 4, "seed": 12345 },
   "players": [
-    { "slot": 0, "name": "Mitch",  "empire": { "name": "Terran Union", "raceId": 0, "governmentId": 0, "r": 40, "g": 90, "b": 200 } },
-    { "slot": 1, "name": "Friend", "empire": { "name": "Ackdarian Compact", "raceId": 1, "governmentId": 2, "r": 200, "g": 60, "b": 40 } }
+    {
+      "slot": 0, "name": "Mitch",
+      "empire": { "name": "Terran Union", "raceId": 0, "governmentId": 0, "r": 40, "g": 90, "b": 200 },
+      "lobbyProtocol": 2,
+      "gameVersion": "1.3.6.3",
+      "contentPacks": [ "Factions - Ikkuro and Dhayut", "Return of the Shakturi" ],
+      "contentPackDetails": [
+        { "name": "Factions - Ikkuro and Dhayut", "installed": true,  "steamAppId": 2140010, "version": "2085203991787705401", "note": "bundles on disk" },
+        { "name": "Return of the Shakturi",       "installed": true,  "steamAppId": 2926560, "version": "1480154476699251668", "note": "bundles on disk" },
+        { "name": "Shadows Rising",               "installed": false, "steamAppId": 3989670, "version": null,                  "note": "bundles not on disk" }
+      ]
+    },
+    { "slot": 1, "name": "Friend", "empire": { "name": "Ackdarian Compact", "raceId": 1, "governmentId": 2, "r": 200, "g": 60, "b": 40 }, "lobbyProtocol": 2, "gameVersion": "1.3.6.3", "contentPacks": [ "..." ], "contentPackDetails": [ "..." ] }
   ],
   "mySlot": 0
 }
 ```
+
+`protocolVersion` is the **lobby protocol** (`LobbyProtocol.Version` in the lobby,
+`SessionConfig.ExpectedProtocolVersion` in the mod -- bump both together). It covers this
+file and the lobby's own messages, because the Join and Session payloads *are* these types.
+It is separate from the mod's in-game `NetSession.ProtocolVersion`. Protocol 2 (2026-11-09)
+added `lobbyProtocol`, `gameVersion` and `contentPackDetails` per player; see
+*Content packs are checked before anyone launches* below.
 
 **Mode decides how slots map to empires:**
 
@@ -482,3 +500,89 @@ Two process lessons from that hour:
    guard that waits for `SessionLog` to be touched and reports `STARTUP STALL` distinctly
    from a generation failure. A separate self-inflicted bug — a launcher script missing
    `-WorkingDirectory` — presented identically, and cost another round.
+
+## Content packs are checked before anyone launches — 2026-11-09
+
+**Why.** mitch re-enabled the four DLC in Steam; Taylor's PC probably owns none. The mod is
+host-authoritative, so two PCs with different packs means a galaxy one of them cannot draw
+(the 2026-09-10 crash) or a load that stops at a dialog (2026-11-08). The 2026-09-10 check
+compared pack names from bundle files and disabled Start, but it had no protocol number of
+its own, so an older launcher looked like "a player with fewer packs", the joiner only learnt
+of a mismatch through the shared session, and the host had to close the lobby for a retry.
+
+**What each side reports** (`PlayerSlot`, lobby protocol 2):
+
+| field | meaning |
+|---|---|
+| `lobbyProtocol` | `LobbyProtocol.Version`. A protocol-1 slot deserialises with 0 here. |
+| `gameVersion` | `DistantWorlds2.exe`'s product version, e.g. `1.3.8.4+820e12…`; `unknown` if unreadable. |
+| `contentPacks` | installed pack names — the protocol-1 field, kept so a protocol-1 host still parses the slot. |
+| `contentPackDetails` | every pack DW2 knows, each with `installed`, `steamAppId`, `version`, `note`. |
+
+*Installed* means the pack's bundle files are on disk **and** Steam does not list it under
+`DisabledDLC` in `steamapps\appmanifest_1531540.acf` (read, never written). *Version* is the
+DLC depot's manifest id from the same file -- the game has no per-pack version of its own,
+and that id is the closest thing Steam reports. It is null for a GOG or Matrix install.
+
+**What the host does on Join** (`LobbySession.ReasonToRefuse`), in the order a player
+should fix things: lobby protocol, then game build (when both are known), then content
+packs -- the installed sets must match, and versions must match where both sides know
+them; a version known on one side only is a log line, not a refusal. On a refusal the host
+logs `REFUSED <name>: <reason>`, sends `Refused` (message 4, a UTF-8 sentence), waits
+250 ms for it to leave, closes that connection and **keeps listening**. The joiner shows the
+sentence in a dialog and gets *Open lobby* back, so the fix-and-retry needs nothing from
+the host.
+
+**Older peers.** A protocol-1 joiner arrives with `lobbyProtocol` 0 and is refused with
+"speaks lobby protocol 1 or older"; its own log can only say `Ignoring unexpected lobby
+message Refused` and then `The other player disconnected` -- the most a build with no
+version check can do, and the host's log carries the reason. A protocol-2 joiner on a
+protocol-1 host is admitted (unknown JSON fields are ignored) and receives a Session with
+`protocolVersion` 1; it refuses that session itself, with the same dialog, and the old host
+sees a disconnect.
+
+**One comparison.** `src\Shared\ContentPackCompare.cs` is compiled into the mod, the lobby
+and `src\Dw2MpTests` (a console runner with no framework; `dotnet run --project
+src\Dw2MpTests` prints 44 checks and exits 1 on a failure). `src\Shared\SteamAppManifest.cs`
+parses the `.acf`. The mod's `Content` message format is unchanged, so the in-game
+`NetSession.ProtocolVersion` stays 2; what changed in the mod is that a protocol or
+game-version mismatch in `Hello` now blocks state exchange the way a content mismatch did.
+
+**Example** -- what mitch's PC reported on 2026-11-09 (lobby Log tab):
+
+```
+Game build: 1.3.8.4+820e122338180652f8f6e544f665261b4b2acc47
+Content packs installed: Factions - Ikkuro and Dhayut, Factions - Quameno and Gizureans, Return of the Shakturi, Factions - Atuuk and Wekkarus
+  Factions - Ikkuro and Dhayut: installed (bundles on disk, depot manifest 2085203991787705401; Steam app 2140010)
+  Factions - Quameno and Gizureans: installed (bundles on disk, depot manifest 4707671932583055779; Steam app 2409480)
+  Return of the Shakturi: installed (bundles on disk, depot manifest 1480154476699251668; Steam app 2926560)
+  Factions - Atuuk and Wekkarus: installed (bundles on disk, depot manifest 650156249882694280; Steam app 3350550)
+  Shadows Rising: NOT installed (bundles not on disk; Steam app 3989670)
+```
+
+If Taylor joins with the base game, the host logs and Taylor's dialog says:
+
+> Content packs differ. Mitch (host) has Factions - Atuuk and Wekkarus, Factions - Ikkuro and
+> Dhayut, Factions - Quameno and Gizureans, Return of the Shakturi; Taylor does not. Both
+> players need the same DLC installed and ticked in Steam (Distant Worlds 2 > Properties > DLC).
+
+**Playing with the common set -- investigated, not built.** `DWGame.Initialize` decides each
+pack by calling the delegate `DWGame.CheckContentPackInstalled(name)`, which the store layer
+assigns before Initialize. True sets `ContentPack.Installed`, logs `Content Pack installed:`,
+and for two packs flips a `Galaxy` flag (`SetShakturiInstalled`, `SetPirateExpansionInstalled`);
+then `Galaxy.StripDisallowedFeatures()` runs, those flags gate `LoadBundle` for the pack
+bundles, and a race whose bundle is not mounted gets `IsPlayable = false`. So a Harmony
+prefix on that delegate's `Invoke` returning false for the packs the *other* player lacks
+would make the host's game behave exactly as if it did not own them -- in memory, with no
+write to the game folder or to Steam, and the lobby already knows both inventories before
+either game launches. It is not built because it cannot be verified without a launch, and
+the failure mode (a pack half-disabled: definitions present, assets not) is the one that
+crashed the 2026-09-10 join. The zero-code version exists today: the host unticks the extra
+DLC in Steam (*Properties > DLC*), Steam removes those depots, and both lobbies report the
+base game.
+
+**Not verified here** (no game launch, one PC): the refusal between two lobbies on two PCs,
+and the in-game `Hello` refusal. When it is tried: the host's Log tab should show
+`REFUSED Taylor: Content packs differ. …` and go on listening; Taylor's lobby should show the
+dialog and have *Open lobby* enabled again; after Taylor fixes the DLC and joins again, the
+host should admit with `Taylor joined as … Game 1.3.8.4+…, content packs: …`.
