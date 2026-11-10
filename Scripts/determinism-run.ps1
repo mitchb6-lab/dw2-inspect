@@ -131,8 +131,9 @@ Write-Host "Game: $game   (mode: $Mode)"
 # thing that removes it) makes DW2 open a Win32 "Send Error Information" prompt before Stride
 # starts, and wait for a click. No SessionLog, no GameServer, nothing in the mod log. Seen
 # 2026-11-09 after a run had left through Environment.Exit. With no game running the lock
-# can only be stale, so say so now instead of spending 90 s per run finding out. The file
-# is not deleted here: this script does not write into the game folder.
+# can only be stale, so say so now instead of spending 90 s per run finding out. A lock found
+# BEFORE any launch is not this script's and is never removed here; see Remove-OwnSessionLock
+# for the one case where it is.
 $sessionLock = Join-Path $game 'data\SessionActive'
 $gameProcesses = @(Get-Process -Name 'DistantWorlds2' -ErrorAction SilentlyContinue)
 
@@ -200,6 +201,59 @@ function Get-NewestSave {
     }
 }
 
+# The harness may remove ITS OWN session lock after a run it had to end by force, and nothing
+# else (mitch, 2026-11-10). Own means: no DistantWorlds2 process is running, and the lock's
+# "Session Started" time falls inside this run's launch window. Anything else -- a lock from
+# before the launch, or from a session mitch started -- is left for a human with the fail-fast
+# message. DW2 writes the marker as "Session Started dd-MM-yyyy HH-mm-ss.fff".
+function Remove-OwnSessionLock {
+    param(
+        [string]   $LockPath,
+        [datetime] $LaunchedAt,
+        [string]   $Label
+    )
+
+    if (-not (Test-Path $LockPath)) {
+        return $true
+    }
+
+    $liveGames = @(Get-Process -Name 'DistantWorlds2' -ErrorAction SilentlyContinue)
+    if ($liveGames.Count -gt 0) {
+        Write-Warning "${Label}: DistantWorlds2.exe (pid $($liveGames[0].Id)) is still running; leaving $LockPath alone."
+        return $false
+    }
+
+    $marker = Get-Content $LockPath -Raw -ErrorAction SilentlyContinue
+    if ($marker) {
+        $marker = $marker.Trim()
+    }
+
+    $match = [regex]::Match("$marker", 'Session Started (\d{2})-(\d{2})-(\d{4}) (\d{2})-(\d{2})-(\d{2})\.(\d{3})')
+    if (-not $match.Success) {
+        Write-Warning "${Label}: could not read a session time from '$marker'; leaving $LockPath alone."
+        return $false
+    }
+
+    $day = [int] $match.Groups[1].Value
+    $month = [int] $match.Groups[2].Value
+    $year = [int] $match.Groups[3].Value
+    $hour = [int] $match.Groups[4].Value
+    $minute = [int] $match.Groups[5].Value
+    $second = [int] $match.Groups[6].Value
+    $sessionStarted = New-Object DateTime $year, $month, $day, $hour, $minute, $second
+
+    $windowStart = $LaunchedAt.AddSeconds(-5)
+    $windowEnd = Get-Date
+    if (($sessionStarted -lt $windowStart) -or ($sessionStarted -gt $windowEnd)) {
+        Write-Warning "${Label}: $LockPath says '$marker', which is not from this run (launched $($LaunchedAt.ToString('yyyy-MM-dd HH:mm:ss'))); leaving it alone."
+        return $false
+    }
+
+    Remove-Item $LockPath -Force -ErrorAction Stop
+    Write-Host "${Label}: removed this run's own session lock ('$marker')."
+    return $true
+}
+
 $pinnedSave = $null
 $saveChanged = $false
 $stoppedEarly = $false
@@ -248,6 +302,7 @@ for ($i = 1; $i -le $Runs; $i++) {
 
     $startFlag = if ($Mode -eq 'continue') { '--continue' } else { '--new-game' }
     $args = @('--skip-splash', $startFlag, '--low-level-inject', $modDll)
+    $launchedAt = Get-Date
     $proc = Start-Process -FilePath (Join-Path $game 'DistantWorlds2.exe') `
                           -ArgumentList $args -WorkingDirectory $game -PassThru
 
@@ -332,13 +387,16 @@ for ($i = 1; $i -le $Runs; $i++) {
 
     # A run this script had to end by force never ran DWGame.Destroy, so data\SessionActive
     # is now stale and every later run would sit at "Send Error Information" for its whole
-    # timeout (run 2 of 2026-11-10 did exactly that). Stop here and say so. The lock is not
-    # deleted by this script.
-    if ($endedByForce -and (Test-Path $sessionLock) -and $i -lt $Runs) {
-        Write-Warning "run ${i} was ended by force, so $sessionLock is now stale. Later runs would stall at 'Send Error Information'; stopping."
-        Write-Warning 'Delete that one file and run again.'
-        $stoppedEarly = $true
-        break
+    # timeout (run 2 of 2026-11-10 did exactly that). Remove the lock if it is provably this
+    # run's own (see Remove-OwnSessionLock); otherwise stop here and say so.
+    if ($endedByForce -and (Test-Path $sessionLock)) {
+        $lockRemoved = Remove-OwnSessionLock -LockPath $sessionLock -LaunchedAt $launchedAt -Label "run $i"
+        if (-not $lockRemoved -and $i -lt $Runs) {
+            Write-Warning "run ${i} was ended by force and $sessionLock could not be removed. Later runs would stall at 'Send Error Information'; stopping."
+            Write-Warning 'Remove that one file and run again.'
+            $stoppedEarly = $true
+            break
+        }
     }
 }
 

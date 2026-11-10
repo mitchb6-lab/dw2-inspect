@@ -2066,3 +2066,27 @@ Verified: `dotnet build` of the mod, the lobby and the test runner (0 new warnin
 `CS0169` unused-field warnings in `NetSession` predate this), 44/44 checks, and the
 inventory reader run against the real install. Not verified: anything that needs a launch or
 a second PC -- see the end of the lobby.md section for what to look for.
+
+## The harness and the game's session lock — decision 2026-11-10
+
+DW2 writes `data\SessionActive` in `DWGame.Initialize` and removes it in `DWGame.Destroy`, the
+only caller of `RemoveSessionFile`. A session that ends any other way leaves it behind, and the
+next launch then stops at a Win32 "Send Error Information" prompt before Stride starts: no
+SessionLog, no GameServer, nothing in the mod log. The harness met this three times on
+2026-11-09/10 — after `Environment.Exit` (now routed through `Determinism.ExitProcess`, which
+calls the game's own `RemoveSessionFile` first), and after runs the script had to end by force.
+
+**Decision (mitch, 2026-11-10): the harness may remove its OWN lock after a run it had to end
+by force, and nothing else.** Own means: no `DistantWorlds2` process is running, and the lock's
+`Session Started dd-MM-yyyy HH-mm-ss.fff` time falls inside that run's launch window. A lock
+found before any launch, or one with a time outside the window, is left for a human with the
+fail-fast message, because it may be a session mitch started. `Scripts/determinism-run.ps1` and
+`Scripts/make-save.ps1` both apply this (`Remove-OwnSessionLock`) and log what they removed.
+
+Two more facts from the same night shaped the scripts. `--continue` loads the newest `.DWGame`
+by write time (`MenuRenderer.ContinueGameClick`, `MaxBy GetLastWriteTime`), so an autosave
+during run 1 is what run 2 loads; the harness now switches `GameSettings.AutoSave` off in
+memory for the run (`AutosaveBlock`, `DW2MP_BLOCK_AUTOSAVE=1`) and refuses a verdict if the
+newest save changes between runs. And under Windows PowerShell 5.1 `Process` has no
+one-argument ending overload: the call threw into an empty `catch` and every timed-out DW2 of
+the night stayed alive, so the scripts call the parameterless one.
