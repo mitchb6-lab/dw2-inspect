@@ -65,7 +65,13 @@ param(
     # GameStartSettings throws NullReferenceException inside
     # DWGame.InitializeSinglePlayerGame (playerEmpire is null).
     [ValidateSet('continue', 'new')]
-    [string] $Mode = 'continue'
+    [string] $Mode = 'continue',
+
+    # Keep every snapshot's raw serialised bytes here, one <run>-cycle<N>.bin per snapshot, so
+    # a divergence can be located by offset instead of only asserted by hash. Empty means no
+    # dump. Always written to DW2MP_DUMP_DIR, so a value left in the shell cannot turn a
+    # routine run into a 65 MB-per-run dump by accident.
+    [string] $DumpDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -288,6 +294,14 @@ for ($i = 1; $i -le $Runs; $i++) {
     $env:DW2MP_SESSION          = ''
     $env:DW2MP_ROLE             = ''
 
+    # Raw snapshot bytes, if asked for. Old dumps under this run's label go first, so a file
+    # from an earlier run can never be mistaken for this one's.
+    $env:DW2MP_DUMP_DIR         = $DumpDir
+    if ($DumpDir) {
+        New-Item -ItemType Directory -Path $DumpDir -Force | Out-Null
+        Remove-Item (Join-Path $DumpDir "$label-cycle*.bin") -ErrorAction SilentlyContinue
+    }
+
     if ($Mode -eq 'continue') {
         $newestSave = Get-NewestSave -GameDir $game
         if ($null -eq $pinnedSave) {
@@ -488,3 +502,11 @@ if ($Runs -lt 2) {
 
 Write-Host ''
 Write-Host "Logs: $logDir"
+
+if ($DumpDir) {
+    Write-Host "Dumps: $DumpDir"
+    Get-ChildItem $DumpDir -Filter '*.bin' -File -ErrorAction SilentlyContinue |
+        Sort-Object Name |
+        Select-Object Name, Length, LastWriteTime |
+        Format-Table -AutoSize
+}

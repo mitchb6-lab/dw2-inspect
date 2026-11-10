@@ -58,6 +58,21 @@ public static class Program
         ASessionWithTooManyPlayersIsRejected();
         AGoodSessionIsAccepted();
 
+        HashWriterLeavesBoolsOutsideAHullAlone();
+        HashWriterWritesAHullsModelLoadedFlagAsFalse();
+        HashWriterTreatsEachHullSeparately();
+        HashWriterWritesStridesEmptyBoundingBox();
+        HashWriterLeavesBoundingBoxesOutsideAHullAlone();
+        ALoadedAndAnUnloadedHullHashTheSame();
+
+        DesyncPopupNamesWhoDesynced();
+        DesyncIsDetectedOnce();
+        DesyncOffersBothButtonsThenOnlySaveAndQuit();
+        DesyncSaveAndQuitIsAlwaysAllowed();
+        DesyncSuccessClosesTheIncident();
+        DesyncMirrorsThePeersFailureCount();
+        DesyncSaveFileNameIsItsOwn();
+
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");
         foreach (var failure in _failures)
@@ -587,6 +602,237 @@ public static class Program
         var problem = JoinPolicy.ValidateSession(session);
         Check("session: a good session is accepted", problem is null, problem);
         Check("session: its slots were sanitised on the way", session.Players[1].Name == "Taylor", session.Players[1].Name);
+    }
+
+    // ------------------------------------------------------------- snapshot hash writer
+
+    /// <summary>
+    /// The 24 bytes an unloaded hull's BoundingBox serialises to, copied from run1-cycle1.bin
+    /// at offset 0x17EC4F on 2026-11-10: Minimum = float.MaxValue x3, Maximum = float.MinValue x3.
+    /// </summary>
+    private static readonly byte[] EmptyBoundingBoxBytes =
+    {
+        0xFF, 0xFF, 0x7F, 0x7F, 0xFF, 0xFF, 0x7F, 0x7F, 0xFF, 0xFF, 0x7F, 0x7F,
+        0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF,
+    };
+
+    private static void HashWriterLeavesBoolsOutsideAHullAlone()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        writer.Write(true);
+        writer.Write(false);
+        writer.Flush();
+
+        var bytes = buffer.ToArray();
+        Check("hash: bools outside a hull are written as given", bytes.Length == 2 && bytes[0] == 1 && bytes[1] == 0);
+        Check("hash: nothing normalised outside a hull", writer.FlagsNormalised == 0 && writer.HullsSeen == 0);
+    }
+
+    private static void HashWriterWritesAHullsModelLoadedFlagAsFalse()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        writer.BeginShipHull();
+        writer.Write(true);
+        writer.Write(true);
+        writer.EndShipHull();
+        writer.Write(true);
+        writer.Flush();
+
+        var bytes = buffer.ToArray();
+        Check("hash: the first bool a hull writes becomes false", bytes[0] == 0);
+        Check("hash: later bools in the same hull are untouched", bytes[1] == 1);
+        Check("hash: bools after the hull are untouched", bytes[2] == 1);
+        Check("hash: one flag counted for one hull", writer.FlagsNormalised == 1 && writer.HullsSeen == 1, writer.Summary);
+    }
+
+    private static void HashWriterTreatsEachHullSeparately()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        for (int hull = 0; hull < 3; hull++)
+        {
+            writer.BeginShipHull();
+            writer.Write(true);
+            writer.Write(true);
+            writer.TryWriteEmptyBoundingBox();
+            writer.EndShipHull();
+        }
+
+        writer.Flush();
+
+        var bytes = buffer.ToArray();
+        int bytesPerHull = 2 + SnapshotHashWriter.BoundingBoxBytes;
+        Check("hash: three hulls, three flags, three boxes", writer.HullsSeen == 3 && writer.FlagsNormalised == 3 && writer.BoundingBoxesNormalised == 3, writer.Summary);
+        Check("hash: consistent when every hull was treated alike", writer.Consistent);
+        Check("hash: each hull's first bool is false and its second is kept", bytes[0] == 0 && bytes[1] == 1 && bytes[bytesPerHull] == 0 && bytes[bytesPerHull + 1] == 1);
+    }
+
+    private static void HashWriterWritesStridesEmptyBoundingBox()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        writer.BeginShipHull();
+        bool wrote = writer.TryWriteEmptyBoundingBox();
+        writer.EndShipHull();
+        writer.Flush();
+
+        var bytes = buffer.ToArray();
+        Check("hash: empty box written inside a hull", wrote);
+        Check("hash: empty box is 24 bytes", bytes.Length == SnapshotHashWriter.BoundingBoxBytes, bytes.Length.ToString());
+        Check("hash: empty box bytes match an unloaded hull's dump", bytes.SequenceEqual(EmptyBoundingBoxBytes), Convert.ToHexString(bytes));
+    }
+
+    private static void HashWriterLeavesBoundingBoxesOutsideAHullAlone()
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        bool wrote = writer.TryWriteEmptyBoundingBox();
+        writer.Flush();
+
+        Check("hash: no box written outside a hull", !wrote && buffer.Length == 0);
+        Check("hash: nothing counted outside a hull", writer.BoundingBoxesNormalised == 0);
+    }
+
+    /// <summary>
+    /// The property the fix exists for: a hull the renderer has loaded (flag up, computed box)
+    /// and the same hull before loading (flag down, empty box) must produce identical bytes.
+    /// </summary>
+    private static void ALoadedAndAnUnloadedHullHashTheSame()
+    {
+        float[] computedBox = { -3.03f, -3.14f, -4.01f, 3.03f, 3.14f, 4.01f };
+        float[] emptyBox = { float.MaxValue, float.MaxValue, float.MaxValue, float.MinValue, float.MinValue, float.MinValue };
+
+        var loaded = WriteHullLikeTheGame(modelLoaded: true, box: computedBox);
+        var unloaded = WriteHullLikeTheGame(modelLoaded: false, box: emptyBox);
+
+        Check("hash: loaded and unloaded hull serialise identically", loaded.SequenceEqual(unloaded), $"{Convert.ToHexString(loaded)} vs {Convert.ToHexString(unloaded)}");
+        Check("hash: the hull's other fields survive", loaded.Length == 2 + 1 + 4 + 1 + SnapshotHashWriter.BoundingBoxBytes && loaded[7] == 1, loaded.Length.ToString());
+    }
+
+    /// <summary>
+    /// ShipHull.WriteToStream in miniature: id, the model-loaded flag, a size, a later bool (a
+    /// bonus flag), then SerializationHelper.WriteBoundingBox, which the mod's prefix redirects
+    /// to the writer's empty box when a hull is being written.
+    /// </summary>
+    private static byte[] WriteHullLikeTheGame(bool modelLoaded, float[] box)
+    {
+        using var buffer = new MemoryStream();
+        using var writer = new SnapshotHashWriter(buffer);
+
+        writer.BeginShipHull();
+        writer.Write((short)7);
+        writer.Write(modelLoaded);
+        writer.Write(1200);
+        writer.Write(true);
+
+        bool replaced = writer.TryWriteEmptyBoundingBox();
+        if (!replaced)
+        {
+            foreach (var component in box)
+            {
+                writer.Write(component);
+            }
+        }
+
+        writer.EndShipHull();
+        writer.Flush();
+        return buffer.ToArray();
+    }
+
+    // ------------------------------------------------------------- desync policy
+
+    private static void DesyncPopupNamesWhoDesynced()
+    {
+        var joiner = new DesyncWho { PlayerName = "Taylor", Slot = 1, IsHost = false };
+        var text = DesyncPolicy.Describe(joiner, "2026-11-10 06:47:03", 2000);
+        Check("desync: text names the joiner, slot, time and tick",
+            text == "Taylor (joiner, slot 1) is out of sync with the host's game at 2026-11-10 06:47:03 (host tick 2000).", text);
+
+        var unnamedHost = new DesyncWho { PlayerName = "", Slot = -1, IsHost = true };
+        Check("desync: an unnamed host is 'the host'", unnamedHost.Describe() == "the host (host)", unnamedHost.Describe());
+
+        var policy = new DesyncPolicy();
+        Check("desync: first options offer both buttons", policy.OptionsText().Contains("2. Attempt resync") && policy.OptionsText().Contains("attempt 1 of 2"), policy.OptionsText());
+    }
+
+    private static void DesyncIsDetectedOnce()
+    {
+        var policy = new DesyncPolicy();
+        Check("desync: nothing to choose before detection", !policy.Choose(DesyncChoice.AttemptResync));
+        Check("desync: first detection is accepted", policy.Detect() && policy.Phase == DesyncPhase.AwaitingChoice);
+        Check("desync: a second report while handling is refused", !policy.Detect());
+    }
+
+    private static void DesyncOffersBothButtonsThenOnlySaveAndQuit()
+    {
+        var policy = new DesyncPolicy();
+        policy.Detect();
+
+        Check("desync: attempt 1 accepted", policy.Choose(DesyncChoice.AttemptResync) && policy.Phase == DesyncPhase.Resyncing);
+        policy.ResyncFinished(succeeded: false);
+        Check("desync: one failure, back to the choice, resync still offered", policy.Phase == DesyncPhase.AwaitingChoice && policy.FailedResyncs == 1 && policy.OffersResync);
+
+        Check("desync: attempt 2 accepted", policy.Choose(DesyncChoice.AttemptResync));
+        policy.ResyncFinished(succeeded: false);
+        Check("desync: two failures, resync no longer offered", policy.FailedResyncs == 2 && !policy.OffersResync);
+        Check("desync: options text says only save and quit", policy.OptionsText().Contains("only option left is 1. Save and quit"), policy.OptionsText());
+        Check("desync: a third resync press is refused", !policy.Choose(DesyncChoice.AttemptResync) && policy.Phase == DesyncPhase.AwaitingChoice);
+    }
+
+    private static void DesyncSaveAndQuitIsAlwaysAllowed()
+    {
+        var policy = new DesyncPolicy();
+        policy.Detect();
+        policy.Choose(DesyncChoice.AttemptResync);
+        policy.ResyncFinished(succeeded: false);
+        policy.Choose(DesyncChoice.AttemptResync);
+        policy.ResyncFinished(succeeded: false);
+
+        Check("desync: save and quit accepted after two failures", policy.Choose(DesyncChoice.SaveAndQuit) && policy.Phase == DesyncPhase.Quitting);
+        Check("desync: nothing else accepted while quitting", !policy.Choose(DesyncChoice.AttemptResync));
+        Check("desync: 'None' is never a valid press", !new DesyncPolicy().Choose(DesyncChoice.None));
+    }
+
+    private static void DesyncSuccessClosesTheIncident()
+    {
+        var policy = new DesyncPolicy();
+        policy.Detect();
+        policy.Choose(DesyncChoice.AttemptResync);
+        policy.ResyncFinished(succeeded: false);
+        policy.Choose(DesyncChoice.AttemptResync);
+        policy.ResyncFinished(succeeded: true);
+
+        Check("desync: success returns to idle and clears the counter", policy.Phase == DesyncPhase.Idle && policy.FailedResyncs == 0);
+        Check("desync: a later desync starts fresh", policy.Detect() && policy.OffersResync && policy.NextAttemptNumber == 1);
+
+        var idle = new DesyncPolicy();
+        idle.ResyncFinished(succeeded: false);
+        Check("desync: an outcome with no resync in flight changes nothing", idle.Phase == DesyncPhase.Idle && idle.FailedResyncs == 0);
+    }
+
+    private static void DesyncMirrorsThePeersFailureCount()
+    {
+        var policy = new DesyncPolicy();
+        policy.Detect();
+        policy.Mirror(2);
+        Check("desync: the peer's higher failure count is adopted", policy.FailedResyncs == 2 && !policy.OffersResync);
+        policy.Mirror(0);
+        Check("desync: a lower count from the peer is not adopted", policy.FailedResyncs == 2);
+    }
+
+    private static void DesyncSaveFileNameIsItsOwn()
+    {
+        var name = DesyncPolicy.SaveFileName(new DateTime(2026, 11, 10, 6, 47, 3));
+        Check("desync: save name carries the date and time", name == "Desync-20261110-064703.DWGame", name);
+        Check("desync: save name never looks like an autosave or the pinned save",
+            !name.StartsWith("Autosave", StringComparison.OrdinalIgnoreCase) && !name.StartsWith("MPBase", StringComparison.OrdinalIgnoreCase));
     }
 
     // ------------------------------------------------------------- helpers

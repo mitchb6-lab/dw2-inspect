@@ -2090,3 +2090,113 @@ memory for the run (`AutosaveBlock`, `DW2MP_BLOCK_AUTOSAVE=1`) and refuses a ver
 newest save changes between runs. And under Windows PowerShell 5.1 `Process` has no
 one-argument ending overload: the call threw into an empty `catch` and every timed-out DW2 of
 the night stayed alive, so the scripts call the parameterless one.
+
+## What differed at cycle 1, and what still differs later — measured 2026-11-10
+
+The first valid two-run comparison on 1.3.8.4 (06:43, `MPBase1384.DWGame`, all DLC off) read
+"diverged at the FIRST snapshot" with identical byte counts at cycle 1. The run was repeated
+with `determinism-run.ps1 -DumpDir` (new; the mod already had `DW2MP_DUMP_DIR`) and the two
+cycle-1 streams were diffed byte for byte.
+
+**Cycle 1: 125 bytes in five groups, all renderer caches.** Each group is one `ShipHull`
+record (hulls are definitions, serialised early in the stream at 1.5–4.3 MB). In every group
+`ShipHull._ExteriorComponentBaysLoadedFromModel` was `00` in run 1 and `01` in run 2, and 23 or
+35 bytes later (MaximumSize, DisplaySize, an empty BonusList and 2 or 4 ResourcesRequired
+entries in between) the hull's `BoundingBox` was Stride's `BoundingBox.Empty`
+(`7F7FFFFF ×3, FF7FFFFF ×3`) in run 1 and a computed box in run 2. Both are filled by the
+renderer when it first loads a hull's 3D model (`ShipHull.ExamineModelForExteriorBays`), so
+they record which five hull types the camera happened to draw in the first second. The
+simulation never reads them and the game recomputes them on load. **Classification: (a),
+presentation noise.** It is the same signature the 2026-09-07 M2b run attributed to "lazy
+caches"; this time the field is named.
+
+**Fix.** The determinism hash now serialises through `SnapshotHashWriter`
+(`src\Shared\SnapshotHashWriter.cs`, pure .NET, tested) with two Harmony patches in
+`src\Dw2Mp\SnapshotHash.cs` that only act when the writer is that type: the first bool a hull
+writes is written as `false`, and `SerializationHelper.WriteBoundingBox` is redirected to the
+empty box. Nothing on the galaxy is mutated; real saves and the FullState a joiner adopts use
+a plain `BinaryWriter` and are untouched. The run log says how many hulls were normalised
+(`# hash: normalised hulls=781 flags=781 boxes=781`) and warns if the counts disagree or the
+patch is missing. The host/client comparison (`ApplyState.StructuralFingerprint`) never used
+the serialised stream, so it did not need this.
+
+**Rerun with the fix, same save, 5 snapshots, 2,000 cycles apart:**
+
+```
+   cycle       bytes  run1                run2
+       1    12861009  09518E127AF08DA9    09518E127AF08DA9
+    2001    12987093  5965108122665244    9DAA7DA3B1EE52CE    <-- DIVERGED
+    4001    12989009  4C64F3D1038AB52B    F50530ADD9153386    <-- DIVERGED
+    6001    12992998  CC2E5C599C9C35E2    3DBD9549B94D08BA    <-- DIVERGED
+    8001    13011286  8B08F27358658FEF    12359C0B22EFD62A    <-- DIVERGED
+VERDICT: identical at first, diverged at cycle 2001.
+```
+
+`fc /b` on the two cycle-1 dumps: no differences. Cycle 1 is now proven byte-identical, which
+is what makes the later rows evidence.
+
+**Cycles 2001 and later: real simulation divergence, (b).** The harness table prints run 1's
+byte column only; run 2's streams were 9.7–14.1 KB longer at every later snapshot, and the
+diffs cover 728 K–988 K bytes (5.6–7.6 % of the stream), growing each snapshot. Different
+sizes mean different numbers of entities, not drifting values. The first differing offset is
+6,513 in every case: a block of game-time `DateTime` ticks just after the galaxy header (the
+last-run times of periodic galaxy jobs) that differ by a few seconds of game time, i.e. the
+two runs scheduled the same periodic work on different ticks. DW2 also auto-paused on an
+empire message at cycle 2,398 in one run and 2,733 in the other. This matches M2b/M2c
+(2026-09-07): fixed timestep and pinned block sizes are not sufficient, and the cause is
+thread timing, not float rounding. Nothing here is a hash defect, and DW2 is not going to be
+made deterministic from a mod.
+
+**What it means for multiplayer.** Nothing changes in the design, and the measurement now
+supports it cleanly: a joiner cannot run its own copy of the simulation and stay in step, so
+the joiner does not simulate and takes the host's state (full states plus deltas), exactly as
+`mp/host-authoritative` does. The determinism harness remains the way to tell a harness or
+hash defect (cycle 1) from DW2 itself (later cycles).
+
+## Desync popup: who desynced, save and quit, attempt resync — mitch, in chat 2026-11-10
+
+"if the game desyncs please bring up an in game error and try to add a resync feature and
+button to the game. lets do the usual if there is a detected desync have an option come up
+that says who desynced. in the pop up lets have two options save and quit 1 attempt resync 2".
+
+Built on `fix/hash-noise-1110`, in `src\Dw2Mp\Desync.cs` with the pure logic in
+`src\Shared\DesyncPolicy.cs` (compiled into the mod and into `src\Dw2MpTests`).
+
+- **Detection is unchanged:** the client compares the host's structural fingerprint on every
+  `StateSummary`; three mismatches in a row are a divergence. What changes is the response.
+- **Who desynced.** The client sends `Msg.DesyncReport` (its player name and slot from the
+  session file, host tick, both fingerprints, game time). The host pauses `GameServer` and
+  both machines show the game's own two-button dialog
+  (`UserInterfaceController.ShowMessageDialogCentered`, 9-argument overload, through
+  reflection like the rest of the mod): "DESYNC DETECTED — Taylor (joiner, slot 1) is out of
+  sync with the host's game at &lt;game time&gt; (host tick N)".
+- **1. Save and quit** saves `Desync-yyyyMMdd-HHmmss.DWGame` through `DWGame.SaveGame` (its
+  own name, so the pinned harness save and the Autosave slots are never overwritten), reads
+  the file back, and exits through `Determinism.ExitProcess` so the session lock is removed.
+  The other side is told (`Msg.DesyncChoice`) and, if it is the host, resumes.
+- **2. Attempt resync**, pressed on either side: the host serves a fresh FullState (the
+  existing `_resyncRequested` path; a client press bypasses the 60 s rate floor), the client
+  adopts it, and the first summaries after the new state has landed decide — a match is
+  success, three mismatches are a failed attempt. The client sends `Msg.DesyncOutcome`; both
+  sides show "Resync succeeded" (host resumes) or the choice again. After two failed attempts
+  only "Save and quit" is offered. Both popups stay in step because every choice and outcome
+  carries the failure count and the peer mirrors it.
+- **The sim pauses** on the host while the popup is open (`GameServer.PauseGame`); the
+  watchdog's auto-resume is suppressed while `Desync.HoldsPause`.
+- **Wire format:** three new message types, so `NetSession.ProtocolVersion` is 3. Hello is
+  unchanged, so a protocol-2 peer still reads it and logs its own mismatch. All three payloads
+  are parsed defensively (strings capped, every reader in a try/catch).
+- **Dev flag:** `DW2MP_FORCE_DESYNC_AT_CYCLE=N` makes a client report a fake divergence once it
+  reaches cycle N (its fingerprint is replaced until the popup is raised, then the forcing
+  stops so a resync can genuinely succeed).
+- **Logging:** every step is a `# desync:` line in the mod log, including the popup text.
+
+Verified: `dotnet build` of the mod (0 errors, the two pre-existing CS0169 warnings) and
+126/126 checks, 22 of them on `DesyncPolicy` (who-text, detect-once, both buttons then only
+save-and-quit, save-and-quit always allowed, success resets, mirroring, save name). **Not
+verified:** the popup on screen and the resync round trip. That needs the lobby's two-instance
+session (the lobby is a WinForms launcher with no headless mode, so an agent cannot drive it
+unattended). To exercise it on one PC: start the lobby as host and joiner, set
+`DW2MP_FORCE_DESYNC_AT_CYCLE=600` in the joiner's environment before launching, and read both
+mod logs for `# desync:` lines; the popup should appear on both after the third summary past
+cycle 600. The message-parsing change should get the game-security review before it ships.

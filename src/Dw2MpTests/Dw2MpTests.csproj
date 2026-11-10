@@ -24,6 +24,8 @@
     <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
     <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
     <Compile Include="..\Shared\PeerText.cs" Link="Shared\PeerText.cs" />
+    <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
+    <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />
     <Compile Include="..\Dw2MpLobby\Session.cs" Link="Lobby\Session.cs" />
     <Compile Include="..\Dw2MpLobby\JoinPolicy.cs" Link="Lobby\JoinPolicy.cs" />
   </ItemGroup>

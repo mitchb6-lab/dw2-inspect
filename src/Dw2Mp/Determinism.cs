@@ -124,6 +124,10 @@ public static class Determinism
 
         Log($"# every={SnapshotEveryCycles} cycles  maxSnapshots={MaxSnapshots}  exitWhenDone={ExitWhenDone}");
 
+        // The hash must not see the renderer's hull model caches (2026-11-10: five hulls the
+        // camera had loaded in one run made cycle 1 read as a divergence).
+        SnapshotHash.Install(harmony, Log);
+
         // This runs before DWGame.Initialize creates the session lock, so a lock already on disk
         // belongs to a session that never ran DWGame.Destroy. DW2 then opens a Win32 "Send Error
         // Information" prompt before Stride starts and waits: no SessionLog, no GameServer, and
@@ -155,6 +159,10 @@ public static class Determinism
 
         // NetSession reuses the apply path, so install it for either consumer.
         NetSession.Install(harmony, Log);
+
+        // The desync popup (mitch, in chat 2026-11-10): resolves the game's dialog API now,
+        // raises the popup when NetSession confirms a divergence.
+        Desync.Install(Log);
 
         // Which DLC this game has, read after DWGame.Initialize; NetSession compares it
         // with the peer's and refuses to exchange state on a mismatch.
@@ -202,7 +210,17 @@ public static class Determinism
             if (now == lastSeen || IsPaused())
             {
                 Log($"# watchdog {secs}s: {now} cycle(s) — {(now == lastSeen ? "STALLED" : "PAUSED")}. {DescribeStall()}");
-                if (KeepRunning) ClearStall();
+
+                // A desync popup holds the pause on purpose; resuming here would let the
+                // host run on while the players are still deciding.
+                if (KeepRunning && Desync.HoldsPause)
+                {
+                    Log("# watchdog: not resuming -- a desync popup holds the pause");
+                }
+                else if (KeepRunning)
+                {
+                    ClearStall();
+                }
             }
             else Log($"# watchdog {secs}s: {now} cycle(s)");
 
@@ -303,6 +321,7 @@ public static class Determinism
             NetSession.SetServer(__instance);
             NetSession.HostTick(galaxy, n);
             NetSession.ClientHeartbeatTick(n);
+            Desync.NoteTick(n);
 
             if (MeasureApply && ApplyState.Ready)
             {
@@ -475,8 +494,12 @@ public static class Determinism
         if (Env("DW2MP_MEASURE_TRANSFER", "0") == "1")
             StateTransfer.Measure(galaxy, _writeToStream, _galaxyDataType, Log);
 
-        var (hashA, bytes) = HashGalaxy(galaxy);
-        var (hashB, _) = HashGalaxy(galaxy);
+        // Only the first serialisation is kept on disk: the second exists to prove the
+        // instant was stable, and a stable pair is byte-identical anyway.
+        string dumpName = $"{Env("DW2MP_RUN_LABEL", "run")}-cycle{cycle}.bin";
+        bool reportNormalisation = _snapshotsTaken == 0;
+        var (hashA, bytes) = HashGalaxy(galaxy, dumpName, reportNormalisation);
+        var (hashB, _) = HashGalaxy(galaxy, null, false);
 
         bool stable = hashA == hashB && hashA is not null;
 
@@ -552,40 +575,56 @@ public static class Determinism
         }
     }
 
-    private static (string Hash, long Bytes) HashGalaxy(object galaxy)
+    /// <summary>
+    /// Serialise the galaxy the way a save does, through SnapshotHash (which normalises the
+    /// renderer's hull caches), and hash the result. When DW2MP_DUMP_DIR is set and a dump
+    /// name is given, the hashed bytes are also written there (overwriting a file of the same
+    /// name from an earlier run, so a stale dump can never pose as this run's). With
+    /// reportNormalisation the log gets one line saying how many hulls were normalised, or a
+    /// warning when the normalisation is missing or inconsistent.
+    /// </summary>
+    private static (string Hash, long Bytes) HashGalaxy(object galaxy, string dumpName, bool reportNormalisation)
     {
         try
         {
-            // Fresh GameGalaxyData: it carries ViewPosition and stopwatch values which
-            // vary every run and would manufacture a divergence out of nothing.
-            var galaxyData = Activator.CreateInstance(_galaxyDataType);
+            var result = SnapshotHash.Compute(galaxy, _writeToStream, _galaxyDataType);
+            byte[] raw = result.Raw;
 
-            using var buffer = new MemoryStream();
-            using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
+            if (reportNormalisation)
             {
-                _writeToStream.Invoke(galaxy, new[] { writer, galaxyData });
-                writer.Flush();
+                if (!SnapshotHash.Installed)
+                {
+                    Log("# hash: WARNING hull model caches are NOT normalised (patch missing); a cycle-1 divergence may be the renderer, not the simulation");
+                }
+                else if (!result.Consistent)
+                {
+                    Log($"# hash: WARNING hull normalisation inconsistent ({result.Normalisation}); the hull stream layout may have changed, so the hash may still carry renderer state");
+                }
+                else
+                {
+                    Log($"# hash: normalised {result.Normalisation}");
+                }
             }
-
-            byte[] raw = buffer.ToArray();
 
             // Optionally keep the bytes. A hash tells you THAT two runs differ; only the
             // bytes tell you WHERE, which is the difference between "a timestamp field
             // in the header" and "float drift scattered through every entity". Those
             // need completely different responses.
-            if (DumpDir is { Length: > 0 })
+            if (DumpDir is { Length: > 0 } && dumpName is { Length: > 0 })
             {
                 try
                 {
                     Directory.CreateDirectory(DumpDir);
-                    var name = $"{Env("DW2MP_RUN_LABEL", "run")}-cycle{Interlocked.Read(ref _cycleCount)}.bin";
-                    var path = Path.Combine(DumpDir, name);
-                    if (!File.Exists(path)) File.WriteAllBytes(path, raw);
+                    var path = Path.Combine(DumpDir, dumpName);
+                    File.WriteAllBytes(path, raw);
                 }
-                catch (Exception ex) { Log("# dump failed: " + ex.Message); }
+                catch (Exception ex)
+                {
+                    Log("# dump failed: " + ex.Message);
+                }
             }
 
-            return (Convert.ToHexString(SHA256.HashData(raw))[..16], raw.LongLength);
+            return (result.Hash, raw.LongLength);
         }
         catch (Exception ex)
         {
