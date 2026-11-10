@@ -21,7 +21,7 @@ this page is about your end.
 |---|---|---|
 | OS | Windows 10/11, x64 | — |
 | Game | **Distant Worlds 2 on Steam, build 1.3.6.3** | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
-| **DLC** | **the same content packs as the host** — the host has all four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* | run the launcher: it logs `Content packs on disk: …` on its Log tab at start, and refuses to start a session whose two players differ |
+| **DLC** | **the same content packs as the host, installed and ticked in Steam** — the host has four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* (not *Shadows Rising*) | run the launcher: its Log tab lists every pack at start (`Content packs installed: …`, then one line per pack saying *bundles on disk*, *unticked in Steam* or *bundles not on disk*). The host **refuses the join** of a player whose packs differ and both players see a dialog naming the packs and the side that has them. Fix: the joiner buys and installs the packs, or the host unticks the extra ones in Steam (*Distant Worlds 2 > Properties > DLC*) so both report the base game |
 | .NET SDK | **9.0 or later** | `dotnet --list-sdks` |
 | git | any | `git --version` |
 | GitHub access | **none needed** — the repo is public (since 2026-09-10; it was private when this page was written) | `git clone` works without signing in |

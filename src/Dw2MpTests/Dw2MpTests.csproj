@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      A console runner with no test framework: this repo has no NuGet dependencies and gains
+      none here. Run it with "dotnet run" and the project option pointing at src\Dw2MpTests;
+      exit code 0 means every check passed, 1 names the failures. The same pattern as
+      StateDelta.SelfTest in the mod.
+    -->
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>Dw2MpTests</AssemblyName>
+    <RootNamespace>Dw2MpTests</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- The code under test is the shared source the mod and the lobby both compile in. -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
+    <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
+  </ItemGroup>
+
+</Project>

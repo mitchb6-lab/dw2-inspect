@@ -26,6 +26,15 @@
   </PropertyGroup>
 
   <!--
+    Shared SOURCE, not a shared assembly: the mod may carry no DLL the game does not already
+    have, and the lobby must not depend on the mod. The content-pack comparison is one file
+    compiled into both (and into src\Dw2MpTests, which is where it is tested).
+  -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
+  </ItemGroup>
+
+  <!--
     Private=false / CopyLocal off on every one of these: at runtime the game has
     already loaded them. Shipping our own copies risks binding a second, different
     instance of the same assembly, which is how a Harmony patch silently applies to

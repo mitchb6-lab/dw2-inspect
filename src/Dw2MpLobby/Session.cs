@@ -1,7 +1,29 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Dw2MpShared;
 
 namespace Dw2MpLobby;
+
+/// <summary>
+/// The lobby protocol number: the shape of session.json AND of the lobby's own messages
+/// (Join, Session, Start, Refused), because the Join and Session payloads ARE this file's
+/// types. One number, checked in both directions before a session can start.
+///
+/// History:
+///   1  2026-09-07  the first lobby. Slots carried only names; no version check of any kind.
+///   2  2026-11-09  slots carry lobbyProtocol, gameVersion and contentPackDetails (name,
+///                  installed, Steam app id, depot manifest). The host refuses a join whose
+///                  protocol, game build or content packs differ, with a Refused message
+///                  naming the difference, and the joiner refuses a Session from an older host.
+///
+/// The mod reads the same number from session.json (SessionConfig.ExpectedProtocolVersion);
+/// bump both together. This is separate from NetSession.ProtocolVersion, which is the mod's
+/// in-game wire format (2 since 2026-09-10) and is unchanged by this.
+/// </summary>
+public static class LobbyProtocol
+{
+    public const int Version = 2;
+}
 
 /// <summary>
 /// The contract between the lobby and the mod, written as session.json.
@@ -11,8 +33,8 @@ namespace Dw2MpLobby;
 /// </summary>
 public sealed class SessionDescriptor
 {
-    /// <summary>Bumped when the shape changes, so a stale file fails loudly.</summary>
-    public int ProtocolVersion { get; set; } = 1;
+    /// <summary>Bumped when the shape changes, so a stale file fails loudly. See LobbyProtocol.</summary>
+    public int ProtocolVersion { get; set; } = LobbyProtocol.Version;
 
     /// <summary>"coop-shared" or "competitive".</summary>
     public string Mode { get; set; } = "coop-shared";
@@ -90,12 +112,37 @@ public sealed class PlayerSlot
     public EmpireConfig Empire { get; set; } = new();
 
     /// <summary>
+    /// The lobby protocol this player's launcher speaks (LobbyProtocol.Version). A slot from
+    /// a protocol-1 launcher deserialises with 0 here, which is how the host tells "older
+    /// launcher" apart from "same launcher, fewer packs" and refuses with the right message.
+    /// </summary>
+    public int LobbyProtocol { get; set; }
+
+    /// <summary>
+    /// DistantWorlds2.exe's product version on this player's machine ("1.3.6.3"), or
+    /// "unknown". The mod checks the game assembly version again in-game; checking the exe
+    /// here saves two four-minute loads when the builds differ.
+    /// </summary>
+    public string GameVersion { get; set; } = "unknown";
+
+    /// <summary>
     /// DLC present in this player's game folder, by content-pack name. Compared by the host
     /// on join: a galaxy generated with a pack cannot be drawn by a game without it (the
     /// first two-PC join crashed on a Planet Destroyer texture from Return of the Shakturi).
     /// Presence on disk is the launcher's view; the mod checks ownership again in-game.
+    ///
+    /// Kept as plain names since protocol 1 so a protocol-1 host still reads this slot.
+    /// The full picture is ContentPackDetails.
     /// </summary>
     public List<string> ContentPacks { get; set; } = new();
+
+    /// <summary>
+    /// Every content pack the game knows, as this machine sees it: installed or not, the
+    /// Steam app id, the Steam depot manifest (the pack's version) and where the answer came
+    /// from. Protocol 2. The host compares installed sets and versions and refuses the join
+    /// when they differ. See Dw2MpShared.ContentPackEntry.
+    /// </summary>
+    public List<ContentPackEntry> ContentPackDetails { get; set; } = new();
 }
 
 /// <summary>Maps one-to-one onto DW2's GameStartSettingsEmpire.</summary>

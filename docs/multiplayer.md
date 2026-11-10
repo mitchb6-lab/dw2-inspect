@@ -2031,3 +2031,38 @@ a watchdog that un-pauses the game the host just paused is a bug wearing a safet
 Verified on loopback, 15 stars, 180 s: content OK both ways, host at 1x (67 s of game time
 per 67 s of wall time), deltas every ~1 s at 135 B, client following, **0 crash dumps, 0
 mutation failures**.
+
+## Content parity, second pass: refused in the lobby, versions, and one comparison — 2026-11-09
+
+mitch re-enabled the four DLC on his PC and Taylor's PC probably owns none, so the
+2026-09-10 content check got its second pass before the next two-PC attempt. The lobby side
+is described in `lobby.md` (*Content packs are checked before anyone launches*); the
+mod-side changes are these.
+
+- **Any handshake mismatch now blocks state.** `ReadHello` used to log `PROTOCOL MISMATCH`
+  and `GAME VERSION MISMATCH` and carry on exchanging state anyway; only a content mismatch
+  stopped it. All three axes now feed one `_incompatibility` reason (first one wins, so the
+  log names the cause), and `IncompatibilityBlocksState` refuses to send or adopt state on
+  any of them. The wire format is unchanged -- Hello still carries protocol, game version
+  and mode in that order; Content is still `Name=1;Name=0` -- so `NetSession.ProtocolVersion`
+  stays at 2 and an older peer logs its own mismatch line against our number.
+- **One comparison, tested.** `ContentPacks.Compare` now delegates to
+  `src\Shared\ContentPackCompare.cs`, the same source the lobby compiles in, and
+  `src\Dw2MpTests` covers it (the protocol-2 wire string parsing exactly is one of the
+  checks, so the format cannot drift without a failure).
+- **The session file carries a protocol number the mod now checks.** `SessionConfig` logs
+  `*** PROTOCOL MISMATCH ***` when `session.json` is not `ExpectedProtocolVersion` (2). A
+  loud line, not a refusal: the lobby writes the file fresh at every launch, so a mismatch
+  means the lobby and the mod on one machine came from different packages.
+- **What the game reports, exactly.** `DistantWorlds.Types.ContentPack` has `Name`,
+  `Installed`, `SteamAppId`, `GOGClientId`, `MatrixRegKey`, `BundleNames`, `BundleSubFiles` and
+  store URLs -- no version field. Versions therefore come from Steam's depot manifests in the
+  lobby, and the in-game check compares installed sets only, as before.
+- **Build drift noted.** `DistantWorlds2.exe` is now `1.3.8.4+820e12…` (Steam buildid
+  26240608); several docs still say 1.3.6.3. The checks compare whatever both sides have,
+  so the number in the docs is informational.
+
+Verified: `dotnet build` of the mod, the lobby and the test runner (0 new warnings; the two
+`CS0169` unused-field warnings in `NetSession` predate this), 44/44 checks, and the
+inventory reader run against the real install. Not verified: anything that needs a launch or
+a second PC -- see the end of the lobby.md section for what to look for.
