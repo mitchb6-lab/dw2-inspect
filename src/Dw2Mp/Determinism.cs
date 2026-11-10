@@ -124,6 +124,12 @@ public static class Determinism
 
         Log($"# every={SnapshotEveryCycles} cycles  maxSnapshots={MaxSnapshots}  exitWhenDone={ExitWhenDone}");
 
+        // This runs before DWGame.Initialize creates the session lock, so a lock already on disk
+        // belongs to a session that never ran DWGame.Destroy. DW2 then opens a Win32 "Send Error
+        // Information" prompt before Stride starts and waits: no SessionLog, no GameServer, and
+        // nothing in this log said why on 2026-11-09.
+        WarnIfStaleSessionLock();
+
         // Install FixedStep FIRST: the clock must already be deterministic by the time
         // the first cycle runs, or snapshot 0 is taken under different rules to the rest.
         FixedStep.Install(harmony, StepMilliseconds, PinBlocks, () => Interlocked.Read(ref _cycleCount), Log);
@@ -479,7 +485,64 @@ public static class Determinism
         if (!ExitWhenDone) return;
 
         Log("# exiting");
-        Environment.Exit(0);
+        ExitProcess(0);
+    }
+
+    /// <summary>
+    /// Leave the process the way the game's own shutdown would. DWGame.Destroy is the only
+    /// caller of RemoveSessionFile, and Environment.Exit skips Destroy, so every harness exit
+    /// left data\SessionActive behind. On 2026-11-09 the next launch then hung on the game's
+    /// "Send Error Information" prompt with nobody there to click.
+    /// </summary>
+    public static void ExitProcess(int exitCode)
+    {
+        try
+        {
+            var gameType = AccessTools.TypeByName("DistantWorlds2.DWGame");
+            var removeSessionFile = gameType is null ? null : AccessTools.Method(gameType, "RemoveSessionFile");
+
+            if (removeSessionFile is null)
+            {
+                Log("# exit: DWGame.RemoveSessionFile not found; data\\SessionActive may be left behind");
+            }
+            else
+            {
+                var target = removeSessionFile.IsStatic ? null : ApplyState.Game;
+                removeSessionFile.Invoke(target, null);
+
+                var lockGone = !File.Exists(SessionLockPath);
+                Log($"# exit: DWGame.RemoveSessionFile called; data\\SessionActive removed = {lockGone}");
+            }
+        }
+        catch (Exception ex)
+        {
+            var cause = ex.InnerException ?? ex;
+            Log("# exit: RemoveSessionFile failed " + cause.GetType().Name + ": " + cause.Message);
+        }
+
+        Environment.Exit(exitCode);
+    }
+
+    /// <summary>The game's session lock, relative to the executable: the game's VFS roots at data\.</summary>
+    private static string SessionLockPath => Path.Combine(AppContext.BaseDirectory, "data", "SessionActive");
+
+    /// <summary>Read-only: says a stale lock is there and what it will do. It does not delete anything.</summary>
+    private static void WarnIfStaleSessionLock()
+    {
+        try
+        {
+            if (!File.Exists(SessionLockPath))
+            {
+                return;
+            }
+
+            var marker = File.ReadAllText(SessionLockPath).Trim();
+            Log($"# session: STALE LOCK data\\SessionActive ('{marker}') -- DW2 will stop at its 'Send Error Information' prompt before loading anything. An unattended run cannot continue: delete that file and relaunch.");
+        }
+        catch (Exception ex)
+        {
+            Log("# session: could not inspect data\\SessionActive " + ex.GetType().Name);
+        }
     }
 
     private static (string Hash, long Bytes) HashGalaxy(object galaxy)
