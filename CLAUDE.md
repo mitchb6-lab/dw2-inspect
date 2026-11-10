@@ -1,7 +1,11 @@
 # CLAUDE.md — dw2-inspect
 
-A CLI that reads the code inside **Distant Worlds 2** (Stride / .NET 8). One project,
-`src/Dw2Inspect`, no dependencies beyond the .NET 9 SDK.
+A CLI that reads the code inside **Distant Worlds 2** (Stride / .NET 8). ~~One project,
+`src/Dw2Inspect`, no dependencies beyond the .NET 9 SDK.~~ (corrected 2026-11-10: the repo
+now holds more than one project.) The CLI is `src/Dw2Inspect`, with no dependencies beyond
+the .NET 9 SDK. Beside it are the multiplayer prototype: the in-game mod `src/Dw2Mp`, the
+launcher `src/Dw2MpLobby`, the stub transport peer `src/Dw2MpProbe`, the test runner
+`src/Dw2MpTests`, and source shared by them in `src/Shared`. See `docs/multiplayer.md`.
 
 ## The one thing to know
 
@@ -20,10 +24,14 @@ line in this codebase. Call it before reading any body. After it, plain
 
 ## Layout
 
+The CLI, in `src/Dw2Inspect`:
+
 | File | Holds |
 |---|---|
 | `Program.cs` | CLI parsing, usage text, exit codes (0 ok, 1 error, 2 bad command) |
-| `Commands.cs` | The verbs: types, find, members, enum, strings, il, refs |
+| `Commands.cs` | The verbs: ~~types, find, members, enum, strings, il, refs~~ (corrected 2026-11-10: `attrs` was missing) types, find, members, enum, strings, il, attrs, refs |
+| `AttributePrinter.cs` | Renders custom attributes for `attrs`, from metadata, without constructing them (added 2026-11-10: missing from this table) |
+| `Log.cs` | Warnings to stderr, silenced by `--quiet` (added 2026-11-10: missing from this table) |
 | `Loader.cs` | Assembly loading, dependency resolution, the static-constructor trick |
 | `IlPrinter.cs` | IL decoding and metadata-token resolution |
 | `GameLocator.cs` | Finds the install via `--game`, `DW2_PATH`, or `libraryfolders.vdf` |
