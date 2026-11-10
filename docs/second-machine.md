@@ -20,8 +20,8 @@ this page is about your end.
 | | Requirement | How to check |
 |---|---|---|
 | OS | Windows 10/11, x64 | — |
-| Game | **Distant Worlds 2 on Steam, build 1.3.6.3** | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
-| **DLC** | **the same content packs as the host, installed and ticked in Steam** — the host has four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* (not *Shadows Rising*) | run the launcher: its Log tab lists every pack at start (`Content packs installed: …`, then one line per pack saying *bundles on disk*, *unticked in Steam* or *bundles not on disk*). The host **refuses the join** of a player whose packs differ and both players see a dialog naming the packs and the side that has them. Fix: the joiner buys and installs the packs, or the host unticks the extra ones in Steam (*Distant Worlds 2 > Properties > DLC*) so both report the base game |
+| Game | **Distant Worlds 2 on Steam, build ~~1.3.6.3~~ 1.3.8.4** *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)* | `(Get-Item "$env:ProgramFiles (x86)\Steam\steamapps\common\Distant Worlds 2\DistantWorlds2.exe").VersionInfo.FileVersion` — but see the note below the table |
+| **DLC** | **the same content packs as the host, installed and ticked in Steam** — the host has four: *Factions: Ikkuro and Dhayut*, *Factions: Quameno and Gizureans*, *Return of the Shakturi*, *Factions: Atuuk and Wekkarus* (not *Shadows Rising*) | run the launcher: its Log tab lists every pack at start (`Content packs installed: …`, then one line per pack saying *bundles on disk*, *unticked in Steam* or *bundles not on disk*). The host **refuses the join** of a player whose packs differ and both players see a dialog naming the packs and the side that has them. Fix: the joiner buys and installs the packs, or the host unticks the extra ones in Steam (*Distant Worlds 2 > Properties > DLC*) so both report the base game *(2026-11-09: mitch disabled all DLC for the sessions with Taylor, so both PCs run the base game; the lobby's content check (PR #8) must then show every pack NOT installed on both sides)* |
 | .NET SDK | **9.0 or later** | `dotnet --list-sdks` |
 | git | any | `git --version` |
 | GitHub access | **none needed** — the repo is public (since 2026-09-10; it was private when this page was written) | `git clone` works without signing in |
@@ -31,7 +31,7 @@ this page is about your end.
 **The game version must match exactly.** The handshake compares it and logs
 `*** GAME VERSION MISMATCH ***` and stops if it does not. State transfer is DW2's own
 serialised galaxy, so different builds exchange bytes that deserialise into nonsense.
-The host is on **1.3.6.3**. If yours differs, one of you updates through Steam; there is
+The host is on ~~**1.3.6.3**~~ **1.3.8.4** *(corrected 2026-11-09: 1.3.8.4, verified against the installed `DistantWorlds2.exe` and Steam buildid 26240608)*. If yours differs, one of you updates through Steam; there is
 no workaround.
 
 **The game must be installed before you build.** The mod compiles against
