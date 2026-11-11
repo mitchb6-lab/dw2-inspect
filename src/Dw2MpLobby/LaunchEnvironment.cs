@@ -40,6 +40,49 @@ public static class LaunchEnvironment
         "DW2MP_OVERLAY_RELEASE",
     };
 
+    /// <summary>The one inherited switch on the list above that changes what the mod does.</summary>
+    public const string OverlayReleaseSwitchName = "DW2MP_OVERLAY_RELEASE";
+
+    private const int ShownValueLimit = 16;
+
+    /// <summary>
+    /// The lobby's log line for an inherited DW2MP_OVERLAY_RELEASE that it passes on to the game,
+    /// or null when the variable is not set (security review of 2026-11-11, N6: a switch that
+    /// reaches a real session must not do so silently). The value is shown with only its letters
+    /// and digits, cut to 16 characters, because it comes from the shell.
+    /// </summary>
+    public static string PassedThroughNote(string overlayReleaseValue)
+    {
+        if (overlayReleaseValue is null)
+        {
+            return null;
+        }
+
+        string trimmed = overlayReleaseValue.Trim();
+
+        string shown = "";
+        foreach (char character in trimmed)
+        {
+            if (shown.Length >= ShownValueLimit)
+            {
+                break;
+            }
+
+            if (char.IsAsciiLetterOrDigit(character))
+            {
+                shown += character;
+            }
+        }
+
+        string meaning = "the release stays ON (only 0 switches it off)";
+        if (trimmed == "0")
+        {
+            meaning = "the joiner's game will NOT release the render targets DW2 discards at each adoption, about 32 MB each time";
+        }
+
+        return $"Passing {OverlayReleaseSwitchName}={shown} from this shell on to the game: {meaning}";
+    }
+
     /// <summary>The inherited DW2MP_* names to remove before launching. Empty in developer mode.</summary>
     public static List<string> NamesToStrip(IEnumerable<string> environmentNames, bool developerMode)
     {

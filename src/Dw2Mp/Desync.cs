@@ -739,7 +739,7 @@ public static class Desync
         ArmAutoChoice();
     }
 
-    private static void QueueInfoDialog(string title, string text)
+    private static bool QueueInfoDialog(string title, string text)
     {
         var ok = new DialogButton
         {
@@ -748,25 +748,47 @@ public static class Desync
             OnClick = () => { },
         };
 
-        QueueDialog(title, text, ok, null);
+        return QueueDialog(title, text, ok, null);
     }
 
     /// <summary>
     /// A one-button notice from another part of the mod (the session memory budget). Shown on
     /// the main thread like every other popup here, and logged even when the UI is unavailable.
+    ///
+    /// Returns true when the notice was handed on. Returns false, having done and logged
+    /// nothing, while a desync incident is open or the popup queue is full: the caller keeps
+    /// the notice and offers it again (security review of 2026-11-11, M3).
     /// </summary>
-    internal static void QueueNotice(string title, string text)
+    internal static bool QueueNotice(string title, string text)
     {
-        QueueInfoDialog(title, text);
+        DesyncPhase phase = CurrentPhase();
+        if (!UnrelatedNotice.MayQueueNow(phase))
+        {
+            return false;
+        }
+
+        lock (PendingDialogs)
+        {
+            if (PendingDialogs.Count >= MaxPendingDialogs)
+            {
+                return false;
+            }
+        }
+
+        return QueueInfoDialog(title, text);
     }
 
-    private static void QueueDialog(string title, string text, DialogButton first, DialogButton second)
+    /// <summary>
+    /// Returns true when the popup was queued for the main thread, or when there is no UI and
+    /// the log line is all this game can show; false when it was dropped because the queue was full.
+    /// </summary>
+    private static bool QueueDialog(string title, string text, DialogButton first, DialogButton second)
     {
         _log($"# desync: popup queued -- {title}: {text.Replace("\n", " | ")}");
 
         if (!_uiAvailable)
         {
-            return;
+            return true;
         }
 
         lock (PendingDialogs)
@@ -779,11 +801,13 @@ public static class Desync
                     _log($"# desync: more than {MaxPendingDialogs} popups waiting for the main thread; dropping the newest (logged once)");
                 }
 
-                return;
+                return false;
             }
 
             PendingDialogs.Enqueue(new PendingDialog { Title = title, Text = text, First = first, Second = second });
         }
+
+        return true;
     }
 
     /// <summary>Main thread (DWGame.Update, via NetSession). Shows whatever the network thread queued and enforces the resync deadline.</summary>

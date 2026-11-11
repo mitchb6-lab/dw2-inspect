@@ -722,6 +722,14 @@ public sealed class LobbyForm : Form
             Log($"Removed {namesToStrip.Count} inherited DW2MP_ variable(s) from the game's environment: {string.Join(", ", namesToStrip)}");
         }
 
+        // The one inherited switch that is allowed through changes what the mod does, so say so.
+        psi.Environment.TryGetValue(LaunchEnvironment.OverlayReleaseSwitchName, out string overlayReleaseValue);
+        string passedThroughNote = LaunchEnvironment.PassedThroughNote(overlayReleaseValue);
+        if (passedThroughNote is not null)
+        {
+            Log(passedThroughNote);
+        }
+
         Log($"Launching {psi.FileName}");
         Process.Start(psi);
     }

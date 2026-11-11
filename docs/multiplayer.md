@@ -2727,7 +2727,9 @@ and unmeasured here.
   leaves two players in two galaxies, which is worse than a large process.
   `DW2MP_MEMORY_BUDGET_MB` overrides the limit (clamped to 16 MB to 64 GB; the lobby strips it
   from a real session like every other variable it does not set). Seen in run 2 with the limit
-  at 64 MB: the notice was queued and shown at the fourth adoption.
+  at 64 MB: the notice was queued and shown at the fourth adoption. (corrected 2026-11-11: the
+  override is now a dev flag in the mod as well. Without `DW2MP_DEV=1` the mod ignores it and
+  says so; see "Hardening after the security review" below.)
 - New dev flags, all needing `DW2MP_DEV=1` and all logged as `*** DEV FLAG LIVE ***`:
   `DW2MP_ADOPTION_MEMORY_PROBE=<n>` (the probe from adoption n on) and
   `DW2MP_ADOPTION_MEMORY_AGGRESSIVE_AT=<n>` (one aggressive collect at adoption n's settled
@@ -2777,7 +2779,10 @@ Guards, in the order they apply:
   rather than draw into a disposed render target.
 - The first exception anywhere is logged once (`# overlay: *** FAILED ...`) and the release stops
   for the rest of the session. That leaves DW2's own behaviour: the leak.
-- The list holds at most 64 instances; past that a replacement is counted and not queued.
+- The list holds at most ~~64 instances~~ **8 render targets** (corrected 2026-11-11, security
+  review); past that a replacement is counted and not queued. It holds the render target
+  strongly and the discarded instance only weakly, because the instance still points at the
+  galaxy it was built for.
 
 ### Why the old render target is no longer referenced (read in the IL, game 1.3.8.4)
 
@@ -2801,8 +2806,13 @@ methods, with a scratch tool built on the `dw2inspect` loader and IL printer) fo
   disposed one once it is released. That stale entry is never drawn: the only code that applies
   those effects is `MapOverlaySystem.Draw`, which sets `Image` to its own `BackBuffer` first.
   It is also why the effects themselves are **not** disposed with a discarded instance.
-- `MapOverlaySystem.Draw` itself skips a `BackBuffer` that is null or `IsDisposed`.
-  `UpdateOverlay` does not, which is the reason for the `Enabled = false` above.
+- ~~`MapOverlaySystem.Draw` itself skips a `BackBuffer` that is null or `IsDisposed`.~~
+  (corrected 2026-11-11, security review: **that check is not a barrier.** It is at
+  `Draw` IL_0113..IL_0128, after `Draw` has called `UpdateOverlay` at IL_0046, and
+  `UpdateOverlay` binds and clears `BackBuffer` unchecked whenever two seconds have passed or
+  `ForceRefresh` is set. A discarded instance that somebody did draw would use the disposed
+  render target before the check is reached. The two real barriers are the unreachability
+  shown in the points above and the `Enabled = false` set on the discarded instance.)
 
 What the IL of DW2 cannot show is what Stride does with a disposed texture that is still named
 in a parameter collection nobody applies. The run below is the evidence for that part.
@@ -2875,3 +2885,34 @@ short of `DW2MP_DEV=1`, which enables every dev flag. The off path was not run i
 - Host side: not installed. The host re-creates its systems once, when it loads the save.
 - One PC, one GPU and driver, the 30-star harness galaxy. Not tried on the late-game save, with
   DLC content, or between two machines.
+
+## Hardening after the security review of the two sections above -- 2026-11-11
+
+Built on `fix/memory-hardening-1111`. The post-merge game-security review of PR #16 and #17
+found no blocker and nine things to tighten. Wire protocol unchanged (net protocol **4**);
+nothing in the simulation is read or written.
+
+| | What a hostile host (or shell) could do | What changed |
+|---|---|---|
+| M1 | Send full states back to back for the 60 s Resyncing phase of a desync incident; every one counted as "asked for" and was adopted at once, about 45 MB of native memory each | `SolicitedStateExemptions` (`src\Shared\SyncGuards.cs`): the join and each request this side sends are good for **one** adoption attempt. `Desync.VerifyingResync` no longer exempts anything. The next state waits its 30 s like any unsolicited one |
+| M1 | Park one whole old galaxy (26 MB) per queue slot in the overlay release for its 10 s delay, 64 slots | `DiscardedResourceQueue` holds the render target strongly and the discarded `MapOverlaySystem` **weakly**; the ceiling is 8. `Enabled = false` is set at release time if the instance is still alive; a collected one is in no field by definition |
+| M2 | Send a state every 19 s so the 20 s "settled" reading, which feeds the memory budget, was pushed back for ever | `SettledReadingSchedule` (`src\Shared\SessionMemoryBudget.cs`): a reading that is already due keeps its time, and after it the newest adoption gets its own. Under a flood there is a reading every 20 s |
+| M3 | Keep a desync incident open so the one memory notice of the session was dropped from the two-deep popup queue, yet counted as given | `Desync.QueueNotice` returns whether it queued and declines while an incident is open or the queue is full; the budget marks the notice given only on `ConfirmNoticeGiven()`. A waiting notice is offered again every frame |
+| N1 | (a game patch) change who holds a `MapOverlaySystem` | `OverlayRelease` switches itself off, with one log line, unless the game build is one of `SnapshotHash.KnownBuildPrefixes` (1.3.8.4) |
+| N2 | (wrong text) | The claim that `Draw`'s null/disposed check protects a discarded instance is corrected in `OverlayRelease.cs` and above |
+| N3 | Plant `DW2MP_MEMORY_BUDGET_MB` in a shell that starts the game without the lobby, to silence the notice | The mod honours it only with `DW2MP_DEV=1` and logs `*** DEV FLAG LIVE ***`; without it, one line says it was ignored |
+| N4 | (silent dev flag) | `DW2MP_ADOPTION_MEMORY_AGGRESSIVE_AT` on its own now prints its `*** DEV FLAG LIVE ***` line |
+| N5 | (untested) | The lobby strip test covers `DW2MP_MEMORY_BUDGET_MB` and `DW2MP_ADOPTION_MEMORY_AGGRESSIVE_AT` |
+| N6 | Pass `DW2MP_OVERLAY_RELEASE` through the lobby unnoticed | The lobby logs the value it passes on (letters and digits only, 16 characters) and what it means |
+
+**Does M1 slow an honest session?** No path was found where it does, and it was not run in the
+game. An honest host serves at most one full state per 60 s (its own floor), plus one for a
+desync resync, which this side has asked for and so adopts at once. The one ordering that now
+waits: a keyframe already on the wire when "Attempt resync" is chosen lands first and spends
+the exemption, and the resync state behind it is held for up to 30 s. It is still adopted and
+checked inside the 60 s resync deadline.
+
+Not run in the game: every change here is covered by the console tests (431 checks) or is a log
+line. The weak-reference change means the build that was run on 2026-11-11 (two two-instance
+runs, above) is not byte for byte the one on this branch; the release path itself (same
+texture, same `Dispose`, same main-thread moment) is unchanged.

@@ -1175,8 +1175,11 @@ public static class NetSession
 
         // A full state this side did not ask for waits until enough time has passed since
         // the last adoption (AdoptionGate): every adoption costs native memory that never
-        // comes back, and the host decides when to send one. Asked-for states are never held.
-        bool solicited = _syncsApplied == 0 || _resyncOutstanding || Desync.VerifyingResync;
+        // comes back, and the host decides when to send one. An asked-for state is not held,
+        // but each asking is good for ONE adoption attempt (SolicitedStateExemptions): the join,
+        // or a request this side sent. The whole Resyncing phase of a desync incident used to
+        // count, which let a host send states back to back for its 60 seconds.
+        bool solicited = _solicitedStates.NextStateIsSolicited;
         double secondsSinceLastAdoption = SecondsSince(_lastAdoptionStamp);
         if (!AdoptionGate.MayAdoptNow(solicited, secondsSinceLastAdoption))
         {
@@ -1210,7 +1213,7 @@ public static class NetSession
         }
 
         _loggedAdoptionHold = false;
-        _resyncOutstanding = false;
+        _solicitedStates.SpendOnAdoptionAttempt();
         _lastAdoptionStamp = Stopwatch.GetTimestamp();
 
         if (ApplyState.ApplyBytes(newest, out var info))
@@ -1226,7 +1229,7 @@ public static class NetSession
     }
 
     private static long _lastAdoptionStamp;
-    private static volatile bool _resyncOutstanding;
+    private static readonly SolicitedStateExemptions _solicitedStates = new();
     private static bool _loggedAdoptionHold;
     private static long _unsolicitedStatesHeld;
 
@@ -1705,7 +1708,7 @@ public static class NetSession
 
         _lastResyncRequest = DateTime.UtcNow;
         _resyncsRequested++;
-        _resyncOutstanding = true;
+        _solicitedStates.NoteStateRequested();
 
         Send(Msg.ResyncRequest, Array.Empty<byte>());
         _log($"# net[client]: requested full state #{_resyncsRequested} — {reason}");

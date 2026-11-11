@@ -408,3 +408,95 @@ public static class RelationListHeader
         return bytesNeeded <= bytes.Length - HeaderBytes;
     }
 }
+
+/// <summary>
+/// Which full states the joiner has asked for and not yet been given (security review of
+/// 2026-11-11, M1). A solicited state skips the AdoptionGate wait, so "solicited" must be
+/// something a host cannot stretch: each reason here is good for ONE adoption attempt.
+///
+///   - the join: the first state this game adopts;
+///   - a request this side sent (the join bootstrap, a quiet repair, "Attempt resync" on the
+///     desync popup -- every one of them goes through NetSession.RequestResync).
+///
+/// Before this, the whole 60-second Resyncing phase of a desync incident counted as solicited,
+/// so a host could send full states back to back for a minute and have each one adopted at
+/// once, at about 45 MB of native memory apiece. Now the first state after the choice is
+/// adopted at once and the next waits its 30 s like any other.
+///
+/// An attempt spends every reason at once, whether or not the state applied: a state that
+/// failed to apply is asked for again, and asking is what arms the next exemption.
+/// Thread-safe: requests are noted from the network thread, attempts happen on the main thread.
+/// </summary>
+public sealed class SolicitedStateExemptions
+{
+    private readonly object _gate = new();
+    private bool _joinStateOwed = true;
+    private bool _requestedStateOwed;
+
+    /// <summary>True while a state this side is owed has not been attempted yet.</summary>
+    public bool NextStateIsSolicited
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _joinStateOwed || _requestedStateOwed;
+            }
+        }
+    }
+
+    /// <summary>This side sent a request for a full state. Two requests before one state arrives are still one exemption.</summary>
+    public void NoteStateRequested()
+    {
+        lock (_gate)
+        {
+            _requestedStateOwed = true;
+        }
+    }
+
+    /// <summary>A full state is being adopted now. Whatever was owed has been delivered.</summary>
+    public void SpendOnAdoptionAttempt()
+    {
+        lock (_gate)
+        {
+            _joinStateOwed = false;
+            _requestedStateOwed = false;
+        }
+    }
+}
+
+/// <summary>
+/// Is this the game build some code was read against? Code that depends on the exact shape of
+/// DW2's IL (field layouts, who reads a render target) must switch itself off on any other
+/// build rather than assume the shape survived a patch.
+/// </summary>
+public static class GameBuild
+{
+    public static bool IsKnown(string gameVersion, IReadOnlyList<string> knownPrefixes)
+    {
+        if (string.IsNullOrWhiteSpace(gameVersion))
+        {
+            return false;
+        }
+
+        if (knownPrefixes is null)
+        {
+            return false;
+        }
+
+        foreach (string prefix in knownPrefixes)
+        {
+            if (string.IsNullOrEmpty(prefix))
+            {
+                continue;
+            }
+
+            if (gameVersion.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

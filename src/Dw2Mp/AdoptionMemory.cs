@@ -58,6 +58,13 @@ public static class AdoptionMemory
     private static int _firstSettledAdoption;
 
     private static SessionMemoryBudget _budget;
+    private static bool _budgetLineLogged;
+
+    /// <summary>True while the budget notice is due but could not be queued yet (a desync popup is open).</summary>
+    private static bool _budgetNoticeWaiting;
+
+    /// <summary>When the newest adoption happened, in Stopwatch ticks; 0 before the first.</summary>
+    private static long _latestAdoptionStamp;
 
     /// <summary>Galaxies this game has replaced. Weak: this list must never be what keeps one alive.</summary>
     private static readonly List<WeakReference> _replacedGalaxies = new();
@@ -101,11 +108,13 @@ public static class AdoptionMemory
     {
         _log = log;
 
+        // Every override here is a developer setting: without DW2MP_DEV=1 the mod ignores it,
+        // whatever the lobby did or did not strip.
+        bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
         string limitText = Environment.GetEnvironmentVariable("DW2MP_MEMORY_BUDGET_MB");
-        long limitBytes = SessionMemoryBudget.LimitFromMegabytesText(limitText);
+        long limitBytes = SessionMemoryBudget.LimitFromOverride(limitText, developerMode);
         _budget = new SessionMemoryBudget(limitBytes);
 
-        bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
         if (developerMode)
         {
             _probeFromAdoption = ReadPositiveInt("DW2MP_ADOPTION_MEMORY_PROBE");
@@ -113,6 +122,25 @@ public static class AdoptionMemory
         }
 
         log($"# memory: session budget {SessionMemoryBudget.FormatGigabytes(limitBytes)} of growth after the join, then one notice");
+
+        bool limitTextGiven = !string.IsNullOrWhiteSpace(limitText);
+        if (limitTextGiven && developerMode)
+        {
+            long limitMegabytes = limitBytes / (1024L * 1024L);
+            log($"# memory: *** DEV FLAG LIVE *** DW2MP_MEMORY_BUDGET_MB (with DW2MP_DEV=1): the session memory budget is {limitMegabytes:N0} MB " +
+                "instead of the default. Never set in a real session.");
+        }
+
+        if (limitTextGiven && !developerMode)
+        {
+            log("# memory: DW2MP_MEMORY_BUDGET_MB is set but ignored without DW2MP_DEV=1; the default budget applies");
+        }
+
+        if (_aggressiveAtAdoption > 0)
+        {
+            log($"# memory: *** DEV FLAG LIVE *** DW2MP_ADOPTION_MEMORY_AGGRESSIVE_AT={_aggressiveAtAdoption} (with DW2MP_DEV=1): " +
+                "one aggressive garbage collection at that adoption's settled reading. Never set in a real session.");
+        }
 
         if (_probeFromAdoption > 0)
         {
@@ -278,8 +306,12 @@ public static class AdoptionMemory
                 _log($"# memory: adoption #{_adoptions} AFTER   {Describe(afterForced)}");
             }
 
+            // A reading that is already due keeps its time: an adoption every 19 s must not
+            // push the reading, and the budget it feeds, back for ever.
             long settleTicks = (long)(SettleSeconds * Stopwatch.Frequency);
-            _settleDueStamp = Stopwatch.GetTimestamp() + settleTicks;
+            long nowStamp = Stopwatch.GetTimestamp();
+            _latestAdoptionStamp = nowStamp;
+            _settleDueStamp = SettledReadingSchedule.DueStampAfterAdoption(_settleDueStamp, nowStamp, settleTicks);
 
             MemorySample after = TakeSample(forceCollection: false);
             return Describe(after);
@@ -293,6 +325,11 @@ public static class AdoptionMemory
     /// <summary>Main thread, every frame on the joiner. Takes the settled reading when it is due.</summary>
     public static void OnMainThreadUpdate()
     {
+        if (_budgetNoticeWaiting)
+        {
+            OfferBudgetNoticeGuarded();
+        }
+
         if (_settleDueStamp == 0)
         {
             return;
@@ -303,7 +340,10 @@ public static class AdoptionMemory
             return;
         }
 
-        _settleDueStamp = 0;
+        // If another adoption has happened since this reading was scheduled, its own settled
+        // reading is due next; otherwise nothing is.
+        long settleTicks = (long)(SettleSeconds * Stopwatch.Frequency);
+        _settleDueStamp = SettledReadingSchedule.DueStampAfterReading(_latestAdoptionStamp, Stopwatch.GetTimestamp(), settleTicks);
 
         try
         {
@@ -384,8 +424,53 @@ public static class AdoptionMemory
             return;
         }
 
-        _log("# memory: *** SESSION MEMORY BUDGET *** " + _budget.LogText());
-        Desync.QueueNotice(SessionMemoryBudget.NoticeTitle, _budget.NoticeText());
+        if (!_budgetLineLogged)
+        {
+            _budgetLineLogged = true;
+            _log("# memory: *** SESSION MEMORY BUDGET *** " + _budget.LogText());
+        }
+
+        OfferBudgetNotice();
+    }
+
+    /// <summary>
+    /// Hands the budget notice to the popup queue. The budget counts it as given only when the
+    /// queue took it; while a desync popup is open it waits and is offered again every frame.
+    /// </summary>
+    private static void OfferBudgetNotice()
+    {
+        if (!_budget.NoticeDue)
+        {
+            _budgetNoticeWaiting = false;
+            return;
+        }
+
+        bool queued = Desync.QueueNotice(SessionMemoryBudget.NoticeTitle, _budget.NoticeText());
+        if (queued)
+        {
+            _budget.ConfirmNoticeGiven();
+            _budgetNoticeWaiting = false;
+            return;
+        }
+
+        if (!_budgetNoticeWaiting)
+        {
+            _budgetNoticeWaiting = true;
+            _log("# memory: the budget notice waits: a desync popup is open or the popup queue is full. It is offered again every frame.");
+        }
+    }
+
+    private static void OfferBudgetNoticeGuarded()
+    {
+        try
+        {
+            OfferBudgetNotice();
+        }
+        catch (Exception ex)
+        {
+            _budgetNoticeWaiting = false;
+            _log("# memory: offering the budget notice failed " + ex.GetType().Name + ": " + ex.Message);
+        }
     }
 
     // ------------------------------------------------------------------ probe: replaced galaxies
