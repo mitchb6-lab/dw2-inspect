@@ -24,6 +24,11 @@
     <Compile Include="..\Shared\ContentPackCompare.cs" Link="Shared\ContentPackCompare.cs" />
     <Compile Include="..\Shared\SteamAppManifest.cs" Link="Shared\SteamAppManifest.cs" />
     <Compile Include="..\Shared\PeerText.cs" Link="Shared\PeerText.cs" />
+    <Compile Include="..\Shared\SyncDigest.cs" Link="Shared\SyncDigest.cs" />
+    <Compile Include="..\Shared\KeyframePolicy.cs" Link="Shared\KeyframePolicy.cs" />
+    <Compile Include="..\Shared\GalaxyEvents.cs" Link="Shared\GalaxyEvents.cs" />
+    <Compile Include="..\Shared\SyncThresholds.cs" Link="Shared\SyncThresholds.cs" />
+    <Compile Include="..\Shared\DivergenceReport.cs" Link="Shared\DivergenceReport.cs" />
     <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
     <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />
     <Compile Include="..\Dw2MpLobby\Session.cs" Link="Lobby\Session.cs" />

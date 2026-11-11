@@ -712,6 +712,8 @@ public sealed class LobbyForm : Form
         if (!developerMode)
         {
             psi.Environment.Remove("DW2MP_FORCE_DESYNC_AT_CYCLE");
+            psi.Environment.Remove("DW2MP_DESYNC_AUTO_CHOICE");
+            psi.Environment.Remove("DW2MP_DIVERGENCE_DIR");
         }
 
         Log($"Launching {psi.FileName}");

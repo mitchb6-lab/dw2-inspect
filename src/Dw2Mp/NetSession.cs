@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using Dw2MpShared;
 using HarmonyLib;
 
 namespace Dw2Mp;
@@ -239,6 +240,17 @@ public static class NetSession
         else log("# net: DWGame.Update not found; client cannot apply state");
 
         StateDelta.Log = log;
+        DivergenceDump.Log = log;
+        GalaxyEventWatch.Log = log;
+
+        if (Role == NetRole.Host)
+        {
+            _keyframes = new KeyframePolicy(LoadSyncSettings(log), MinTicksBetweenServedStates, MaxTicksBetweenFullStates);
+        }
+        else
+        {
+            HostPause.Install(harmony, log);
+        }
         InstallCommandRelay(harmony, log);
 
         var thread = new Thread(LauncherLoop)
@@ -270,7 +282,11 @@ public static class NetSession
     /// </summary>
     // 3 (2026-11-10): three desync messages added (DesyncReport, DesyncChoice, DesyncOutcome).
     // Hello itself is unchanged, so a protocol-2 peer still reads it and logs its own mismatch.
-    private const int ProtocolVersion = 3;
+    // 4 (2026-11-10, desync reduction): StateSummary carries the full-state number it was built
+    // against and a per-collection digest (SyncDigest) in place of one opaque fingerprint; a
+    // Delta frame with an empty body is a clock-only sample; the delta body is version 9 with
+    // five more sections. No new message type. Hello is still unchanged.
+    private const int ProtocolVersion = 4;
 
     /// <summary>
     /// The Hello payload: protocol version, game version, and mode.
@@ -604,10 +620,13 @@ public static class NetSession
                         }
 
                         _inboundDeltas.Enqueue(payload);
+                        Interlocked.Increment(ref _deltasReceived);
                         break;
 
+                    // Only queued here. The comparison runs on the main thread, after every
+                    // delta that arrived before this summary has been applied.
                     case Msg.StateSummary when Role == NetRole.Client:
-                        OnStateSummary(payload);
+                        OnStateSummaryReceived(payload);
                         break;
 
                     // The host does not send a state here: HostTick owns serialisation,
@@ -676,6 +695,7 @@ public static class NetSession
         {
             _connected = false;
             _log($"# net[{Role}]: disconnected from launcher");
+            _tolerance.Reset();
 
             // A desync popup must not outlive the link: a paused host with no peer would
             // otherwise stay paused for a resync that can never be verified.
@@ -697,15 +717,21 @@ public static class NetSession
     //
     // What replaces it:
     //
-    //   every SummaryEveryTicks   a StateSummary — tick plus a structural fingerprint, tens
-    //                             of bytes, ~50,000x smaller than a full state.
-    //   client disagrees          the client asks for a resync and the host sends one.
-    //   MaxTicksBetweenFullStates a safety net, so a client whose fingerprint somehow keeps
-    //                             matching while its world is wrong still gets corrected.
+    //   every SummaryEveryTicks   a StateSummary — tick, the full-state number it was built
+    //                             against, and a digest of the collections deltas carry. About
+    //                             a hundred bytes.
+    //   client disagrees          a real, sustained mismatch: the client asks for a repair,
+    //                             and after three in a row raises the desync popup.
+    //   keyframes                 a full state every few minutes of running game and after a
+    //                             big event (KeyframePolicy), so state that deltas do not carry is
+    //                             never stale for long.
+    //   MaxTicksBetweenFullStates the old safety net, still there.
     //
-    // The summary is STRUCTURAL on purpose — see ApplyState.StructuralFingerprint. It
-    // notices ships appearing and disappearing, not the positional drift that DW2's
-    // non-determinism guarantees between two independently simulating processes.
+    // The summary is STRUCTURAL on purpose, and since 2026-11-10 it covers ONLY what the
+    // sync carries (StateDelta.BuildDigest): the members of the ship, colony, design,
+    // character and fleet collections. Not positions, which drift by design; and not the
+    // Empires and Orbs counts the first fingerprint (ApplyState.StructuralFingerprint)
+    // folded in, which deltas never carried and which raised a false desync on 2026-11-10.
 
     private static long _lastSummaryTick;
     private static long _summariesSent;
@@ -730,34 +756,66 @@ public static class NetSession
         if (Role != NetRole.Host || !_connected) return;
         if (IncompatibilityBlocksState("send state")) return;
 
-        // Deltas first, and often: this is now the channel that makes the client's world
-        // move. A few hundred bytes against 4.37 MB, and applied in place so it costs no
-        // adoption at all.
-        if (tick - _lastDeltaTick >= DeltaEveryTicks)
+        NoteKeyframeTime();
+
+        // Deltas first, and often: this is the channel that makes the client's world move.
+        // A few hundred bytes against megabytes, and applied in place so it costs no adoption.
+        //
+        // A summary is always preceded by a delta built on the same tick (2026-11-10). The
+        // summary describes the galaxy as it is NOW; if the last delta were up to 29 ticks
+        // old, every ship built in that gap would read as a mismatch the client could do
+        // nothing about. Built on the same tick, the summary describes exactly what the
+        // delta stream has carried.
+        //
+        // No delta before the first full state: the joiner has nothing but its throwaway
+        // galaxy to apply it to. The 2026-11-10 run sent 364 KB of every design and ship
+        // there, built in 439 ms on the simulation thread, for a galaxy about to be replaced.
+        bool summaryDue = tick - _lastSummaryTick >= SummaryEveryTicks;
+        bool deltaDue = tick - _lastDeltaTick >= DeltaEveryTicks;
+        bool joinerHasState = _syncsSent > 0;
+
+        if (deltaDue || summaryDue)
         {
             _lastDeltaTick = tick;
-            SendDelta(galaxy, tick);
+
+            bool deltaSent = false;
+            if (joinerHasState)
+            {
+                deltaSent = SendDelta(galaxy, tick);
+            }
+
+            // A still or paused galaxy sends no delta, and the delta tag was the only thing
+            // telling the joiner the host's time and speed. So when nothing changed, the tag
+            // goes alone: the joiner's clock stops when the host pauses.
+            if (!deltaSent)
+            {
+                SendClockSample();
+            }
         }
 
-        // Cheap heartbeat first: it is the thing that makes rare full states safe.
-        if (tick - _lastSummaryTick >= SummaryEveryTicks)
+        // Cheap heartbeat: it is the thing that makes rare full states safe.
+        if (summaryDue)
         {
             _lastSummaryTick = tick;
+
+            if (joinerHasState)
+            {
+                WatchForBigEvents(galaxy);
+            }
+
             SendStateSummary(galaxy, tick);
         }
 
+        // When to serve a full state is KeyframePolicy's decision (src/Shared, tested): the
+        // joiner asked, a desync choice, a big event, the periodic keyframe, or the safety net.
+        // The floor on SERVED states (security review 2026-11-10) lives there too: a peer
+        // sending ResyncRequest every frame cannot make the host serialise megabytes a tick.
         bool asked = _resyncRequested;
-        bool overdue = tick - _lastSyncTick >= MaxTicksBetweenFullStates;
+        KeyframeDecision decision = _keyframes.Decide(tick, asked, _desyncServeExemption);
 
-        // A floor on SERVED full states (security review 2026-11-10): a peer sending
-        // ResyncRequest every frame would otherwise have the host serialise 4.4 MB every
-        // tick. One request within the floor is honoured per desync choice accepted on the
-        // popup; the join bootstrap (nothing served yet) is never throttled.
-        bool withinFloor = _syncsSent > 0 && tick - _lastSyncTick < MinTicksBetweenServedStates;
-        if (asked && withinFloor && !_desyncServeExemption)
+        if (decision.RequestIgnored)
         {
             _resyncRequested = false;
-            asked = false;
             _throttledServeRequests++;
             if (_throttledServeRequests == 1 || _throttledServeRequests % 50 == 0)
             {
@@ -765,12 +823,20 @@ public static class NetSession
             }
         }
 
-        if (!asked && !overdue) return;
+        if (!decision.Serve)
+        {
+            return;
+        }
+
+        bool servedOnRequest = decision.Reason == KeyframeReason.ClientAsked || decision.Reason == KeyframeReason.DesyncChoice;
 
         _resyncRequested = false;
         _desyncServeExemption = false;
         _lastSyncTick = tick;
-        if (asked) _resyncsServed++;
+        if (servedOnRequest)
+        {
+            _resyncsServed++;
+        }
 
         try
         {
@@ -792,10 +858,12 @@ public static class NetSession
             // clearing is what stops the first delta after every full state from re-sending
             // the entire galaxy the client just received.
             StateDelta.PrimeBaseline(galaxy);
+            _keyframes.NoteServed(tick);
+            GalaxyEventWatch.Rebase(galaxy);
 
             _syncsSent++;
             _log($"# net[host]: full state #{_syncsSent} tick={tick} " +
-                 $"({(asked ? "client asked" : "safety interval")}) raw={raw.LongLength:N0}B " +
+                 $"({DescribeKeyframe(decision)}) raw={raw.LongLength:N0}B " +
                  $"packed={packed.Length:N0}B serialise={serialiseMs:N0}ms pack={packMs:N0}ms queued" +
                  (superseded is null ? "" : $" (superseded 1, {Interlocked.Read(ref _statesDropped)} total)"));
         }
@@ -818,8 +886,8 @@ public static class NetSession
     /// </summary>
     private const long DeltaEveryTicks = 30;
 
-    /// <summary>Host: send what moved. Nothing moved means nothing is sent.</summary>
-    private static void SendDelta(object galaxy, long tick)
+    /// <summary>Host: send what moved. Nothing moved means nothing is sent, and false comes back.</summary>
+    private static bool SendDelta(object galaxy, long tick)
     {
         try
         {
@@ -842,7 +910,7 @@ public static class NetSession
                 _log($"# net[host]: SLOW delta build #{_deltasSent + 1} {buildMs:N1}ms " +
                      $"[{StateDelta.LastBuildBreakdown()}] [{StateDelta.LastBuildCollections()}] [{StateDelta.LastWholeCounts()}]");
 
-            if (payload is null) return;
+            if (payload is null) return false;
 
             Send(Msg.Delta, TagDelta(payload));
             _deltasSent++;
@@ -856,11 +924,125 @@ public static class NetSession
                      $"vs {_syncsSent} full state(s)) build={buildMs:N1}ms " +
                      $"avg={_deltaBuildMs / Math.Max(1, _deltasSent):N1}ms worst={_worstDeltaBuildMs:N1}ms@#{_worstDeltaAt} " +
                      $"[{StateDelta.SectionTimings()}] [{StateDelta.LastWholeCounts()}]");
+
+            return true;
         }
         catch (Exception ex)
         {
             _log("# net[host]: delta failed " + ex.GetType().Name + ": " + ex.Message);
+            return false;
         }
+    }
+
+    private static long _clockSamplesSent;
+
+    /// <summary>
+    /// Host: the delta tag with no delta behind it. Twenty bytes that carry the host's time
+    /// and speed (0 when paused) on a tick where nothing in the galaxy changed.
+    /// </summary>
+    private static void SendClockSample()
+    {
+        try
+        {
+            Send(Msg.Delta, TagDelta(Array.Empty<byte>()));
+            _clockSamplesSent++;
+        }
+        catch (Exception ex)
+        {
+            _log("# net[host]: clock sample failed " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------- host: keyframes
+
+    private static KeyframePolicy _keyframes;
+    private static long _lastKeyframeStamp;
+
+    /// <summary>sync-settings.json beside the session files, with DW2MP_KEYFRAME_MINUTES over it.</summary>
+    private static SyncSettings LoadSyncSettings(Action<string> log)
+    {
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Dw2Mp",
+            "sync-settings.json");
+
+        string json = "";
+        try
+        {
+            if (File.Exists(path))
+            {
+                json = File.ReadAllText(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            log("# net[host]: could not read " + path + ": " + ex.Message);
+        }
+
+        string environmentMinutes = Environment.GetEnvironmentVariable("DW2MP_KEYFRAME_MINUTES") ?? "";
+        SyncSettings settings = SyncSettings.Parse(json, environmentMinutes, out string note);
+
+        string interval = settings.KeyframeMinutes > 0
+            ? $"every {settings.KeyframeMinutes:0.##} min of running game"
+            : "periodic keyframes OFF";
+        log($"# net[host]: keyframes {interval}, on big events = {settings.KeyframeOnEvents} ({note}; file {path})");
+
+        return settings;
+    }
+
+    /// <summary>
+    /// Feed the keyframe policy wall time, counted only while the host's game is running.
+    /// Wall time and not ticks: the tick follows GameLogicCycleLengthInMilliseconds, measured at
+    /// about 29 a second on 2026-11-10 where older comments here assume 10.
+    /// </summary>
+    private static void NoteKeyframeTime()
+    {
+        long now = Stopwatch.GetTimestamp();
+        long previous = _lastKeyframeStamp;
+        _lastKeyframeStamp = now;
+
+        if (previous == 0)
+        {
+            return;
+        }
+
+        double elapsedSeconds = (now - previous) / (double)Stopwatch.Frequency;
+        var (_, hostSpeed) = HostClock();
+        _keyframes.NoteTime(elapsedSeconds, hostSpeed > 0f);
+    }
+
+    /// <summary>
+    /// Diff the galaxy's big facts against the last look (GalaxyEventWatch) and queue a
+    /// keyframe for anything that happened. Runs at the summary cadence.
+    /// </summary>
+    private static void WatchForBigEvents(object galaxy)
+    {
+        try
+        {
+            List<string> events = GalaxyEventWatch.Detect(galaxy);
+            foreach (string description in events)
+            {
+                _keyframes.NoteEvent(description);
+                _log($"# net[host]: big event -- {description}; keyframe queued ({_keyframes.PendingEventCount} pending)");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log("# net[host]: event watch failed " + ex.GetType().Name + ": " + ex.Message);
+        }
+    }
+
+    private static string DescribeKeyframe(KeyframeDecision decision)
+    {
+        return decision.Reason switch
+        {
+            KeyframeReason.ClientAsked => "client asked",
+            KeyframeReason.DesyncChoice => "desync popup: attempt resync",
+            KeyframeReason.Event => "keyframe after " + decision.Description,
+            KeyframeReason.Periodic => "periodic keyframe",
+            KeyframeReason.SafetyInterval => "safety interval",
+            _ => "unknown reason",
+        };
     }
 
     private static double _deltaBuildMs;
@@ -877,18 +1059,28 @@ public static class NetSession
     {
         try
         {
-            var fingerprint = ApplyState.StructuralFingerprint(galaxy);
+            // What the sync carries, and only that: see SyncDigest for why the old fingerprint
+            // (ship ids plus the Empires and Orbs counts) raised false desyncs.
+            SyncDigest digest = StateDelta.BuildDigest(galaxy, isHost: true);
+            string fingerprint = digest.Describe();
 
             using var buffer = new MemoryStream();
             using (var writer = new BinaryWriter(buffer, System.Text.Encoding.UTF8, leaveOpen: true))
             {
                 writer.Write(tick);
-                writer.Write(fingerprint ?? "");
+                writer.Write(CurrentBaseline);
+                digest.Write(writer);
                 writer.Flush();
             }
 
             Send(Msg.StateSummary, buffer.ToArray());
             _summariesSent++;
+
+            // Dev measurement: this side's census for this tick, to diff against the client's.
+            if (DivergenceDump.ShouldSample(_summariesSent))
+            {
+                DivergenceDump.Write(galaxy, "host", tick, $"baseline={_syncsSent} deltasSent={_deltasSent} fp={fingerprint}");
+            }
 
             // One line every 20 summaries: often enough to see the channel is alive, rare
             // enough not to bury the full states, which are the interesting events now.
@@ -930,6 +1122,8 @@ public static class NetSession
         if (Role != NetRole.Client) return;
 
         DrainDeltas();
+        HostPause.FollowHost();
+        ProcessPendingSummaries();
 
         if (_inbound.IsEmpty) return;
 
@@ -1000,6 +1194,13 @@ public static class NetSession
         if (IsDesyncMessage(type) && length > MaxDesyncFrameBytes)
         {
             _log($"# net: {type} frame of {length:N0}B exceeds the {MaxDesyncFrameBytes}B cap; dropping the connection");
+            return (null, null);
+        }
+
+        // A summary is a tick, a baseline and at most sixteen short digest entries.
+        if (type == Msg.StateSummary && length > MaxSummaryFrameBytes)
+        {
+            _log($"# net: StateSummary frame of {length:N0}B exceeds the {MaxSummaryFrameBytes}B cap; dropping the connection");
             return (null, null);
         }
 
@@ -1091,116 +1292,265 @@ public static class NetSession
     // ------------------------------------------ client: deciding when a full state is due
 
     private static long _summariesSeen;
-    private static int _consecutiveMismatches;
     private static long _resyncsRequested;
-    private static string _lastHostFingerprint = "";
     private static DateTime _lastResyncRequest = DateTime.MinValue;
 
     /// <summary>
-    /// How many summaries in a row must disagree before asking for 4.4 MB.
-    ///
-    /// Not one. The two sides sample at different instants — the host fingerprints as it
-    /// ticks, the client compares whenever the packet lands — so a ship built or destroyed
-    /// on the host legitimately shows as a single mismatch that resolves itself. Requiring a
-    /// run of them means we react to a genuine structural divergence and not to the seam
-    /// between two clocks.
+    /// The tolerance rules and the run-of-mismatches counter (src/Shared/SyncDigest.cs, tested).
+    /// Three real mismatches in a row are a desync, as before; what changed on 2026-11-10 is
+    /// what counts as one. A summary built against a different full state is not compared at
+    /// all, and a gap the host says it has not sent yet is latency, not divergence.
     /// </summary>
-    private const int MismatchesBeforeResync = 3;
+    private static readonly DesyncTolerance _tolerance = new();
 
     /// <summary>
-    /// A floor on how often a full state can be requested — and now, in practice, the
-    /// structure-refresh rate.
+    /// Summaries waiting for the main thread, in arrival order, each with the number of deltas
+    /// that had arrived before it. Deltas and summaries travel in two queues, so "after
+    /// DrainDeltas" alone is not "after every earlier delta": a delta and its summary can both
+    /// land in the instant between the drain and the check. The count closes that gap exactly.
+    /// </summary>
+    private static readonly ConcurrentQueue<(long DeltasBefore, byte[] Payload)> _pendingSummaries = new();
+
+    /// <summary>Deltas the network thread has queued, ever.</summary>
+    private static long _deltasReceived;
+
+    /// <summary>Deltas the main thread has taken off the queue (applied, held or dropped), each counted once.</summary>
+    private static long _deltasTaken;
+
+    private const int MaxPendingSummaries = 32;
+
+    private static long _summariesDropped;
+    private static long _checksMatched;
+    private static long _checksSkipped;
+    private static long _checksTolerated;
+    private static long _unreadableSummaries;
+    private static int _mismatchRunLogged;
+
+    /// <summary>
+    /// A floor on how often a full state can be requested.
     ///
-    /// 60 s rather than 20 s because deltas took over the job the full state used to do.
-    /// The client's world MOVES continuously on a few hundred bytes; a full state is now
-    /// only how it learns about ships that came into existence since the last one. Being a
-    /// minute behind on newly-built ships costs far less than a 4.4 MB adoption every 20 s,
-    /// and adoption is the thing that costs ~30 MB of unreleasable native memory.
+    /// 60 s because deltas do the job the full state used to do. The client's world MOVES
+    /// continuously on a few hundred bytes; a full state is how it repairs a real mismatch, and
+    /// adoption is the thing that costs ~30 MB of unreleasable native memory.
     /// </summary>
     private static readonly TimeSpan MinTimeBetweenResyncRequests = TimeSpan.FromSeconds(60);
 
     /// <summary>
-    /// Client: compare the host's structural fingerprint with our own and decide whether we
-    /// need a correction.
+    /// Client, network thread: a summary arrived. Nothing is compared here.
     ///
-    /// Runs on the network thread. It only READS galaxy structure, which is why it can:
-    /// the alternative, marshalling to the main thread, would make the check as expensive
-    /// as the thing it exists to avoid.
+    /// The comparison used to run on this thread the moment the packet landed, against a galaxy
+    /// the main thread was still applying deltas to. So "the summary disagrees" could mean
+    /// nothing more than "the delta sent just before it has not been applied yet". Now the
+    /// summary waits its turn: the main thread applies every delta that arrived before it, then
+    /// compares (ProcessPendingSummaries). The stream is ordered, so the comparison is too.
     /// </summary>
-    private static void OnStateSummary(byte[] payload)
+    private static void OnStateSummaryReceived(byte[] payload)
     {
-        try
+        _summariesSeen++;
+
+        // JOIN BOOTSTRAP. A client that has adopted nothing yet is not "in agreement", it is
+        // empty: its galaxy is the throwaway it generated to have something for
+        // StartGameExisting to replace. Ask immediately; there is nothing to compare against.
+        if (_syncsApplied == 0)
         {
-            using var input = new MemoryStream(payload, writable: false);
-            using var reader = new BinaryReader(input, System.Text.Encoding.UTF8);
-
-            long hostTick = reader.ReadInt64();
-            string hostFingerprint = reader.ReadString();
-
-            _summariesSeen++;
-            _lastHostFingerprint = hostFingerprint;
-
-            var galaxy = ApplyState.CurrentGalaxy;
-
-            // JOIN BOOTSTRAP. A client that has adopted nothing yet is not "in agreement",
-            // it is empty — its galaxy is the throwaway it generated to have something for
-            // StartGameExisting to replace. Ask immediately rather than waiting for a
-            // mismatch run, because there is nothing meaningful to compare against.
-            if (_syncsApplied == 0)
-            {
-                RequestResync(galaxy is null ? "no galaxy yet" : "joined, no state adopted yet");
-                return;
-            }
-
-            if (galaxy is null) return;
-
-            // The dev flag DW2MP_FORCE_DESYNC_AT_CYCLE replaces our fingerprint until the
-            // popup has been raised, so the whole path can be walked on one PC.
-            var mine = Desync.MaybeForceDivergence(ApplyState.StructuralFingerprint(galaxy));
-
-            // A resync chosen on the popup is verified here: the first summaries after the
-            // new full state has landed decide whether it worked.
-            if (Desync.VerifyingResync)
-            {
-                Desync.OnSummaryDuringResync(mine == hostFingerprint, _syncsApplied, hostTick);
-                return;
-            }
-
-            if (mine == hostFingerprint)
-            {
-                if (_consecutiveMismatches > 0)
-                    _log($"# net[client]: structure back in agreement after {_consecutiveMismatches} mismatch(es)");
-                _consecutiveMismatches = 0;
-                return;
-            }
-
-            _consecutiveMismatches++;
-            if (_consecutiveMismatches < MismatchesBeforeResync) return;
-
-            // Report the divergence whether or not we act on it: the rate floor lives in
-            // RequestResync, so a run of mismatches we decline to serve still shows up.
-            if (_consecutiveMismatches == MismatchesBeforeResync)
-            {
-                _log($"# net[client]: structure diverged — host {hostFingerprint} vs mine {mine} " +
-                     $"at host tick {hostTick}");
-
-                // mitch, in chat 2026-11-10: a detected desync raises the in-game popup
-                // (who desynced; 1 save and quit, 2 attempt resync) instead of a silent
-                // correction. The silent path stays as the fallback when the dialog API
-                // is not available.
-                bool popupRaised = Desync.OnDivergenceConfirmed(hostTick, hostFingerprint, mine);
-                if (popupRaised)
-                {
-                    return;
-                }
-            }
-
-            RequestResync($"structure diverged for {_consecutiveMismatches} summaries");
+            string reason = ApplyState.CurrentGalaxy is null ? "no galaxy yet" : "joined, no state adopted yet";
+            RequestResync(reason);
+            return;
         }
-        catch (Exception ex)
+
+        if (_pendingSummaries.Count >= MaxPendingSummaries)
         {
-            _log("# net[client]: summary read failed " + ex.GetType().Name + ": " + ex.Message);
+            _summariesDropped++;
+            if (_summariesDropped == 1 || _summariesDropped % 50 == 0)
+            {
+                _log($"# net[client]: {_summariesDropped} summary(ies) dropped -- the main thread is not draining them");
+            }
+
+            return;
         }
+
+        long deltasBefore = Interlocked.Read(ref _deltasReceived);
+        _pendingSummaries.Enqueue((deltasBefore, payload));
+    }
+
+    /// <summary>Client, main thread, straight after DrainDeltas.</summary>
+    private static void ProcessPendingSummaries()
+    {
+        while (_pendingSummaries.TryPeek(out var next))
+        {
+            // Not yet: a delta that arrived before this summary is still in the queue.
+            if (Interlocked.Read(ref _deltasTaken) < next.DeltasBefore)
+            {
+                return;
+            }
+
+            _pendingSummaries.TryDequeue(out _);
+
+            try
+            {
+                CheckSummary(next.Payload);
+            }
+            catch (Exception ex)
+            {
+                _log("# net[client]: sync check failed " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+    }
+
+    private static void CheckSummary(byte[] payload)
+    {
+        long hostTick;
+        long summaryBaseline;
+        SyncDigest hostDigest;
+
+        using (var input = new MemoryStream(payload, writable: false))
+        using (var reader = new BinaryReader(input, System.Text.Encoding.UTF8))
+        {
+            hostTick = reader.ReadInt64();
+            summaryBaseline = reader.ReadInt64();
+            hostDigest = SyncDigest.TryRead(reader);
+        }
+
+        if (hostDigest is null)
+        {
+            _unreadableSummaries++;
+            if (_unreadableSummaries == 1 || _unreadableSummaries % 50 == 0)
+            {
+                _log($"# net[client]: summary at host tick {hostTick} has no readable digest ({_unreadableSummaries} so far); ignored");
+            }
+
+            return;
+        }
+
+        var galaxy = ApplyState.CurrentGalaxy;
+        if (galaxy is null)
+        {
+            return;
+        }
+
+        SyncDigest mine = StateDelta.BuildDigest(galaxy, isHost: false);
+
+        // The dev flag DW2MP_FORCE_DESYNC_AT_CYCLE replaces our digest until the popup has been
+        // raised, so the whole path can be walked on one PC.
+        if (Desync.ForcingDivergence())
+        {
+            mine = ForcedDigest(mine);
+        }
+
+        var context = new SyncCheckContext
+        {
+            SummaryBaseline = summaryBaseline,
+            AppliedBaseline = _syncsApplied,
+            DeltasHeld = _heldDeltas.Count,
+            FullStateQueued = !_inbound.IsEmpty,
+        };
+
+        SyncCheckResult result = _tolerance.Evaluate(hostDigest, mine, context);
+
+        // Dev measurement: this side's census for this host tick, written with every delta
+        // before the summary already applied.
+        if (DivergenceDump.Enabled)
+        {
+            string dumpContext = $"baseline={_syncsApplied} summaryBaseline={summaryBaseline} verdict={result.Verdict} " +
+                                 $"deltasApplied={_deltasApplied} deltasHeld={_heldDeltas.Count} [{StateDelta.MutationFailureSummary()}]";
+            DivergenceDump.Write(galaxy, "client", hostTick, dumpContext);
+        }
+
+        if (result.Verdict == SyncVerdict.NotComparable)
+        {
+            _checksSkipped++;
+            if (_checksSkipped == 1 || _checksSkipped % 20 == 0)
+            {
+                _log($"# net[client]: sync check skipped at host tick {hostTick} -- {result.Detail} ({_checksSkipped} skipped so far)");
+            }
+
+            return;
+        }
+
+        if (result.Verdict == SyncVerdict.Tolerated)
+        {
+            _checksTolerated++;
+            _log($"# net[client]: sync check tolerated at host tick {hostTick} -- {result.Detail} ({_checksTolerated} tolerated so far)");
+            return;
+        }
+
+        bool matched = result.Verdict == SyncVerdict.Match;
+
+        // A resync chosen on the popup is verified here: the first comparable summaries after
+        // the new full state has landed decide whether it worked.
+        if (Desync.VerifyingResync)
+        {
+            Desync.OnSummaryDuringResync(matched, _syncsApplied, hostTick);
+            return;
+        }
+
+        if (matched)
+        {
+            _checksMatched++;
+
+            if (_mismatchRunLogged > 0)
+            {
+                _log($"# net[client]: structure back in agreement after {_mismatchRunLogged} mismatch(es)");
+                _mismatchRunLogged = 0;
+            }
+
+            if (_checksMatched % 20 == 1)
+            {
+                _log($"# net[client]: sync check OK #{_checksMatched} at host tick {hostTick} -- {mine.Describe()} " +
+                     $"(skipped {_checksSkipped}, tolerated {_checksTolerated})");
+            }
+
+            return;
+        }
+
+        _mismatchRunLogged = result.ConsecutiveMismatches;
+        _log($"# net[client]: sync check MISMATCH {result.ConsecutiveMismatches} of {DesyncTolerance.MismatchesBeforeDesync} at host tick {hostTick} -- {result.Detail}");
+
+        // A desync popup is already open: the players are deciding, so nothing is asked for here.
+        if (Desync.IncidentOpen)
+        {
+            return;
+        }
+
+        if (result.BecameSustained)
+        {
+            string hostText = hostDigest.Describe();
+            string mineText = mine.Describe();
+            _log($"# net[client]: structure diverged — host {hostText} vs mine {mineText} at host tick {hostTick}");
+
+            // mitch, in chat 2026-11-10: a detected desync raises the in-game popup (who
+            // desynced; 1 save and quit, 2 attempt resync). The silent path below stays as
+            // the fallback when the dialog API is not available.
+            bool popupRaised = Desync.OnDivergenceConfirmed(hostTick, hostText, mineText);
+            if (popupRaised)
+            {
+                return;
+            }
+        }
+
+        // Before the popup: ask for a repair, quietly. A real mismatch is something only a
+        // full state fixes, and if one fixes it the players never need to be asked. Both
+        // floors still apply (60 s here, MinTicksBetweenServedStates on the host).
+        RequestResync($"sync check mismatched {result.ConsecutiveMismatches} time(s): {result.Detail}");
+    }
+
+    /// <summary>A copy of our digest that cannot match: the ship entry is seven members out.</summary>
+    private static SyncDigest ForcedDigest(SyncDigest mine)
+    {
+        var forced = new SyncDigest();
+
+        foreach (SyncDigestEntry entry in mine.Entries)
+        {
+            if (entry.Name == "ships")
+            {
+                forced.Add(entry.Name, entry.Count + 7, entry.SetHash ^ 1UL, entry.Unsent);
+                continue;
+            }
+
+            forced.Add(entry.Name, entry.Count, entry.SetHash, entry.Unsent);
+        }
+
+        return forced;
     }
 
     /// <summary>
@@ -1215,7 +1565,6 @@ public static class NetSession
         if (!force && DateTime.UtcNow - _lastResyncRequest < MinTimeBetweenResyncRequests) return;
 
         _lastResyncRequest = DateTime.UtcNow;
-        _consecutiveMismatches = 0;
         _resyncsRequested++;
 
         Send(Msg.ResyncRequest, Array.Empty<byte>());
@@ -1250,6 +1599,9 @@ public static class NetSession
 
     /// <summary>Desync frames are a few primitives and short strings; anything bigger is not ours and ends the link.</summary>
     private const int MaxDesyncFrameBytes = 1024;
+
+    /// <summary>8 + 8 + 1 + 16 x (1 + 24 + 4 + 8 + 4) bytes is 673; anything past 2 KB is not a summary.</summary>
+    private const int MaxSummaryFrameBytes = 2048;
 
     private static bool IsDesyncMessage(Msg type)
     {
@@ -1298,6 +1650,8 @@ public static class NetSession
 
         while (_inboundDeltas.TryDequeue(out var tagged))
         {
+            Interlocked.Increment(ref _deltasTaken);
+
             var (baseline, payload) = UntagDelta(tagged);
             if (payload is null) continue;
 
@@ -1315,6 +1669,15 @@ public static class NetSession
                 // Built against a galaxy we have already replaced. Nothing in it is true now.
                 if (++_deltasDropped == 1 || _deltasDropped % 50 == 0)
                     _log($"# net[client]: dropped delta for superseded full state #{baseline} (have #{_syncsApplied}); {_deltasDropped} dropped so far");
+                continue;
+            }
+
+            // The tag alone: nothing changed on the host this tick, but its clock (and its
+            // pause) still has to reach us.
+            if (payload.Length == 0)
+            {
+                FollowHostClock(tagged);
+                _clockSamplesApplied++;
                 continue;
             }
 
@@ -1344,6 +1707,10 @@ public static class NetSession
 
         var pending = new List<byte[]>();
         while (_heldDeltas.TryDequeue(out var d)) pending.Add(d);
+
+        // These were counted when they were first taken and will be taken again.
+        Interlocked.Add(ref _deltasTaken, -pending.Count);
+
         while (_inboundDeltas.TryDequeue(out var d)) pending.Add(d);
         foreach (var d in pending) _inboundDeltas.Enqueue(d);
 
@@ -1366,6 +1733,7 @@ public static class NetSession
 
     private static readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _heldDeltas = new();
     private static long _deltasHeld, _deltasDropped;
+    private static long _clockSamplesApplied;
 
     /// <summary>Host: which full state the next deltas are relative to. Read on the sim thread.</summary>
     private static long CurrentBaseline => _syncsSent;

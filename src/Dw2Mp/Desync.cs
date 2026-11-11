@@ -38,7 +38,8 @@ namespace Dw2Mp;
 /// </summary>
 public static class Desync
 {
-    private const int MaxFingerprintLength = 64;
+    // 160 since protocol 4: the text is SyncDigest.Describe(), one "name=count:hash" per carried collection.
+    private const int MaxFingerprintLength = 160;
 
     private const int MaxGameTimeLength = 32;
 
@@ -564,11 +565,11 @@ public static class Desync
     /// client's own fingerprint is replaced so every summary mismatches. It stops the moment
     /// the popup is raised, so a following resync can genuinely succeed.
     /// </summary>
-    public static string MaybeForceDivergence(string myFingerprint)
+    public static bool ForcingDivergence()
     {
         if (ForceAtCycle <= 0 || _forceSpent || Interlocked.Read(ref _lastClientTick) < ForceAtCycle)
         {
-            return myFingerprint;
+            return false;
         }
 
         if (!_forceLogged)
@@ -577,7 +578,83 @@ public static class Desync
             _log($"# desync: FORCING a fake divergence from cycle {Interlocked.Read(ref _lastClientTick)} (DW2MP_FORCE_DESYNC_AT_CYCLE)");
         }
 
-        return "FORCED-DESYNC-" + myFingerprint;
+        return true;
+    }
+
+    /// <summary>True from the moment a desync is detected until the incident is closed.</summary>
+    public static bool IncidentOpen => CurrentPhase() != DesyncPhase.Idle;
+
+    // ------------------------------------------------------------- dev auto-choice
+    //
+    // DW2MP_DESYNC_AUTO_CHOICE=1 or 2: press that popup button by itself a few seconds after the
+    // choice is offered. A harness run has nobody to click, and without this the first desync
+    // of a run left the host paused behind a dialog for the rest of it (2026-11-10). Set it on
+    // ONE side so the choice still has to cross the wire. The lobby strips it from a real
+    // session unless DW2MP_DEV=1, exactly as it strips the force flag.
+
+    private static readonly int AutoChoice = ReadAutoChoice();
+
+    private static readonly TimeSpan AutoChoiceDelay = TimeSpan.FromSeconds(5);
+
+    private static DateTime _autoChoiceDueUtc = DateTime.MaxValue;
+
+    private static int ReadAutoChoice()
+    {
+        string text = Environment.GetEnvironmentVariable("DW2MP_DESYNC_AUTO_CHOICE") ?? "";
+        if (text == "1")
+        {
+            return 1;
+        }
+
+        if (text == "2")
+        {
+            return 2;
+        }
+
+        return 0;
+    }
+
+    private static void ArmAutoChoice()
+    {
+        if (AutoChoice == 0)
+        {
+            return;
+        }
+
+        _autoChoiceDueUtc = DateTime.UtcNow + AutoChoiceDelay;
+    }
+
+    private static void CheckAutoChoice()
+    {
+        if (AutoChoice == 0 || DateTime.UtcNow < _autoChoiceDueUtc)
+        {
+            return;
+        }
+
+        _autoChoiceDueUtc = DateTime.MaxValue;
+
+        bool awaitingChoice;
+        bool offersResync;
+        lock (Gate)
+        {
+            awaitingChoice = Policy.Phase == DesyncPhase.AwaitingChoice;
+            offersResync = Policy.OffersResync;
+        }
+
+        if (!awaitingChoice)
+        {
+            return;
+        }
+
+        if (AutoChoice == 2 && !offersResync)
+        {
+            _log("# desync: DEV auto-choice 2 not pressed -- resync is no longer offered; the choice waits for a person");
+            return;
+        }
+
+        DesyncChoice choice = AutoChoice == 1 ? DesyncChoice.SaveAndQuit : DesyncChoice.AttemptResync;
+        _log($"# desync: DEV auto-choice pressing {choice} (DW2MP_DESYNC_AUTO_CHOICE={AutoChoice})");
+        ChooseLocally(choice);
     }
 
     // ------------------------------------------------------------- dialogs
@@ -638,6 +715,7 @@ public static class Desync
         }
 
         QueueDialog(DesyncPolicy.Title, text, saveAndQuit, attemptResync);
+        ArmAutoChoice();
     }
 
     private static void QueueInfoDialog(string title, string text)
@@ -682,6 +760,7 @@ public static class Desync
     public static void OnMainThreadUpdate()
     {
         CheckResyncDeadline();
+        CheckAutoChoice();
 
         PendingDialog next = null;
         lock (PendingDialogs)

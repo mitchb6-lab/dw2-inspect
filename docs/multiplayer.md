@@ -1599,6 +1599,10 @@ it. Knowing that from the earlier work is what made this safe first time.
 
 Full states remain the repair path when a delta does not fit.
 
+*(2026-11-10: per-race `Colony.Population` and diplomacy are carried now, and full states
+arrive as keyframes; see "Desync reduction: measured, then built" at the end of this file.
+Fleet and character CONTENTS are still left to full states.)*
+
 ---
 
 ## Fleets and characters — 2026-09-08, and the refresh half was measured out again
@@ -2217,3 +2221,285 @@ honour the handshake block; the lobby strips `DW2MP_FORCE_DESYNC_AT_CYCLE` from 
 environment unless `DW2MP_DEV=1`; and `SnapshotHash` skips its positional normalisation (and
 says so) on a game build other than 1.3.8.4. The popup keeps mitch's two options; a third button
 is his call.
+
+## Desync reduction: measured, then built — mitch, in chat 2026-11-10
+
+Five things asked for, to make desyncs less likely: measure what diverges, serve periodic
+keyframes, carry more state in deltas, make the desync check tolerant, and make pause the
+host's alone. Built on `feat/desync-reduction-1110`. Net protocol **4**, delta body **9**.
+
+### The harness: two instances, no lobby
+
+`Scripts\net-twoinstance.ps1` runs a host and a joiner on one PC with no lobby window. The
+lobby only pumps frames between two sockets once the games are up, so `dw2mpprobe relay
+<hostPort> <joinerPort>` (new, `src\Dw2MpProbe\DevModes.cs`) does that from a console and
+counts traffic per message type. The script writes both session files, launches both games
+**at the same moment** (two instances share `data\SessionActive`, so the second must pass its
+start-up check before the first creates the lock; both passed in both runs), and both mods
+leave by themselves after `-Cycles` server cycles through `Determinism.ExitProcess`, which
+removes the lock. The host runs with `DW2MP_KEEP_RUNNING=1`, the joiner with `0` exactly as
+the lobby launches it.
+
+With `-DivergenceDir`, both games write a census of their galaxy at the same host tick
+(`src\Dw2Mp\DivergenceDump.cs`: every primitive field, every one-level struct and the `Count`
+of every collection field, for ships, colonies, characters, designs, empires, relations and
+fleets), the joiner after applying every delta that preceded the summary. `dw2mpprobe
+divergence <dir>` diffs each pair and ranks fields by how many objects differ
+(`src\Shared\DivergenceReport.cs`, tested).
+
+**The tick is not 10 a second.** Both games counted about 29 cycles a second (870 per 30 s
+watchdog interval). `LogicCycleDue` follows the game's own `GameLogicCycleLengthInMilliseconds`.
+So on 1.3.8.4 a summary goes every ~10 s, not 30; three mismatches are ~30 s, not 90; and the
+600-tick served-state floor is ~20 s, not 60. The constants are unchanged; the keyframe
+interval is measured in wall time for this reason.
+
+### Measurement 1 (before any fix): the desync popup was a false alarm
+
+First run, origin/main logic plus the dump. Thirty seconds after the join both machines showed
+DESYNC DETECTED and the host paused behind the popup:
+
+```
+joiner  # net[client]: structure diverged — host B0B9C3BB6E2A8C19 vs mine ADAD4834A190E1E9 at host tick 1200
+host    # desync: REPORTED by HarnessJoiner (joiner, slot 1) at host tick 1200 ... host B0B9C3BB6E2A8C19 vs theirs ADAD4834A190E1E9
+joiner  # net[client]: APPLIED sync #2 ... ships=282
+joiner  # net[client]: structure diverged — host B0B9C3BB6E2A8C19 vs mine ADAD4834A190E1E9 at host tick 3000
+```
+
+The same two fingerprints before and after a fresh full state. The census at tick 1200 and
+again at tick 3000 says why: **282 ships on both sides with identical ids, 12 colonies, 12
+characters, 669 designs, 14 empires, all equal; `Orbs` 1,401 on the host and 1,400 on the
+joiner.** `ApplyState.StructuralFingerprint` hashed `e=<Empires>;o=<Orbs>;s=<Ships.Count>;`
+in front of the ship ids. Deltas never carried orbs, and the one-orb difference survives a
+full state, so nothing could repair it: both resync attempts were bound to fail and leave only
+"Save and quit". A desync, by this project's own definition, is state the host changed that
+the sync does not carry; here the CHECK compared state the sync does not carry.
+
+Two more things the same run showed:
+
+- **The joiner sat auto-paused for the whole session**: `GameServer.IsRunning=False,
+  DWGame.AutoPaused=True, GetGamePaused=True` at every watchdog line from its first adoption.
+- The host's first delta, before any full state, was **364,534 B built in 439 ms** on the
+  simulation thread (every design and ship as "new") and was applied to the joiner's throwaway
+  galaxy.
+
+### Measurement 1: what really differed, ranked
+
+Objects whose value differed between host and joiner, same host tick, ~10 s and ~30 s after a
+full state (host at 4x). 282 ships, 12 colonies, 669 designs:
+
+| State | Objects differing | Kind |
+|---|---:|---|
+| `Design.BuildCost`, `MaintenanceCost` | 542–622 of 669 (host 3,228 / joiner 1,500) | derived on the host, not restored by a full state |
+| `Colony` per-race population | 12 of 12 | simulation state |
+| `Colony._DevelopmentLevel` | 12 of 12 (host 0.52 / joiner 0.78) | derived, not restored |
+| `Colony._MigrationFactor` | 10 of 12 | simulation state |
+| `Colony.TaxRate` | 6 of 12 | simulation state |
+| `Colony.ColonyInfluenceRadius`, `GrowthFundingRatio` | 3 of 12 each | simulation state |
+| `Ship.Shields` | 40 | simulation state |
+| `Ship.HullConstructionLevel` | 19 (ships being built) | simulation state |
+| `Ship.Energy`, `Ship.Fuel` | 15, 11 | simulation state |
+| `Ship.UnbuiltComponentCount`, `NormalComponentCount`, `#Weapons` | 12, 16, 8 | a ship's component list while it is built |
+| `Galaxy.#Troops` 12 / 11, `#SpaceItems` 136 / 129, `#Orbs` 1,401 / 1,400 | — | collections deltas do not carry |
+| `Character.#Events` | 4 of 12 | contents (membership only, by design) |
+| `Ship.SummarySize`, `StrengthCached`, `NebulaPermeability`, `ScannerLongRange`, `#ComponentDisplayData`, `Colony.#BonusesComplete` ... | 131–282 | caches the simulation derives; the joiner never computes them |
+
+Membership was exact in every sample: no ship, colony, character or design on one side only.
+Empires and relations could not be compared in this run: the host-side dump died on one
+unreadable field before it reached them (fixed; every field is now read under its own guard).
+
+### 2. Keyframes
+
+The host serves a full state by itself (`src\Shared\KeyframePolicy.cs`, tested; wired in
+`NetSession.HostTick`):
+
+- **every N minutes of RUNNING game**, N from `%LOCALAPPDATA%\Dw2Mp\sync-settings.json`
+  (`{ "keyframeMinutes": 3, "keyframeOnEvents": true }`; default 3, clamped to 1–120, 0 = off)
+  or `DW2MP_KEYFRAME_MINUTES`. Paused time does not count: a paused galaxy has not changed
+  and every adoption costs the joiner native memory.
+- **after a big event**: war declared, peace made, first contact, a colony gained or lost, an
+  empire eliminated. Detected by diffing a small census every summary (`GalaxyEventWatch`,
+  pure half in `src\Shared\GalaxyEvents.cs`), not by hooking: DW2 changes a relation through
+  fourteen `ChangeEmpireRelation` overloads. Wars, peace, contact and colonies are watched for
+  the **players' empires** only; a dozen AI empires meeting each other would otherwise cost a
+  keyframe each. Elimination counts for any empire.
+- **inside the existing floor** (`MinTicksBetweenServedStates`): an event inside it waits and
+  is served when the floor has passed; it is never dropped. A joiner's request inside the
+  floor is still ignored, except the one a desync choice exempts.
+
+A keyframe is an ordinary FullState, so the baseline number every delta already carries goes
+up, and every summary now carries it too. A summary built against a full state the joiner has
+not adopted yet, or one older than the state it has just adopted, is **not compared**, so a
+keyframe can never start, extend or end a run of mismatches (tested).
+
+**Cost, stated plainly:** each adoption still costs the joiner ~25–36 MB of native memory that
+is not returned (measured 2026-09-08). At the default 3 minutes that is on the order of
+600 MB an hour. The interval is in a file for that reason.
+
+### 3. More state in deltas (delta body 9)
+
+Five sections appended after fleets (`src\Dw2Mp\StateDelta.Carried1110.cs`), so the older
+sections' layout is untouched:
+
+| Section | Carries | How |
+|---|---|---|
+| ship vitals | shields, fuel, energy, hull construction level | field level, thresholded |
+| colony extras | development level, tax rate, migration factor, influence radius, growth funding, and the **per-race population list** | field level, thresholded; races added and removed on the joiner |
+| design costs | build cost, maintenance cost | field level, exact |
+| empire money | state and private cash | field level, thresholded |
+| relations | an empire's whole relation list | **DW2's own `EmpireRelationList.WriteToStream`**, sent when a relation's flags change |
+
+Relations follow the ship path. On the joiner a NEW `EmpireRelationList` is filled by DW2's
+own `ReadFromStream` and swapped into `Empire.Relations`, which is what loading a save does;
+the swap only happens when the reader consumed exactly the bytes the host wrote. The trigger is
+a signature of every bool, byte and short on each relation (HaveMet, AtWar, Subjugated, the
+thirteen Treaty flags, TreatyTradeLevel), not a byte hash: relations also hold incident history
+and dates that move constantly, the same trap that made refreshing characters cost 32 MB.
+
+Colony extras and design costs are **not primed** after a full state. The host cannot assume
+the joiner's copy equals its own for values a full state does not restore, so those two
+baselines are cleared and the first pass after every full state sends them all. Research
+progress was already carried and stays as it was.
+
+Thresholds are one tested function (`src\Shared\SyncThresholds.cs`).
+
+### 4. The desync check
+
+- **Compares only what the sync carries.** `StateSummary` now carries a `SyncDigest`
+  (`src\Shared\SyncDigest.cs`): per collection that deltas create and remove members in
+  (ships, colonies, designs, characters, fleets), a count and an order-independent hash of the
+  member ids, read from live objects and never from `Count` (lists keep tombstones). Built by
+  `StateDelta.BuildDigest` from the same lists the delta sections walk. No orbs, no empires.
+- **Is ordered.** The host builds a delta on the same tick as every summary, and the joiner
+  compares on the main thread only after every delta that arrived before the summary has been
+  taken off the queue. The check used to run on the network thread the moment the packet
+  landed.
+- **Tolerates known latency** (`DesyncTolerance`, tested): members the host says it has not
+  sent yet (`Unsent`: created or removed since its last delta) are latency for as long as the
+  host says so; one more than that is tolerated for one summary; the same collection still
+  off on the next summary is a mismatch.
+- **Only a sustained real mismatch raises the popup**: three in a row, unbroken by a match,
+  as before. On the first real mismatch the joiner now quietly asks for a full state (both
+  rate floors apply); if that repairs it nobody is asked anything.
+
+### 5. Host-owned pause
+
+A pause in DW2 is local: `DWGame.PauseGame(bool)` stops the local `GameServer` stopwatch and
+tells the local `GameClient`s; it sends nothing. So a joiner's pause never reached the host,
+and that half was already true. The other half was not: `StartGameExisting` pauses on every
+adoption, nothing resumed a joiner, and an empire message auto-pauses the same way.
+Separately, the host's own pause only reached the joiner on a delta, and a paused galaxy
+sends none, so the joiner's clock ran on at the last speed.
+
+Fixed in `src\Dw2Mp\HostPause.cs` (decision in `PauseMirror`, tested): on the main thread the
+joiner's pause state and speed follow the host's clock sample, whoever paused it. And the host
+now sends the 20-byte delta tag alone when nothing changed, so pause and speed always arrive.
+A save on the joiner is left alone. The joiner's own pause key therefore does nothing for
+longer than a quarter of a second; a pause REQUEST from the joiner to the host would be a
+vote, and is not built.
+
+### Measurement 2 (the new build): one 347-second two-instance run
+
+Same harness, host at 4x, `DW2MP_KEYFRAME_MINUTES=1` so several keyframes fit in the run, and
+on the joiner `DW2MP_FORCE_DESYNC_AT_CYCLE=6500` with the new dev flag
+`DW2MP_DESYNC_AUTO_CHOICE=2` (presses "Attempt resync" five seconds after the popup; the
+lobby strips it from a real session unless `DW2MP_DEV=1`). Ships grew 217 to 313, designs 508
+to 788, characters 9 to 16. Both games left by themselves and removed the session lock.
+
+**The check.** Every comparable summary before the forced one matched, 21 in a row, none
+skipped, none tolerated, where measurement 1 raised the popup on the third:
+
+```
+joiner  # net[client]: sync check OK #21 at host tick 6600 -- ships=305:894CA2CF colonies=12:E4764427 designs=764:D6001C8B characters=14:77025E29 fleets=0:00000000 (skipped 0, tolerated 0)
+```
+
+Across ten sampled ticks the census found **no object on one side only**, and 0 mutation
+failures on the joiner.
+
+**Keyframes.** Seven full states: the join, one event keyframe, three periodic, and the two
+the forced desync caused.
+
+```
+host  # net[host]: full state #2 tick=1500 (keyframe after empire 2 eliminated, empire 4 eliminated, empire 6 eliminated)
+host  # net[host]: full state #3 tick=3331 (periodic keyframe)
+host  # net[host]: full state #4 tick=5165 (periodic keyframe)
+host  # net[host]: full state #5 tick=6902 (client asked)
+host  # net[host]: full state #6 tick=7655 (desync popup: attempt resync)
+host  # net[host]: full state #7 tick=9637 (periodic keyframe)
+```
+
+Three eliminations in one summary shared one keyframe. No keyframe produced a mismatch.
+
+**The popup and the resync round trip, in game for the first time** (it was built and
+unverified on PR #13). The forced digest mismatched three times; the first asked for a quiet
+repair (#5), which a forced mismatch survives by construction; the third raised the popup:
+
+```
+joiner  # net[client]: sync check MISMATCH 3 of 3 at host tick 7500 -- ships host 306 mine 313
+joiner  # desync: DETECTED -- HarnessJoiner (joiner, slot 1) diverged at host tick 7500 ...
+host    # desync: REPORTED by HarnessJoiner (joiner, slot 1) at host tick 7500 ...
+host    # desync: host simulation PAUSED while the popup is open
+joiner  # pause: the host paused; joiner paused to match (#3)
+joiner  # desync: DEV auto-choice pressing AttemptResync (DW2MP_DESYNC_AUTO_CHOICE=2)
+host    # net[host]: full state #6 tick=7655 (desync popup: attempt resync)
+joiner  # net[client]: APPLIED sync #6 ... ships=306
+joiner  # desync: RESYNC SUCCEEDED -- structure agrees at host tick 7800
+host    # desync: RESYNC SUCCEEDED -- the joiner verified the new full state
+host    # desync: host simulation RESUMED
+joiner  # pause: the host is running at 4x; joiner resumed to match (#7)
+```
+
+The dialogs were queued and logged as SHOWN on both sides; nobody looked at the screen.
+
+**Pause.** The joiner's watchdog said PAUSED three times in the run, each time while the host
+was paused (the pause DW2 leaves after generation, DW2's own event auto-pause on the host at
+60 s with `DWGame.AutoPaused=True`, and the desync popup), and it resumed with the host each
+time. Eight resumes in all, five of them logged on the line straight after an adoption:
+
+```
+joiner  # net[client]: APPLIED sync #2 ...
+joiner  # pause: the host is running at 4x; joiner resumed to match (#3)
+```
+
+**What deltas carried.** The joiner's totals at delta #251: `colonyextras=540
+designcosts=4,544 money=159 relations=43 vitals=2,401`. What still differed at tick 6300, about
+40 s after a full state, against measurement 1:
+
+| State | Measurement 1 | Measurement 2 |
+|---|---:|---:|
+| Design build and maintenance cost | 542–622 of 669 | **0 of 764** |
+| Colony development level, tax rate | 12 and 6 of 12 | **0 and 0 of 12** |
+| Colony per-race population | 12 of 12, growing | 7 of 12, all within 0.3 % (the send threshold) |
+| Relation flags (HaveMet, AtWar, Treaty*) | not measured | **0 of 212 in every sample** |
+| Empire cash | not measured | 3 of 15, within 0.6 % in nine samples of ten |
+| Ship shields, fuel | 40, 11 | still top of the ranking, inside their 2 % threshold and three-delta cadence |
+
+Still differing, and not carried: a ship's heading, speed and component list while it is built,
+`Design.BuildCount`, `Galaxy.#SpaceItems` (24 / 11), character events and traits, troops, and
+every cache the simulation derives (`Colony.#BonusesComplete` 26 / 0, ship summaries, scanner
+ranges). The derived caches are a client-side rebuild question, like `Ship.Summary` in
+September, not a sync one.
+
+**Traffic**, host to joiner, 347 s at 4x: 333 deltas, 1,228,849 B (about 3.5 KB/s; not split
+by section, and it includes 280 whole designs the AI created); 7 full states, 17.6 MB; 33
+summaries, 4,719 B. Delta build averaged 1.5 ms, worst 8.8 ms.
+
+### Honest limits
+
+- **One PC, loopback, two short runs, a 30-star galaxy.** Nothing here was run over Steam or
+  between two machines, and no late-game galaxy was tried. Wars, peace, first contact and
+  colony events are tested as pure logic; the only event the run produced was elimination.
+- **In the harness galaxy the players' empire is eliminated after a minute.** "Harness Host
+  Empire" (id 2) and two AI empires start with no colony and DW2 removes them at its first
+  check. That is generation, not sync, and it is why no player war or colony event fired. The
+  lobby's defaults are the same 30 stars, 4 AI, seed 12345, so it is worth one look in a real
+  session.
+- **Relations are replaced whole.** 43 lists were swapped with no failure, but nothing
+  checked that a UI panel holding the old list refreshes.
+- **Keyframes cost the joiner memory** (see above). Private bytes on the joiner went from
+  5,491 MB at the first adoption to 5,825 MB at the seventh, in under six minutes with the
+  interval forced down to one minute.
+- **The first run of the harness was left unsupervised.** A script error one second after
+  launch ended the script while both games ran on; they left by themselves three minutes
+  later. The supervision is now inside a try block that always reaches the clean-up.
+- The new message parsing (summary digest, delta sections 9, the empty delta as a clock
+  sample) has had no security review yet.

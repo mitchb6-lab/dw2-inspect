@@ -50,16 +50,27 @@ namespace Dw2Mp;
 /// 523 KB baseline, and turned off on the numbers. Membership is the part deltas are needed
 /// for -- an object the client does not have is one it can never be told about again.
 ///
+/// CARRIED SINCE 2026-11-10 (StateDelta.Carried1110.cs, ranked by that day's measurement):
+/// ship shields, fuel, energy and construction level; five colony rates and the per-race
+/// Colony.Population list; design build and maintenance cost; empire cash; and an empire's
+/// whole relation list, in DW2's own bytes, when a treaty, war, peace or first contact
+/// changes it.
+///
 /// STILL NOT CARRIED: research projects are created and removed with an empire rather than
-/// during play, so they are update-only; and Colony.Population is a per-race collection,
-/// which is the nested-collection problem one level down. Diplomacy is untouched.
+/// during play, so they are update-only. Colony ownership, troops, space items, orbs, a
+/// ship's component list while it is being built, character and fleet contents, and every
+/// cache the simulation derives (ship summaries, colony bonuses, scanner ranges) wait for a
+/// full state, which since the same day arrives as a keyframe every few minutes and after
+/// big events.
 ///
 /// Deltas carry change AND the structure they can safely reconstruct; full states carry
 /// the rest, and remain the repair path when a delta does not fit.
 /// </summary>
-public static class StateDelta
+public static partial class StateDelta
 {
-    private const int Version = 8;
+    // 9 (2026-11-10): five sections appended after fleets -- ship vitals, colony extras with
+    // per-race population, design costs, empire money, relations. See StateDelta.Carried1110.cs.
+    private const int Version = 9;
 
     /// <summary>
     /// Per-kind change thresholds. Without them every float that drifts by a rounding error
@@ -90,6 +101,7 @@ public static class StateDelta
             _lastColonies.Clear();
             _lastResearch.Clear();
             _lastWhole.Clear();
+            ResetCarriedBaselines();
         }
     }
 
@@ -220,6 +232,15 @@ public static class StateDelta
 
 
                 changed += Timed("fleets", () => WriteFleetSection(galaxy, writer, primeOnly));
+
+                // The 2026-11-10 sections, in this order on the wire. Apply reads them in the
+                // same order; see StateDelta.Carried1110.cs for what each carries and why.
+                changed += Timed("vitals", () => WriteVitalsSection(galaxy, writer, primeOnly));
+                changed += Timed("colonyextras", () => WriteColonyExtrasSection(galaxy, writer, primeOnly));
+                changed += Timed("designcosts", () => WriteDesignCostsSection(galaxy, writer, primeOnly));
+                changed += Timed("money", () => WriteMoneySection(galaxy, writer, primeOnly));
+                changed += Timed("relations", () => WriteRelationsSection(galaxy, writer, primeOnly));
+
                 _gcDuringBuild[0] = GC.CollectionCount(0) - g0;
                 _gcDuringBuild[1] = GC.CollectionCount(1) - g1;
                 _gcDuringBuild[2] = GC.CollectionCount(2) - g2;
@@ -845,6 +866,25 @@ public static class StateDelta
             if (fleets + absentFleets > 0)
                 parts.Add($"{fleets} fleet(s)" + (absentFleets > 0 ? $" +{absentFleets} absent" : ""));
 
+            // The 2026-11-10 sections, read in the order Build writes them.
+            int vitals = ApplyVitalsSection(galaxy, reader, out int absentVitals);
+            int colonyExtras = ApplyColonyExtrasSection(galaxy, reader, out int absentColonyExtras);
+            int designCosts = ApplyDesignCostsSection(galaxy, reader, out int absentDesignCosts);
+            int money = ApplyMoneySection(galaxy, reader, out int absentMoney);
+            int relations = ApplyRelationsSection(galaxy, reader, out int absentRelations);
+
+            CountApplied("vitals", vitals);
+            CountApplied("colonyextras", colonyExtras);
+            CountApplied("designcosts", designCosts);
+            CountApplied("money", money);
+            CountApplied("relations", relations);
+
+            AddPart(parts, vitals, absentVitals, "ship vitals");
+            AddPart(parts, colonyExtras, absentColonyExtras, "colony extras");
+            AddPart(parts, designCosts, absentDesignCosts, "design cost(s)");
+            AddPart(parts, money, absentMoney, "empire money");
+            AddPart(parts, relations, absentRelations, "relation list(s)");
+
             info = string.Join(", ", parts) +
                    (hostShips != localShips ? $" [have {localShips} of host's {hostShips} ships]" : "") +
                    $", {payload.Length:N0}B";
@@ -855,6 +895,22 @@ public static class StateDelta
             info = (ex.InnerException ?? ex).Message;
             return false;
         }
+    }
+
+    private static void AddPart(List<string> parts, int applied, int absent, string label)
+    {
+        if (applied + absent == 0)
+        {
+            return;
+        }
+
+        string text = $"{applied} {label}";
+        if (absent > 0)
+        {
+            text += $" +{absent} absent";
+        }
+
+        parts.Add(text);
     }
 
     /// <summary>
