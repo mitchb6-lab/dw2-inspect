@@ -96,7 +96,7 @@ public static class AdoptionMemory
         }
     }
 
-    private static bool ProbeActive
+    internal static bool ProbeActive
     {
         get
         {
