@@ -2560,6 +2560,23 @@ Protocol stays **4**: nothing on the wire changed shape, only what the reader wi
   assimilation and reproduction rate swapped. DW2's constructor is `(raceId, amount,
   reproductionRate, assimilation)`; fixed in `PopulationArguments`, with a test.
 
+**Third two-instance run, on the hardened build** (same harness, 8,000 cycles, keyframes forced
+to 1 min, forced desync at joiner cycle 4,500). Five full states; the event keyframe waited for
+the 60 s floor; the joiner's quiet repair request was refused by it; the popup round trip
+succeeded again; 51 relation lists passed the header check; 0 mutation failures, no clock
+sample ignored, no delta refused, no unsolicited state held, no summary dropped:
+
+```
+host    # net[host]: full state #2 tick=2133 (keyframe after empire 2 eliminated, empire 4 eliminated, empire 6 eliminated)
+host    # net[host]: resync request ignored -- 27 s since the last full state (floor 60 s); 1 ignored so far
+host    # net[host]: full state #4 tick=5555 (desync popup: attempt resync)
+joiner  # desync: RESYNC SUCCEEDED -- structure agrees at host tick 5700
+joiner  [totals: ... colonyextras=446 designcosts=3,684 ... money=152 relations=51 ... vitals=2,257] [mutation failures=0 distinct=0]
+```
+
+That run shows an honest host is not hindered. Nothing in it was hostile: the limits
+themselves are exercised by the tests, not by a run.
+
 Not done: a session memory budget for adoptions (follow-up, above); a local-collection bound
 on sections that CREATE members (ship, colony, design, character and fleet additions), which
 have only the bytes-left bound because a creation is by definition not in the local
