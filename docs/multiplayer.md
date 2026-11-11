@@ -2871,7 +2871,8 @@ short of `DW2MP_DEV=1`, which enables every dev flag. The off path was not run i
   scanner and exploration overlays were seen drawing correctly after a release, and the log does
   not say whether either overlay was switched on during the run. That wants one attended session
   with both overlays on across an adoption.
-- **The other 7 MB of buffers per adoption**, and the 61 small resources (root signatures,
+- **The other 7 MB of buffers per adoption** (2026-11-11, later the same day: about 2.5 MB of
+  them are now released and the rest is named; see "Renderer release" below), and the 61 small resources (root signatures,
   pipeline states, constant buffers) are still DW2's leak. The same proof was not done for the
   other eight systems `CheckInitializeGraphics` re-creates (`_NebulaCloudSystem`,
   `_GalaxyBackgroundSystem`, `_TerritoryMapSystem`, `_SymbolSystem`, `_FlowSystem`,
@@ -2924,3 +2925,209 @@ minute, adoption memory probe on the joiner):
 That run did not exercise a resync (M1's exemption was used only for the join), the 30 s hold,
 the budget notice, or the N1 off path. The windows were minimised, so the overlays were not
 watched drawing.
+
+## Renderer release: the other discarded render systems' buffers -- 2026-11-11
+
+Built on `fix/renderer-release-1111`, the follow-up to "Overlay release" and its hardening. Wire
+protocol unchanged (net protocol **4**); nothing in the simulation is read or written.
+
+The question was the remaining ~7 MB of Stride buffers per adoption: the eight render systems
+`DWRendererBase.CheckInitializeGraphics(true)` re-creates besides the two map overlay systems.
+**Six of the eight are proven unreachable once replaced and their vertex and index buffers are
+now released: about 2.5 of the 7 MB. The other 4.6 MB belong to the nebula system, one of the
+two that could not be proven, and still stay.** See "Measured".
+
+### The sweep (game 1.3.8.4, read again for this change)
+
+A scratch tool on the `dw2inspect` loader and IL printer (`Loader.Prepare` on every type before
+any body is read) went through the four `DistantWorlds*` assemblies: 1,904 types, 26,633 method
+bodies, none the IL printer failed on, one type skipped (`DistantWorlds2.Core.Intrinsics`, whose
+static constructor ends the process outside the game; it is CPU feature code). It wrote every
+field of every type, every IL line naming one of the eight systems, and the whole IL of the 390
+types of the `DistantWorlds2` assembly.
+
+Facts that hold for all eight:
+
+- Each type derives from `object` and implements no interface, so only a field of that exact
+  type or an `object` could hold one. The fields of those types, in all four assemblies, are the
+  eight in `DWRendererBase`, two galaxy-preview fields in `MenuRenderer`
+  (`_GalaxyPreviewNebulaCloudSystem`, `_GalaxyPreviewGalaxyBackgroundSystem`),
+  `NebulaCloudSystem.SystemLevelNebulaCloudSystem`, and the `<>4__this` of three compiler-made
+  closure classes (one in `NebulaCloudSystem`, two in `SymbolSystem`).
+- Every instance is made by `newobj` and stored at once (`stfld`) in the field of the renderer
+  that made it: once for each of the eight in `DWRendererBase.CheckInitializeGraphics`, and for
+  the two preview fields in `MenuRenderer.CheckInitializeGraphics`. No field is ever copied into
+  another. The condition, the same for each, is `(field == null || !field.Initialized) |
+  forceReinitialization` (three of them also re-create when their textures were disposed).
+- `CheckInitializeGraphics` passes nothing of the old instance to the new one. The textures a new
+  instance is given come from `ScaledRenderer` (`GalaxyBackgroundTextures`, `Symbols`), so
+  textures are shared across instances and are **never** disposed here.
+- For every instruction that puts a reference to one of the seven non-nebula systems on the
+  stack (a load of the renderer field, a call of one of the four getters, a load of a typed
+  local), the instruction that follows was tabulated across the whole assembly. They are: a null
+  test, a load of one of the system's own fields, an argument for a call on the system itself, a
+  store to a local of that type (five `ScaledRenderer` button handlers, all plain methods), or
+  the `ret` of the four getters. Nothing stores one anywhere else, and no method outside the
+  system takes one as a parameter. (Nebula is the exception: `DWRendererBase.BindNebulaSystem`.)
+- The readers are `DWRendererBase.Update...System` (one method per system),
+  `CustomOrbRenderer.DrawCorePreSceneInternal` / `DrawCorePostSceneInternal`,
+  `UpdateMapOverlaySystems` (fleet overlay), `DrawEmpireTerritoryAndPaths` and
+  `DrawSystemCartouche(s)` (fleet overlay, through the getter), and the `ScaledRenderer` map
+  button handlers. Each loads the field again for each use.
+- Vertex and index buffers are created per instance: `EffectHelper.UpdateBuffers` /
+  `UpdateVertexBuffer` / `UpdateIndexBuffer` (`Buffer.Vertex.New`, `Buffer.New`, stored only
+  through the `ref` binding they were handed; they also replace a buffer they find disposed) and
+  `GeometryPrimitiveHelper.CreateBuffersFromVertices` (a class with no fields). No binding field
+  is written from outside its own type. `FlowSystem.AssignBuffers` and
+  `SymbolSystem.AssignBuffers`, which would take buffers from a caller, are never called.
+
+| System | Second holder | Closures capturing it | Effect instances | Verdict |
+|---|---|---|---|---|
+| `GalaxyBackgroundSystem` | none (the `MenuRenderer` preview field only ever gets its own `newobj`) | none | **shared static** `EffectHelper._GalaxyBackgroundEffect` | buffers released |
+| `TerritoryMapSystem` | none | none (one static lambda, no `this`) | 3 of its own | buffers released |
+| `FlowSystem` | none; `get_FlowSystem` callers use it at once or in a local | none | 1 of its own | buffers released |
+| `TravelVectorSystem` | none; getter as above | none | 1 of its own | buffers released |
+| `FleetOverlaySystem` | none; getter as above | none | **shared static** `EffectHelper._BasicColorEffect`, and 1 of its own | buffers released |
+| `AttackVectorSystem` | none; getter as above | none | 1 of its own | buffers released |
+| `NebulaCloudSystem` | **yes**: `SystemLevelNebulaCloudSystem` | one, used synchronously (`Parallel.For`) | 4 of its own | **left alone** |
+| `SymbolSystem` | none | **yes, two**: a thread-pool item and a `Task.Run` | 1 of its own | **left alone** |
+
+### The two that are left alone, and exactly why
+
+- **`NebulaCloudSystem`.** `ScaledRenderer.SetView`, `SetViewGalaxy`, `MoveViewNoZoom` and
+  `CheckChangeScene` pass one renderer's `_NebulaCloudSystem` to another renderer's
+  `BindNebulaSystem`, which stores it in that renderer's nebula system
+  (`NebulaCloudSystem.BindData(Location, NebulaCloudSystem, Galaxy)` writes
+  `SystemLevelNebulaCloudSystem`). `NebulaCloudSystem.Update` and `DrawStormClouds` then read
+  that field. So if renderer B's system is re-created and bound before renderer A's is
+  re-created, B's **live** system holds A's **discarded** one and draws through it until the
+  next bind. Whether that order can happen is not decided by the IL. A release would need a check
+  made at release time (is the discarded instance in any live system's
+  `SystemLevelNebulaCloudSystem`), which is a different kind of argument from the one used for
+  the six, so it was not built.
+- **`SymbolSystem`.** `SymbolSystem.Update` creates a closure that holds `this` and hands it to
+  `ThreadPoolHelpers.QueueUserWorkItem` and to `Task.Run`. Read instruction by instruction, the
+  delegates do: `UpdateGalaxyShipVisibility` (a `Parallel.For` over ships), one
+  `EffectInstance.Parameters.Set` (`SymbolKeys.AlphaLevel`), `GenerateVertexBuffer` (which fills
+  two CPU lists) and two `Interlocked.Exchange` flags. They never touch `_Vertices` or
+  `_Indices`; only `Update` (through `SymbolSystem.UpdateBuffers`) and `Draw` do. A buffers-only
+  release therefore looks safe, but the instance is **not** unreachable at the moment its field
+  is overwritten, which is the test the other six pass, so it is left alone and offered as the
+  next candidate rather than decided here.
+
+Also not released, for any system:
+
+- **Effect instances.** Two are statics shared by every instance (the table above), exactly the
+  trap the overlay systems had. The ones a system makes for itself own a root signature and
+  constant buffers (the 17 + 17 small resources per adoption), and `SymbolSystem`'s is written
+  from a background delegate. What Stride does with a pipeline state whose root signature has
+  been disposed was not read.
+- **Pipeline states.** Every `SetupPipelineState` calls Stride's `PipelineState.New`. In Stride
+  that is a lookup in a cache on the graphics device keyed by the description, so two instances
+  built on a shared effect can be handed the same object. Not read in Stride's IL, so not touched.
+- `_BillboardSystem` and `_AreaBlastWaveSystem`, which `CheckInitializeGraphics` also assigns
+  under their own conditions, were not examined.
+
+### What the mod does
+
+`src\Dw2Mp\SystemBufferRelease.cs`, called only by `OverlayRelease`, so the same Harmony patch,
+the same off switch (`DW2MP_OVERLAY_RELEASE=0`), the same game-build gate (1.3.8.4 only), the same
+stub-body wait and the joiner only. The decision table is data: `RenderSystemCatalog` in
+`src\Shared\DiscardedSystemBuffers.cs`, with the reason for each system that is not released.
+
+- **Prefix.** Only when `CheckInitializeGraphics` is called with `forceReinitialization` true
+  (the path an adoption takes) the tracked fields are remembered. An ordinary frame costs one
+  comparison. A system DW2 replaces without the flag (it was missing, not initialised, or its
+  textures were disposed) is not noticed and stays DW2's leak.
+- **Postfix.** For a field that now holds another instance, the old instance's binding fields
+  are read on the spot (a binding, a dictionary of bindings, or a dictionary of lists of
+  bindings) and its buffers go into a waiting list as one `DiscardedBufferSet`. The list holds
+  the buffers strongly and the discarded system only weakly, as the hardening of the overlay
+  queue requires. It is a second instance of `DiscardedResourceQueue` with its own ceiling
+  (48 systems), so the overlay queue and its reviewed ceiling of 8 are unchanged.
+- **Release**, on the main thread, after **10 seconds and 60 main-thread updates**: a system that
+  is back in a field of any renderer seen is forgotten instead; a buffer a live system also
+  names, a buffer already disposed, and a placeholder that was never created on the device
+  (`new Buffer()`, size 0) are not disposed; each remaining buffer is disposed once. The
+  discarded instance, if still alive, gets `Enabled = false` first: `CustomOrbRenderer` tests
+  `Enabled` before every `Draw` of these six systems.
+- A field named in the catalog that is missing, or is not a binding or a container of bindings,
+  switches that system off at install (one log line). Nothing of an unproven system is read in a
+  player's game; with the developer memory probe on, the size of what a discarded nebula or
+  symbol system still holds is logged, and that is where the numbers below come from.
+- The first exception is logged once (`# overlay: *** FAILED (render system buffers) ...`) and
+  ends this release for the session. It has its own switch: it cannot stop the render targets
+  from being released.
+
+### Measured: one two-instance run, six adoptions
+
+`Scripts\net-twoinstance.ps1 -Cycles 10000 -ExtraHostEnv DW2MP_KEYFRAME_MINUTES=1
+-ExtraJoinerEnv DW2MP_ADOPTION_MEMORY_PROBE=1` (`DW2MP_DEV=1` is set by the harness), both windows
+minimised, 30 stars. Settled readings on the joiner, MB. "Before" is the seven-adoption run of
+"Overlay release" above (same harness and settings, render targets already released).
+
+| Adoption | buffers before | buffers after | textures after | private after | other after |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 110 | 100 | 2,424 | 5,854 | 5,374 |
+| 2 | 117 (+7) | 105 (+5) | 2,424 (+0) | 5,875 | 5,381 |
+| 3 | 124 (+7) | 109 (+4) | 2,424 (+0) | 5,868 | 5,390 |
+| 4 | 131 (+7) | 114 (+5) | 2,424 (+0) | 5,878 | 5,399 |
+| 5 | 138 (+7) | 118 (+4) | 2,424 (+0) | 5,871 | 5,409 |
+| 6 | 145 (+7) | 123 (+5) | 2,424 (+0) | 5,841 | 5,390 |
+
+- **Stride buffers: +7 MB per adoption before, +4.6 MB after** (+23 MB over five adoptions).
+  Every adoption queued and, ten seconds later, released the same thing: **9 buffers, about
+  2.5 MB** (2,517 KB the first time, 2,506 KB after), from four discarded systems in two renderers. The log shows the counter falling each time, for
+  example `Stride buffers 107.08 MB -> 105.85 MB` and then `-> 104.63 MB`. 54 buffers, 15,045 KB
+  in the run; none skipped (0 named twice, 0 never created, 0 already disposed, 0 held by a live
+  system), 0 dropped by the queue, at most 4 systems waiting.
+- **Where the 7 MB is, per adoption, as logged:**
+
+  | System | Buffers | Size | |
+  |---|---:|---:|---|
+  | `TerritoryMapSystem`, in two renderers | 2 + 2 | 1,248 KB each renderer | released |
+  | `FleetOverlaySystem` | 3 | 10 KB | released |
+  | `GalaxyBackgroundSystem` | 2 | under 1 KB | released |
+  | `NebulaCloudSystem` | 4 | **4,611 KB** | left alone |
+  | `SymbolSystem` | 0 | 0 | left alone; it had no buffers in this run |
+
+  2,506 KB released and 4,611 KB left add up to the 7 MB. **What still grows is the nebula
+  system, and only it.** At the default five-minute keyframe that is about 55 MB an hour.
+- **Textures stayed flat** at 2,424 MB: 12 render targets released in six adoptions, as before.
+- Private bytes were 5,854 at the first settled reading and 5,841 at the sixth. `other` rose 7
+  to 10 MB an adoption for four adoptions and then fell 19. Releasing 2.5 MB cannot explain a
+  change of that size against the +22 an adoption of the overlay run, so it is recorded and not
+  claimed.
+- The probe's list of what an adoption creates is unchanged (63 resources: 17 root signatures,
+  16 typed buffers, 17 constant buffers, 8 pipeline states, 2 render targets, 3 index buffers).
+  What changed is the other column: **13 gone** since the previous adoption, where it was 2
+  before anything was released (the 2 render targets and the 9 buffers are the difference).
+- Zero `FAILED` lines in either log and zero exceptions in the joiner's, 6 full states adopted,
+  none held, both sync checks OK, no desync incident, no mutation failure. Both games reached `# run complete`
+  and left on their own with the session lock removed; the harness exited 0. No "Send Error
+  Information" window at the three checks made while the games ran or the two after they left.
+
+**A first run with the wrong flags.** The run before this one was started with the two
+`-Extra...Env` values in single quotes, which reached the script as part of the variable names,
+so neither flag was set: keyframes at the default five minutes, no probe, two adoptions. It is not the evidence above, but it is a run of the same build as a
+player's game would run it: 18 buffers, 5,012 KB released, no failure line, clean exit. Its logs
+are kept beside the others.
+
+### Not done
+
+- **Flow, travel vector and attack vector systems had no buffers in either run** (those map
+  overlays were never switched on), so for three of the six released systems the collecting and
+  disposing code ran with nothing to do. Their proof is the IL; their release has not happened
+  in a game yet.
+- **Nobody looked at the picture**, again. Both windows were minimised. The territory map is the
+  system whose buffers are now disposed at every adoption; it should be watched drawing, with the
+  fleet overlay on, across at least one adoption in an attended session.
+- **The nebula system's 4.6 MB per adoption**, for the reason given above. The follow-up that
+  could release it is a check at release time that no live nebula system names the discarded
+  one, plus the same argument for its `Parallel.For` closure; it wants its own review.
+- `SymbolSystem`: left alone on the closure rule although the delegates read as harmless. It
+  held nothing in this run, so nothing is known about how much it would give back.
+- The 42 small resources per adoption (root signatures, constant buffers, pipeline states) and
+  the `_BillboardSystem` / `_AreaBlastWaveSystem` fields.
+- The off switch, a game build outside 1.3.8.4, and the stub-body wait were not run in the game.
+  Host side: not installed. One PC, one GPU and driver, the 30-star harness galaxy.
