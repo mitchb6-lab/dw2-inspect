@@ -29,6 +29,7 @@
     <Compile Include="..\Shared\GalaxyEvents.cs" Link="Shared\GalaxyEvents.cs" />
     <Compile Include="..\Shared\SyncThresholds.cs" Link="Shared\SyncThresholds.cs" />
     <Compile Include="..\Shared\SyncGuards.cs" Link="Shared\SyncGuards.cs" />
+    <Compile Include="..\Shared\SessionMemoryBudget.cs" Link="Shared\SessionMemoryBudget.cs" />
     <Compile Include="..\Shared\DivergenceReport.cs" Link="Shared\DivergenceReport.cs" />
     <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
     <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />

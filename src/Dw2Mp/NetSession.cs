@@ -255,6 +255,7 @@ public static class NetSession
         else
         {
             HostPause.Install(harmony, log);
+            AdoptionMemory.Install(log);
         }
         InstallCommandRelay(harmony, log);
 
@@ -1151,6 +1152,7 @@ public static class NetSession
         DrainDeltas();
         HostPause.FollowHost();
         ProcessPendingSummaries();
+        AdoptionMemory.OnMainThreadUpdate();
 
         if (_inbound.IsEmpty) return;
 

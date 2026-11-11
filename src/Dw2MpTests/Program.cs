@@ -80,6 +80,9 @@ public static partial class Program
         // The hardening that followed the security review of protocol 4: see SecurityHardeningTests.cs.
         RunSecurityHardeningTests();
 
+        // 2026-11-11 session memory budget for adoptions: see AdoptionMemoryTests.cs.
+        RunAdoptionMemoryTests();
+
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");
         foreach (var failure in _failures)
