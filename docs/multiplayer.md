@@ -2912,7 +2912,15 @@ waits: a keyframe already on the wire when "Attempt resync" is chosen lands firs
 the exemption, and the resync state behind it is held for up to 30 s. It is still adopted and
 checked inside the 60 s resync deadline.
 
-Not run in the game: every change here is covered by the console tests (431 checks) or is a log
-line. The weak-reference change means the build that was run on 2026-11-11 (two two-instance
-runs, above) is not byte for byte the one on this branch; the release path itself (same
-texture, same `Dispose`, same main-thread moment) is unchanged.
+Every change here is covered by the console tests (431 checks) or is a log line.
+
+In game (2026-11-11, one `net-twoinstance.ps1 -Cycles 8000` run of this build, keyframes once a
+minute, adoption memory probe on the joiner):
+- Five adoptions. Joiner textures stayed flat at 2,540 MB.
+- Ten render targets were released, with zero `FAILED` lines and `0 ever dropped` from the queue.
+- Only the throwaway galaxy from adoption #1 stayed alive, so the weak owner pins nothing.
+- No held states, no desync, and both games exited cleanly.
+
+That run did not exercise a resync (M1's exemption was used only for the join), the 30 s hold,
+the budget notice, or the N1 off path. The windows were minimised, so the overlays were not
+watched drawing.
