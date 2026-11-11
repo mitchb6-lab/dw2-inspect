@@ -437,7 +437,7 @@ public static class AdoptionMemory
     /// Stride's own count of graphics memory, in megabytes; -1 when it cannot be read. An integer
     /// counter is taken as bytes and a floating-point one as megabytes.
     /// </summary>
-    private static double ReadGraphicsCounterMegabytes(string memberName)
+    internal static double ReadGraphicsCounterMegabytes(string memberName)
     {
         try
         {

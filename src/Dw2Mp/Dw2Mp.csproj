@@ -41,6 +41,7 @@
     <Compile Include="..\Shared\SyncThresholds.cs" Link="Shared\SyncThresholds.cs" />
     <Compile Include="..\Shared\SyncGuards.cs" Link="Shared\SyncGuards.cs" />
     <Compile Include="..\Shared\SessionMemoryBudget.cs" Link="Shared\SessionMemoryBudget.cs" />
+    <Compile Include="..\Shared\DiscardedResourceQueue.cs" Link="Shared\DiscardedResourceQueue.cs" />
   </ItemGroup>
 
   <!--
