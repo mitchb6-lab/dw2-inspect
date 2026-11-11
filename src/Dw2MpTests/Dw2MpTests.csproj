@@ -31,6 +31,7 @@
     <Compile Include="..\Shared\SyncGuards.cs" Link="Shared\SyncGuards.cs" />
     <Compile Include="..\Shared\SessionMemoryBudget.cs" Link="Shared\SessionMemoryBudget.cs" />
     <Compile Include="..\Shared\DiscardedResourceQueue.cs" Link="Shared\DiscardedResourceQueue.cs" />
+    <Compile Include="..\Shared\DiscardedSystemBuffers.cs" Link="Shared\DiscardedSystemBuffers.cs" />
     <Compile Include="..\Shared\DivergenceReport.cs" Link="Shared\DivergenceReport.cs" />
     <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
     <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />

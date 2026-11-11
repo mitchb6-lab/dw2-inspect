@@ -65,6 +65,12 @@ namespace Dw2Mp;
 ///
 /// Joiner only: that is where the leak repeats and where it was verified. Off switch:
 /// DW2MP_OVERLAY_RELEASE=0 (an off switch, not a dev flag: the lobby lets it through).
+///
+/// THE OTHER RENDER SYSTEMS (same day, later): the same patch also tells SystemBufferRelease
+/// which of the other galaxy-bound systems CheckInitializeGraphics replaced, and that class
+/// releases the vertex and index buffers of the ones proven unreachable. It has its own
+/// waiting list and its own failure switch, so nothing there can stop the render targets from
+/// being released; this class's gates (off switch, game build) come first for both.
 /// </summary>
 public static class OverlayRelease
 {
@@ -78,6 +84,9 @@ public static class OverlayRelease
         public bool Captured;
         public object LongRangeScanner;
         public object ExplorationDiplomacy;
+
+        /// <summary>What SystemBufferRelease remembered about the other render systems. Null on an ordinary frame.</summary>
+        public object[] OtherRenderSystems;
     }
 
     private static readonly object _gate = new();
@@ -177,6 +186,8 @@ public static class OverlayRelease
             DiscardedResourceQueue.DefaultMinimumUpdates,
             DiscardedResourceQueue.DefaultMaximumPending);
 
+        SystemBufferRelease.Prepare(rendererType, log);
+
         _patchPending = true;
         TryPatchGuarded();
     }
@@ -268,7 +279,11 @@ public static class OverlayRelease
     // ------------------------------------------------------------------ the patch
 
     /// <summary>Harmony prefix on DWRendererBase.CheckInitializeGraphics(bool). Every frame, every renderer: keep it cheap.</summary>
-    private static void BeforeCheckInitializeGraphics(object __instance, out OverlaySystemsBefore __state)
+    /// <remarks>
+    /// Harmony names an original method's arguments by position: __0 is CheckInitializeGraphics's
+    /// one parameter, forceReinitialization.
+    /// </remarks>
+    private static void BeforeCheckInitializeGraphics(object __instance, bool __0, out OverlaySystemsBefore __state)
     {
         __state = default;
 
@@ -287,7 +302,12 @@ public static class OverlayRelease
         {
             __state = default;
             StopAfterFailure("the CheckInitializeGraphics prefix", exception);
+            return;
         }
+
+        // Guards itself: a failure in there stops only the release of the other systems' buffers.
+        bool forceReinitialization = __0;
+        __state.OtherRenderSystems = SystemBufferRelease.CaptureBefore(__instance, forceReinitialization);
     }
 
     /// <summary>Harmony postfix: an overlay field that holds a different instance now has discarded the old one.</summary>
@@ -297,6 +317,9 @@ public static class OverlayRelease
         {
             return;
         }
+
+        // Guards itself, like the call in the prefix.
+        SystemBufferRelease.NoteAfter(__instance, __state.OtherRenderSystems);
 
         try
         {
@@ -343,8 +366,10 @@ public static class OverlayRelease
 
             if (queued > 0)
             {
-                _log($"# overlay: {__instance.GetType().Name} replaced {queued} map overlay system(s); " +
-                     $"their render targets are released in {DiscardedResourceQueue.DefaultDelaySeconds.ToString("0", CultureInfo.InvariantCulture)} s " +
+                string rendererName = __instance.GetType().Name;
+                string delayText = DiscardedResourceQueue.DefaultDelaySeconds.ToString("0", CultureInfo.InvariantCulture);
+                _log($"# overlay: {rendererName} replaced {queued} map overlay system(s); " +
+                     $"their render targets are released in {delayText} s " +
                      $"({waiting} waiting, {droppedQueueFull} ever dropped because the queue was full)");
             }
         }
@@ -396,6 +421,10 @@ public static class OverlayRelease
         {
             TryPatchGuarded();
         }
+
+        // Before this class's own switch is looked at: buffers already waiting are still
+        // released if the render target release has stopped. Guards itself.
+        SystemBufferRelease.OnMainThreadUpdate();
 
         if (!_active)
         {

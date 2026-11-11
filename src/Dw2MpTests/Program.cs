@@ -89,6 +89,9 @@ public static partial class Program
         // 2026-11-11 fixes from the security review of the two above: see MemoryHardeningTests.cs.
         RunMemoryHardeningTests();
 
+        // 2026-11-11 release of the other discarded render systems' buffers: see RendererReleaseTests.cs.
+        RunRendererReleaseTests();
+
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");
         foreach (var failure in _failures)
