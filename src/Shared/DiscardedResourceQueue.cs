@@ -15,14 +15,20 @@ namespace Dw2MpShared;
 ///   - nothing is handed out before BOTH a wall-clock delay and a number of main-thread updates
 ///     have passed since the replacement, so a frame that was already being drawn is long over
 ///     and a process that was frozen for the whole delay still gets its frames first;
-///   - at that moment the caller is asked whether the object is in use again. One that is, is
-///     forgotten, never handed out: if the game discards it again it is noticed again;
-///   - an object is queued once however often it is reported, and the queue has a ceiling. Past
+///   - at that moment the caller is asked whether the object or its resource is in use again.
+///     One that is, is forgotten, never handed out: if the game discards it again it is noticed
+///     again;
+///   - a resource is queued once however often it is reported, and the queue has a ceiling. Past
 ///     the ceiling a replacement is counted and not queued: that is the game's leak coming back,
 ///     which is safe, where an unbounded list would not be.
 ///
-/// It holds the discarded objects strongly until they are handed out or forgotten, and not one
-/// frame longer. Pure .NET: it knows nothing about Stride, Harmony or DW2. Tested.
+/// WHAT IT HOLDS (security review of 2026-11-11): the RESOURCE strongly, because releasing it is
+/// what the queue is for and a texture pins nothing else; the discarded OWNER only weakly. A
+/// discarded MapOverlaySystem still points at the galaxy it was built for, about 26 MB, and a
+/// host that sent states back to back could otherwise have parked one whole galaxy per queue
+/// slot here for the length of the delay. The ceiling is 8 for the same reason.
+///
+/// Pure .NET: it knows nothing about Stride, Harmony or DW2. Tested.
 /// </summary>
 public sealed class DiscardedResourceQueue
 {
@@ -32,21 +38,41 @@ public sealed class DiscardedResourceQueue
     /// <summary>Main-thread updates that must also have passed. At 30 frames a second this is two seconds.</summary>
     public const int DefaultMinimumUpdates = 60;
 
-    /// <summary>Two overlays on a handful of renderers per adoption; 64 is several adoptions inside one delay.</summary>
-    public const int DefaultMaximumPending = 64;
+    /// <summary>
+    /// Two overlays per renderer per adoption, and an unsolicited adoption at most every 30 s
+    /// (AdoptionGate) against a 10 s delay: an honest session has two waiting, rarely four.
+    /// </summary>
+    public const int DefaultMaximumPending = 8;
 
-    /// <summary>One discarded object waiting for its release.</summary>
+    /// <summary>One discarded resource waiting for its release.</summary>
     public sealed class PendingRelease
     {
-        /// <summary>The object the game replaced.</summary>
-        public object Discarded;
+        /// <summary>The graphics resource to release. Held strongly.</summary>
+        public object Resource;
 
-        /// <summary>Which field it was replaced in, for the log.</summary>
+        /// <summary>The object the game replaced, which owned the resource. Held weakly: see the class remarks.</summary>
+        public WeakReference OwnerReference;
+
+        /// <summary>Which field the owner was replaced in, for the log.</summary>
         public string SlotName;
 
         public double DueAtSeconds;
 
         public long DueAtUpdate;
+
+        /// <summary>The owner if it is still alive, otherwise null. Nothing the game still uses can be null here.</summary>
+        public object Owner
+        {
+            get
+            {
+                if (OwnerReference is null)
+                {
+                    return null;
+                }
+
+                return OwnerReference.Target;
+            }
+        }
     }
 
     private static readonly IReadOnlyList<PendingRelease> NothingDue = Array.Empty<PendingRelease>();
@@ -64,7 +90,7 @@ public sealed class DiscardedResourceQueue
         _maximumPending = maximumPending;
     }
 
-    /// <summary>Objects waiting now.</summary>
+    /// <summary>Resources waiting now.</summary>
     public int PendingCount
     {
         get
@@ -76,10 +102,10 @@ public sealed class DiscardedResourceQueue
     /// <summary>Replacements that were queued.</summary>
     public long QueuedCount { get; private set; }
 
-    /// <summary>Objects handed out for release.</summary>
+    /// <summary>Resources handed out for release.</summary>
     public long HandedOutCount { get; private set; }
 
-    /// <summary>Objects that were in use again when their time came, and were forgotten instead.</summary>
+    /// <summary>Resources that were in use again when their time came, and were forgotten instead.</summary>
     public long KeptInUseCount { get; private set; }
 
     /// <summary>Replacements not queued because the queue was full.</summary>
@@ -100,10 +126,11 @@ public sealed class DiscardedResourceQueue
     }
 
     /// <summary>
-    /// Report what one field held before and after the game's own code ran. Queues the old
-    /// object when it was really replaced. Returns true when it was queued.
+    /// Report what one field held before and after the game's own code ran, and the resource the
+    /// old object owned. Queues that resource when the object was really replaced. Returns true
+    /// when it was queued.
     /// </summary>
-    public bool NoteReplacement(string slotName, object before, object after, double nowSeconds)
+    public bool NoteReplacement(string slotName, object before, object after, object resourceOfBefore, double nowSeconds)
     {
         if (before is null)
         {
@@ -115,9 +142,14 @@ public sealed class DiscardedResourceQueue
             return false;
         }
 
+        if (resourceOfBefore is null)
+        {
+            return false;
+        }
+
         foreach (PendingRelease waiting in _pending)
         {
-            if (ReferenceEquals(waiting.Discarded, before))
+            if (ReferenceEquals(waiting.Resource, resourceOfBefore))
             {
                 return false;
             }
@@ -130,7 +162,8 @@ public sealed class DiscardedResourceQueue
         }
 
         PendingRelease pending = new PendingRelease();
-        pending.Discarded = before;
+        pending.Resource = resourceOfBefore;
+        pending.OwnerReference = new WeakReference(before);
         pending.SlotName = slotName;
         pending.DueAtSeconds = nowSeconds + _delaySeconds;
         pending.DueAtUpdate = _updates + _minimumUpdates;
@@ -140,11 +173,12 @@ public sealed class DiscardedResourceQueue
     }
 
     /// <summary>
-    /// Call once per main-thread update. Returns the discarded objects whose wait is over and
-    /// that <paramref name="isInUseNow"/> says are not in use; the caller releases them. The
-    /// queue forgets every object it returns and every object found in use.
+    /// Call once per main-thread update. Returns the resources whose wait is over and that
+    /// <paramref name="isInUseNow"/> says are not in use; the caller releases them. The predicate
+    /// is given the owner (null once it has been collected) and the resource. The queue forgets
+    /// everything it returns and everything found in use.
     /// </summary>
-    public IReadOnlyList<PendingRelease> TakeDue(double nowSeconds, Func<object, bool> isInUseNow)
+    public IReadOnlyList<PendingRelease> TakeDue(double nowSeconds, Func<object, object, bool> isInUseNow)
     {
         _updates++;
 
@@ -171,7 +205,7 @@ public sealed class DiscardedResourceQueue
 
             _pending.RemoveAt(index);
 
-            if (isInUseNow(waiting.Discarded))
+            if (isInUseNow(waiting.Owner, waiting.Resource))
             {
                 KeptInUseCount++;
                 continue;

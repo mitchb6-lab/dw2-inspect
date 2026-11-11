@@ -163,3 +163,18 @@ public sealed class DesyncPolicy
         return "Desync-" + now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".DWGame";
     }
 }
+
+/// <summary>
+/// May a notice that has nothing to do with a desync (the session memory budget) be shown now?
+/// Not while a desync incident is open (security review of 2026-11-11, M3): the popup queue is
+/// two deep, and a host that kept an incident open could have had the one memory notice of the
+/// session dropped, or shown over the choice the player has to make. It waits until the phase
+/// is Idle again.
+/// </summary>
+public static class UnrelatedNotice
+{
+    public static bool MayQueueNow(DesyncPhase phase)
+    {
+        return phase == DesyncPhase.Idle;
+    }
+}

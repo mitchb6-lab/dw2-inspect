@@ -35,17 +35,31 @@ namespace Dw2Mp;
 ///     statics; only MapOverlaySystem.Initialize obtains them), so after an adoption they can
 ///     still name the old texture. That stale entry is never drawn: the only code that applies
 ///     those effects is MapOverlaySystem.Draw, which first sets Image to its own BackBuffer.
-///   - MapOverlaySystem.Draw itself skips a BackBuffer that is null or IsDisposed.
+///
+/// WHAT IS NOT A BARRIER (corrected after the security review of 2026-11-11): Draw does check
+/// BackBuffer for null and IsDisposed, at IL_0113..IL_0128, but only AFTER it has called
+/// UpdateOverlay at IL_0046, and UpdateOverlay binds and clears BackBuffer unchecked whenever
+/// two seconds have passed or ForceRefresh is set. A discarded instance that somebody did draw
+/// would use the disposed render target before that check is reached. The barriers are the
+/// two below, not DW2's check:
+///
+///   1. unreachability, as swept above: nothing in the game can call Draw on a discarded one;
+///   2. Enabled = false, set on the discarded instance just before the release. Both callers
+///      of Draw test Enabled first.
 ///
 /// WHAT THIS CLASS DOES: a prefix and a postfix on CheckInitializeGraphics compare the two
-/// fields before and after. A replaced instance waits in a DiscardedResourceQueue for ten
-/// seconds and sixty main-thread updates; then, on the main thread, its BackBuffer is disposed.
+/// fields before and after. A replaced instance's BackBuffer waits in a DiscardedResourceQueue
+/// for ten seconds and sixty main-thread updates; then, on the main thread, it is disposed.
+/// The queue holds the texture strongly and the discarded instance only weakly, because the
+/// instance still points at the galaxy it was built for.
 ///
 /// WHAT IT NEVER DOES:
 ///   - dispose anything belonging to an instance that is in either field of any renderer seen,
 ///     or a texture that such an instance holds;
 ///   - dispose the discarded instance's effects (shared, see above), its SpriteBatch or its
 ///     plane buffers (small; not proven the same way -- see docs/multiplayer.md);
+///   - run on a game build other than the one its proof was read from: the sweep above is of
+///     1.3.8.4 and says nothing about who holds a MapOverlaySystem in any other build;
 ///   - keep going after a failure: the first exception is logged once and the release stops
 ///     for the rest of the session, which leaves DW2's own behaviour (the leak).
 ///
@@ -109,6 +123,17 @@ public static class OverlayRelease
         if (!enabled)
         {
             log($"# overlay: OFF ({OffSwitchVariable}=0): DW2 keeps two 2048x2048 render targets per adoption, about 32 MB each time");
+            return;
+        }
+
+        // Install runs once, so this is logged once.
+        string gameVersion = NetSession.GameVersion();
+        bool knownBuild = GameBuild.IsKnown(gameVersion, SnapshotHash.KnownBuildPrefixes);
+        if (!knownBuild)
+        {
+            string knownBuilds = string.Join(", ", SnapshotHash.KnownBuildPrefixes);
+            log($"# overlay: OFF -- game build {gameVersion} is not one the release was proven safe on ({knownBuilds}); " +
+                "DW2 keeps two 2048x2048 render targets per adoption, about 32 MB each time, until the IL has been read again for this build");
             return;
         }
 
@@ -290,6 +315,11 @@ public static class OverlayRelease
                 return;
             }
 
+            // The render targets are read now, while this frame still holds the old instances:
+            // the queue keeps the texture and lets go of the instance (and of its galaxy).
+            object longRangeScannerRenderTarget = RenderTargetOf(__state.LongRangeScanner);
+            object explorationDiplomacyRenderTarget = RenderTargetOf(__state.ExplorationDiplomacy);
+
             double nowSeconds = NowSeconds();
             int queued = 0;
             int waiting;
@@ -297,12 +327,12 @@ public static class OverlayRelease
 
             lock (_gate)
             {
-                if (_queue.NoteReplacement(LongRangeScannerFieldName, __state.LongRangeScanner, longRangeScannerNow, nowSeconds))
+                if (_queue.NoteReplacement(LongRangeScannerFieldName, __state.LongRangeScanner, longRangeScannerNow, longRangeScannerRenderTarget, nowSeconds))
                 {
                     queued++;
                 }
 
-                if (_queue.NoteReplacement(ExplorationDiplomacyFieldName, __state.ExplorationDiplomacy, explorationDiplomacyNow, nowSeconds))
+                if (_queue.NoteReplacement(ExplorationDiplomacyFieldName, __state.ExplorationDiplomacy, explorationDiplomacyNow, explorationDiplomacyRenderTarget, nowSeconds))
                 {
                     queued++;
                 }
@@ -322,6 +352,16 @@ public static class OverlayRelease
         {
             StopAfterFailure("the CheckInitializeGraphics postfix", exception);
         }
+    }
+
+    private static object RenderTargetOf(object overlaySystem)
+    {
+        if (overlaySystem is null)
+        {
+            return null;
+        }
+
+        return _backBufferField.GetValue(overlaySystem);
     }
 
     private static void RememberRenderer(object renderer)
@@ -375,7 +415,6 @@ public static class OverlayRelease
     private static void ReleaseWhatIsDue()
     {
         IReadOnlyList<DiscardedResourceQueue.PendingRelease> due;
-        List<object> overlaySystemsInUse;
 
         lock (_gate)
         {
@@ -386,8 +425,8 @@ public static class OverlayRelease
                 return;
             }
 
-            overlaySystemsInUse = OverlaySystemsInUse();
-            due = _queue.TakeDue(NowSeconds(), candidate => DiscardedResourceQueue.IsAmong(candidate, overlaySystemsInUse));
+            List<object> overlaySystemsInUse = OverlaySystemsInUse();
+            due = _queue.TakeDue(NowSeconds(), (discardedSystem, renderTarget) => IsInUse(discardedSystem, renderTarget, overlaySystemsInUse));
         }
 
         if (due.Count == 0)
@@ -402,7 +441,7 @@ public static class OverlayRelease
 
         foreach (DiscardedResourceQueue.PendingRelease pending in due)
         {
-            string releasedSize = ReleaseRenderTarget(pending.Discarded, overlaySystemsInUse);
+            string releasedSize = ReleaseRenderTarget(pending);
             if (releasedSize is null)
             {
                 skipped++;
@@ -415,19 +454,42 @@ public static class OverlayRelease
 
         _renderTargetsReleased += released;
         double texturesAfter = AdoptionMemory.ReadGraphicsCounterMegabytes("TextureMemory");
-
         string texturesBeforeText = texturesBefore.ToString("N0", CultureInfo.InvariantCulture);
         string texturesAfterText = texturesAfter.ToString("N0", CultureInfo.InvariantCulture);
 
         _log($"# overlay: released {released} discarded map overlay render target(s){sizeText}, " +
-             $"{skipped} skipped (none, already disposed or shared with a live overlay); " +
+             $"{skipped} skipped (already disposed); " +
              $"Stride textures {texturesBeforeText} MB -> {texturesAfterText} MB; " +
              $"{_renderTargetsReleased} released this session");
     }
 
-    private static bool AlwaysInUse(object candidate)
+    private static bool AlwaysInUse(object discardedSystem, object renderTarget)
     {
         return true;
+    }
+
+    /// <summary>
+    /// True when the discarded overlay system is back in a renderer field, or a system that is
+    /// in one holds the very same render target. The discarded system is null once it has been
+    /// collected, and a collected object is in no field.
+    /// </summary>
+    private static bool IsInUse(object discardedSystem, object renderTarget, List<object> overlaySystemsInUse)
+    {
+        if (DiscardedResourceQueue.IsAmong(discardedSystem, overlaySystemsInUse))
+        {
+            return true;
+        }
+
+        foreach (object systemInUse in overlaySystemsInUse)
+        {
+            object renderTargetInUse = _backBufferField.GetValue(systemInUse);
+            if (ReferenceEquals(renderTargetInUse, renderTarget))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Every overlay system that is in either field of any renderer seen, right now. Caller holds the gate.</summary>
@@ -462,25 +524,11 @@ public static class OverlayRelease
 
     /// <summary>
     /// Disposes one discarded overlay system's render target. Returns its size as text, or null
-    /// when nothing was disposed (no render target, already disposed, or a live overlay holds
-    /// the very same texture).
+    /// when nothing was disposed (it was already disposed, or is not disposable).
     /// </summary>
-    private static string ReleaseRenderTarget(object discardedSystem, List<object> overlaySystemsInUse)
+    private static string ReleaseRenderTarget(DiscardedResourceQueue.PendingRelease pending)
     {
-        object renderTarget = _backBufferField.GetValue(discardedSystem);
-        if (renderTarget is null)
-        {
-            return null;
-        }
-
-        foreach (object systemInUse in overlaySystemsInUse)
-        {
-            object renderTargetInUse = _backBufferField.GetValue(systemInUse);
-            if (ReferenceEquals(renderTargetInUse, renderTarget))
-            {
-                return null;
-            }
-        }
+        object renderTarget = pending.Resource;
 
         object isDisposed = AccessTools.Property(renderTarget.GetType(), "IsDisposed")?.GetValue(renderTarget);
         if (isDisposed is true)
@@ -496,10 +544,16 @@ public static class OverlayRelease
         object width = AccessTools.Property(renderTarget.GetType(), "Width")?.GetValue(renderTarget);
         object height = AccessTools.Property(renderTarget.GetType(), "Height")?.GetValue(renderTarget);
 
-        // A second barrier, should the reading of DW2's IL above ever be wrong: both callers of
-        // MapOverlaySystem.Draw check Enabled first, so a discarded instance that somebody did
-        // still hold would draw nothing instead of drawing into a disposed render target.
-        _enabledField.SetValue(discardedSystem, false);
+        // The second barrier (the first is that nothing in the game can reach a discarded
+        // instance): both callers of MapOverlaySystem.Draw test Enabled first, so a discarded
+        // instance that somebody did still hold would draw nothing. DW2's own disposed-check in
+        // Draw is NOT a barrier: UpdateOverlay has used the render target before it is reached.
+        // An instance that has already been collected needs no barrier.
+        object discardedSystem = pending.Owner;
+        if (discardedSystem is not null)
+        {
+            _enabledField.SetValue(discardedSystem, false);
+        }
 
         disposable.Dispose();
 

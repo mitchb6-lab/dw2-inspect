@@ -45,7 +45,11 @@ public static partial class Program
 
         bool noticeAtLimit = budget.Record(baseline + 1536 * TestMegabyte);
         Check("budget: reaching the limit is the notice", noticeAtLimit);
-        Check("budget: notice recorded as given", budget.NoticeGiven);
+
+        // The caller queued the popup, so it tells the budget (see MemoryHardeningTests.cs for
+        // the case where it could not).
+        budget.ConfirmNoticeGiven();
+        Check("budget: notice recorded as given once the caller confirms it", budget.NoticeGiven);
 
         bool noticeAgain = budget.Record(baseline + 3 * TestGigabyte);
         Check("budget: never a second notice in the same session", !noticeAgain);

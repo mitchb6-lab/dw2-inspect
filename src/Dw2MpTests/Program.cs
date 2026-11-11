@@ -86,6 +86,9 @@ public static partial class Program
         // 2026-11-11 release of the render targets DW2 discards at an adoption: see OverlayReleaseTests.cs.
         RunOverlayReleaseTests();
 
+        // 2026-11-11 fixes from the security review of the two above: see MemoryHardeningTests.cs.
+        RunMemoryHardeningTests();
+
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");
         foreach (var failure in _failures)

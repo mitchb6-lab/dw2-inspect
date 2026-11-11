@@ -33,7 +33,7 @@ public static class SnapshotHash
     /// ResourcesRequired). The rule is positional, so on any other build the normalisation is
     /// skipped and the harness says so, rather than silently zeroing some other bool.
     /// </summary>
-    private static readonly string[] KnownBuildPrefixes = { "1.3.8.4" };
+    internal static readonly string[] KnownBuildPrefixes = { "1.3.8.4" };
 
     public static void Install(Harmony harmony, Action<string> log)
     {
