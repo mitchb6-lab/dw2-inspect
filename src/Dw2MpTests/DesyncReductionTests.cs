@@ -36,7 +36,7 @@ public static partial class Program
         KeyframePeriodicCanBeSwitchedOff();
         KeyframeSafetyIntervalStillServes();
 
-        SettingsDefaultToThreeMinutes();
+        SettingsDefaultToFiveMinutes();
         SettingsReadTheFileAndTheOverride();
         SettingsClampAndSurviveGarbage();
 
@@ -329,13 +329,13 @@ public static partial class Program
 
     // ------------------------------------------------------------- keyframes
 
-    private const long FloorTicks = 600;
+    private const double FloorSeconds = 60;
     private const long SafetyTicks = 36000;
 
     private static KeyframePolicy PolicyWith(double minutes, bool onEvents)
     {
         var settings = new SyncSettings { KeyframeMinutes = minutes, KeyframeOnEvents = onEvents };
-        return new KeyframePolicy(settings, FloorTicks, SafetyTicks);
+        return new KeyframePolicy(settings, FloorSeconds, SafetyTicks);
     }
 
     private static void KeyframeJoinIsNeverThrottled()
@@ -351,9 +351,12 @@ public static partial class Program
         KeyframePolicy policy = PolicyWith(3, true);
         policy.NoteServed(100);
 
+        policy.NoteTime(20, hostRunning: true);
         KeyframeDecision inside = policy.Decide(400, clientAsked: true, desyncExemption: false);
         KeyframeDecision exempt = policy.Decide(400, clientAsked: true, desyncExemption: true);
-        KeyframeDecision outside = policy.Decide(100 + FloorTicks, clientAsked: true, desyncExemption: false);
+
+        policy.NoteTime(40, hostRunning: true);
+        KeyframeDecision outside = policy.Decide(401, clientAsked: true, desyncExemption: false);
 
         Check("keyframe: a request inside the floor is ignored", !inside.Serve && inside.RequestIgnored);
         Check("keyframe: a desync choice is served inside the floor", exempt.Serve && exempt.Reason == KeyframeReason.DesyncChoice);
@@ -376,7 +379,8 @@ public static partial class Program
         Check("keyframe: the 180th running second serves a periodic keyframe", due.Serve && due.Reason == KeyframeReason.Periodic);
 
         policy.NoteServed(20001);
-        Check("keyframe: serving restarts the three minutes", !policy.Decide(20002 + FloorTicks, false, false).Serve && policy.RunningSecondsSinceServed == 0);
+        policy.NoteTime(0, hostRunning: true);
+        Check("keyframe: serving restarts the three minutes", !policy.Decide(30000, false, false).Serve && policy.RunningSecondsSinceServed == 0);
     }
 
     private static void KeyframeEventWaitsForTheFloorAndIsNotLost()
@@ -385,8 +389,11 @@ public static partial class Program
         policy.NoteServed(1000);
         policy.NoteEvent("war declared between empires 1 and 4");
 
+        policy.NoteTime(30, hostRunning: true);
         KeyframeDecision inside = policy.Decide(1200, false, false);
-        KeyframeDecision atFloor = policy.Decide(1000 + FloorTicks, false, false);
+
+        policy.NoteTime(30, hostRunning: true);
+        KeyframeDecision atFloor = policy.Decide(1201, false, false);
 
         Check("keyframe: an event inside the floor waits", !inside.Serve && policy.PendingEventCount == 1);
         Check("keyframe: and is served when the floor has passed", atFloor.Serve && atFloor.Reason == KeyframeReason.Event);
@@ -411,11 +418,11 @@ public static partial class Program
         policy.NoteEvent("first contact between empires 1 and 6");
         policy.NoteTime(500, hostRunning: true);
 
-        KeyframeDecision both = policy.Decide(FloorTicks, false, false);
+        KeyframeDecision both = policy.Decide(600, false, false);
         Check("keyframe: two events share one keyframe", both.Reason == KeyframeReason.Event && both.Description.Contains("peace made") && both.Description.Contains("first contact"), both.Description);
 
-        policy.NoteServed(FloorTicks);
-        Check("keyframe: a served state carries every pending event", policy.PendingEventCount == 0 && !policy.Decide(FloorTicks * 2, false, false).Serve);
+        policy.NoteServed(600);
+        Check("keyframe: a served state carries every pending event", policy.PendingEventCount == 0 && !policy.Decide(1200, false, false).Serve);
 
         for (int index = 0; index < 50; index++)
         {
@@ -443,6 +450,7 @@ public static partial class Program
     {
         KeyframePolicy policy = PolicyWith(0, false);
         policy.NoteServed(0);
+        policy.NoteTime(FloorSeconds, hostRunning: false);
 
         KeyframeDecision decision = policy.Decide(SafetyTicks, false, false);
         Check("keyframe: the safety interval still serves", decision.Serve && decision.Reason == KeyframeReason.SafetyInterval);
@@ -450,21 +458,21 @@ public static partial class Program
 
     // ------------------------------------------------------------- settings
 
-    private static void SettingsDefaultToThreeMinutes()
+    private static void SettingsDefaultToFiveMinutes()
     {
         SyncSettings settings = SyncSettings.Parse("", "", out string note);
 
-        Check("settings: the default interval is 3 minutes", settings.KeyframeMinutes == 3 && settings.KeyframeSeconds == 180);
+        Check("settings: the default interval is 5 minutes", settings.KeyframeMinutes == 5 && settings.KeyframeSeconds == 300);
         Check("settings: event keyframes are on by default", settings.KeyframeOnEvents);
         Check("settings: the note says defaults", note == "defaults", note);
     }
 
     private static void SettingsReadTheFileAndTheOverride()
     {
-        SyncSettings fromFile = SyncSettings.Parse("{ \"keyframeMinutes\": 5, \"keyframeOnEvents\": false }", "", out _);
-        SyncSettings overridden = SyncSettings.Parse("{ \"keyframeMinutes\": 5 }", "2.5", out string note);
+        SyncSettings fromFile = SyncSettings.Parse("{ \"keyframeMinutes\": 8, \"keyframeOnEvents\": false }", "", out _);
+        SyncSettings overridden = SyncSettings.Parse("{ \"keyframeMinutes\": 8 }", "2.5", out string note);
 
-        Check("settings: the file sets the interval and the event switch", fromFile.KeyframeMinutes == 5 && !fromFile.KeyframeOnEvents);
+        Check("settings: the file sets the interval and the event switch", fromFile.KeyframeMinutes == 8 && !fromFile.KeyframeOnEvents);
         Check("settings: the environment overrides the file", overridden.KeyframeMinutes == 2.5, note);
     }
 
@@ -477,12 +485,12 @@ public static partial class Program
         SyncSettings negative = SyncSettings.Parse("{ \"keyframeMinutes\": -4 }", "", out _);
         SyncSettings notNumber = SyncSettings.Parse("", "soon", out string notNumberNote);
 
-        Check("settings: invalid JSON gives the defaults and says so", garbage.KeyframeMinutes == 3 && garbageNote.Contains("not valid JSON"), garbageNote);
+        Check("settings: invalid JSON gives the defaults and says so", garbage.KeyframeMinutes == 5 && garbageNote.Contains("not valid JSON"), garbageNote);
         Check("settings: under a minute is raised to one", tooSmall.KeyframeMinutes == 1);
         Check("settings: over two hours is lowered to 120", tooBig.KeyframeMinutes == 120);
         Check("settings: zero switches periodic keyframes off", off.KeyframeMinutes == 0);
         Check("settings: a negative interval also means off", negative.KeyframeMinutes == 0);
-        Check("settings: a non-numeric override is ignored", notNumber.KeyframeMinutes == 3 && notNumberNote.Contains("not a number"), notNumberNote);
+        Check("settings: a non-numeric override is ignored", notNumber.KeyframeMinutes == 5 && notNumberNote.Contains("not a number"), notNumberNote);
     }
 
     // ------------------------------------------------------------- events

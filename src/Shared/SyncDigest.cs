@@ -143,7 +143,7 @@ public sealed class SyncDigest
                 ulong setHash = reader.ReadUInt64();
                 int unsent = reader.ReadInt32();
 
-                if (name.Length == 0 || name.Length > MaxNameLength)
+                if (name.Length == 0 || name.Length > MaxNameLength || !IsPlainName(name))
                 {
                     return null;
                 }
@@ -162,6 +162,25 @@ public sealed class SyncDigest
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Collection names are lowercase ASCII letters and digits. Anything else is refused on
+    /// read, so a name from the wire can go into a log line or a dialog as it stands.
+    /// </summary>
+    public static bool IsPlainName(string name)
+    {
+        foreach (char character in name)
+        {
+            bool isLowercaseLetter = character >= 'a' && character <= 'z';
+            bool isDigit = character >= '0' && character <= '9';
+            if (!isLowercaseLetter && !isDigit)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>"ships=282:1A2B3C4D colonies=12:..." for logs and the desync report. Short on purpose.</summary>
@@ -251,6 +270,11 @@ public sealed class SyncCheckResult
 ///   MISMATCH        anything else. MismatchesBeforeDesync of them in a row, unbroken by a
 ///                   match, is a sustained desync.
 ///
+/// Three limits from the 2026-11-10 security review, because the host's digest is the other
+/// player's word and not a fact: "not sent yet" counts for at most MaxUnsentTolerated members
+/// and SummariesUnsentTolerated summaries in a row; and a host digest that leaves out a
+/// collection this side carries is a mismatch, so an empty digest can never read as agreement.
+///
 /// One instance per joiner. Pure: no clocks, no game types.
 /// </summary>
 public sealed class DesyncTolerance
@@ -264,7 +288,15 @@ public sealed class DesyncTolerance
     /// <summary>Real mismatches in a row before the popup. Unchanged from the fingerprint check it replaces.</summary>
     public const int MismatchesBeforeDesync = 3;
 
+    /// <summary>The most members "the host has not sent yet" can excuse. A real host has built one or two ships since its last delta.</summary>
+    public const int MaxUnsentTolerated = 32;
+
+    /// <summary>How many summaries in a row one collection may be excused as "not sent yet". The delta that carries them is a second away.</summary>
+    public const int SummariesUnsentTolerated = 3;
+
     private readonly Dictionary<string, int> _toleratedInARow = new(StringComparer.Ordinal);
+
+    private readonly Dictionary<string, int> _unsentToleratedInARow = new(StringComparer.Ordinal);
 
     private int _consecutiveMismatches;
 
@@ -274,6 +306,7 @@ public sealed class DesyncTolerance
     public void Reset()
     {
         _toleratedInARow.Clear();
+        _unsentToleratedInARow.Clear();
         _consecutiveMismatches = 0;
     }
 
@@ -288,6 +321,16 @@ public sealed class DesyncTolerance
         var mismatches = new List<string>();
         var tolerated = new List<string>();
 
+        // Every collection this side carries must be in the host's digest. Without this an
+        // empty digest compared nothing and read as a match for ever.
+        foreach (SyncDigestEntry myEntry in mine.Entries)
+        {
+            if (host.Find(myEntry.Name) is null)
+            {
+                mismatches.Add($"{myEntry.Name} is missing from the host's digest");
+            }
+        }
+
         foreach (SyncDigestEntry hostEntry in host.Entries)
         {
             SyncDigestEntry myEntry = mine.Find(hostEntry.Name);
@@ -301,19 +344,29 @@ public sealed class DesyncTolerance
             if (sameMembers)
             {
                 _toleratedInARow.Remove(hostEntry.Name);
+                _unsentToleratedInARow.Remove(hostEntry.Name);
                 continue;
             }
 
             int gap = Math.Abs(hostEntry.Count - myEntry.Count);
+            int unsent = Math.Min(hostEntry.Unsent, MaxUnsentTolerated);
             string description = $"{hostEntry.Name} host {hostEntry.Count} mine {myEntry.Count}";
 
-            if (hostEntry.Unsent > 0 && gap <= hostEntry.Unsent)
+            if (unsent > 0 && gap <= unsent)
             {
-                tolerated.Add(description + $" ({hostEntry.Unsent} not sent yet)");
+                _unsentToleratedInARow.TryGetValue(hostEntry.Name, out int unsentRunSoFar);
+                if (unsentRunSoFar < SummariesUnsentTolerated)
+                {
+                    _unsentToleratedInARow[hostEntry.Name] = unsentRunSoFar + 1;
+                    tolerated.Add(description + $" ({unsent} not sent yet)");
+                    continue;
+                }
+
+                mismatches.Add(description + $" (the host has said 'not sent yet' for more than {SummariesUnsentTolerated} summaries)");
                 continue;
             }
 
-            if (gap <= hostEntry.Unsent + ExtraGapTolerated)
+            if (gap <= unsent + ExtraGapTolerated)
             {
                 _toleratedInARow.TryGetValue(hostEntry.Name, out int runSoFar);
                 if (runSoFar < SummariesExtraGapTolerated)

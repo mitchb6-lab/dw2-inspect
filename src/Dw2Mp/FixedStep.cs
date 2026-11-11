@@ -143,6 +143,7 @@ public static class FixedStep
         if (serverType is null) { log("# clock: GameServer not found; client clock will not follow the host"); return; }
 
         _follow = true;
+        _followLog = log;
         PatchClock(harmony, serverType, "get_Now", nameof(FollowPrefix), log);
         PatchClock(harmony, serverType, "get_NowPrecise", nameof(FollowPrefix), log);
         log("# clock: client follows the host's time and speed (carried on every delta)");
@@ -151,11 +152,38 @@ public static class FixedStep
     /// <summary>Client: the host's clock as of the delta just applied.</summary>
     public static void FollowHost(long hostNowTicks, float hostSpeed)
     {
-        if (!_follow || hostNowTicks <= 0) return;
+        if (!_follow)
+        {
+            return;
+        }
+
+        // The joiner's whole clock is what the host says it is, so a sample is checked before
+        // it is believed (ClockSampleCheck, src\Shared, tested): a real DateTime, a finite
+        // speed in DW2's range, and no leap the wall time since the last sample cannot explain.
+        double wallSecondsSincePrevious = _sinceHostTime.IsRunning ? _sinceHostTime.Elapsed.TotalSeconds : 0;
+        bool accepted = _clockCheck.Accept(hostNowTicks, hostSpeed, wallSecondsSincePrevious);
+        if (!accepted)
+        {
+            long rejected = _clockCheck.Rejected;
+            if (Dw2MpShared.LogThrottle.ShouldLog(rejected, 3, 50))
+            {
+                _followLog?.Invoke($"# clock: ignored a host clock sample (ticks {hostNowTicks}, speed {hostSpeed}); {rejected} ignored so far");
+            }
+
+            return;
+        }
+
         _hostNowTicks = hostNowTicks;
         _hostSpeed = hostSpeed;
         _sinceHostTime.Restart();
     }
+
+    private static readonly Dw2MpShared.ClockSampleCheck _clockCheck = new();
+
+    private static Action<string> _followLog;
+
+    /// <summary>Wall seconds since the last host clock sample was accepted; very large when there has been none.</summary>
+    public static double SecondsSinceHostSample => _sinceHostTime.IsRunning ? _sinceHostTime.Elapsed.TotalSeconds : double.MaxValue;
 
     private static bool FollowPrefix(ref DateTime __result)
     {

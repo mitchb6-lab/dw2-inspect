@@ -2250,8 +2250,9 @@ divergence <dir>` diffs each pair and ranks fields by how many objects differ
 **The tick is not 10 a second.** Both games counted about 29 cycles a second (870 per 30 s
 watchdog interval). `LogicCycleDue` follows the game's own `GameLogicCycleLengthInMilliseconds`.
 So on 1.3.8.4 a summary goes every ~10 s, not 30; three mismatches are ~30 s, not 90; and the
-600-tick served-state floor is ~20 s, not 60. The constants are unchanged; the keyframe
-interval is measured in wall time for this reason.
+600-tick served-state floor was ~20 s, not the 60 it was reviewed as. The summary and delta
+constants are unchanged; the keyframe interval is measured in wall time for this reason, and
+since the security pass below so is the served-state floor (60 s, as documented).
 
 ### Measurement 1 (before any fix): the desync popup was a false alarm
 
@@ -2313,9 +2314,10 @@ The host serves a full state by itself (`src\Shared\KeyframePolicy.cs`, tested; 
 `NetSession.HostTick`):
 
 - **every N minutes of RUNNING game**, N from `%LOCALAPPDATA%\Dw2Mp\sync-settings.json`
-  (`{ "keyframeMinutes": 3, "keyframeOnEvents": true }`; default 3, clamped to 1–120, 0 = off)
+  (`{ "keyframeMinutes": 5, "keyframeOnEvents": true }`; default 5, clamped to 1–120, 0 = off)
   or `DW2MP_KEYFRAME_MINUTES`. Paused time does not count: a paused galaxy has not changed
-  and every adoption costs the joiner native memory.
+  and every adoption costs the joiner native memory. (mitch asked for a default of 3; it
+  was raised to 5 the same day, once the cost per adoption below had been measured.)
 - **after a big event**: war declared, peace made, first contact, a colony gained or lost, an
   empire eliminated. Detected by diffing a small census every summary (`GalaxyEventWatch`,
   pure half in `src\Shared\GalaxyEvents.cs`), not by hooking: DW2 changes a relation through
@@ -2331,9 +2333,11 @@ up, and every summary now carries it too. A summary built against a full state t
 not adopted yet, or one older than the state it has just adopted, is **not compared**, so a
 keyframe can never start, extend or end a run of mismatches (tested).
 
-**Cost, stated plainly:** each adoption still costs the joiner ~25–36 MB of native memory that
-is not returned (measured 2026-09-08). At the default 3 minutes that is on the order of
-600 MB an hour. The interval is in a file for that reason.
+**Cost, stated plainly:** each adoption still costs the joiner native memory that is not
+returned: ~25–36 MB when measured on 2026-09-08, 43–48 MB in the 2026-11-10 run below. At the
+default 5 minutes that is twelve adoptions and roughly 550 MB an hour, before any event
+keyframe. The interval is in a file for that reason, and a per-session memory budget (stop
+serving periodic keyframes once the joiner has adopted N) is a follow-up, not built.
 
 ### 3. More state in deltas (delta body 9)
 
@@ -2502,4 +2506,61 @@ summaries, 4,719 B. Delta build averaged 1.5 ms, worst 8.8 ms.
   launch ended the script while both games ran on; they left by themselves three minutes
   later. The supervision is now inside a try block that always reaches the clean-up.
 - The new message parsing (summary digest, delta sections 9, the empty delta as a clock
-  sample) has had no security review yet.
+  sample) was reviewed the same day; see the next section.
+
+### Security review, same day (game-security on 0e4ad64), applied on the same branch
+
+One merge blocker and a list of hardening. The host is the other player's PC, not a trusted
+server, so every count, length, time and name in a frame is a number somebody else chose.
+Protocol stays **4**: nothing on the wire changed shape, only what the reader will accept.
+
+- **H1, the blocker: a flood of summaries was a flood of checks.** Every queued summary was
+  checked in one frame, and a check walks every ship, colony, design, character and fleet on
+  the main thread. `SummaryGate` (`src\Shared\SyncGuards.cs`) now hands the main thread at
+  most one summary per call and at most one a second: the newest whose earlier deltas have
+  been taken; older ready ones are discarded. Tested with 1,000 summaries: one check in the
+  call, none in the next hundred frames of the same second. The tolerated and mismatch log
+  lines are throttled like the skipped line.
+- **Lengths and counts** (`WireLimits`): every length-prefixed object block in a delta is
+  capped at 4 MB and checked against the bytes left in the frame before anything is allocated
+  (four older sites read `ReadBytes(length)` uncapped); every record count is refused when it
+  is negative, more than the frame could hold, or, for update and removal sections, more than
+  the local collection plus a margin; a Delta frame is capped at 16 MB; `MaxRacesPerColony`
+  is enforced on read; NaN and infinity are refused in vitals, colony rates, design costs and
+  cash.
+- **Full states:** decompression is a bounded copy with a 256 MB cap (the link is dropped past
+  it), and at most one full state waits to be adopted.
+- **Held deltas:** at most 512 deltas or 16 MB wait for a full state in transit, and a delta
+  for a state more than one ahead of ours is refused.
+- **Clock samples** (`ClockSampleCheck`): followed only when the time is a real DateTime, the
+  speed is finite and at most 8x, and the time has not leapt beyond what the wall time since
+  the last sample explains; thirty insisting samples in a row are then believed.
+- **Digest** (`DesyncTolerance`): a host digest that leaves out a collection this side carries
+  is a mismatch, so an empty digest never reads as agreement; "not sent yet" excuses at most 32
+  members and three summaries in a row; collection names are lowercase letters and digits or
+  the digest is refused, and digest text is passed through `PeerText` before it is logged.
+- **Served-state floor is wall-clock 60 s** (`KeyframePolicy`), not 600 ticks. On the joiner,
+  a full state it did not ask for waits until 30 s have passed since the last adoption, newest
+  kept (`AdoptionGate`); the join, a repair it asked for and a popup resync are never held.
+- **Mutation failures** are remembered by a fixed key (stage and exception type), capped at
+  64; the variable detail is logged once and not remembered (`FailureLedger`).
+- **Relation lists:** before DW2's reader sees the bytes, their header must carry the same
+  list EmpireId as the list being replaced and a relation count the bytes could hold.
+- **Dev flags:** the mod itself now needs `DW2MP_DEV=1` for `DW2MP_DESYNC_AUTO_CHOICE`,
+  `DW2MP_DIVERGENCE_DIR` and `DW2MP_FORCE_DESYNC_AT_CYCLE`, and logs `*** DEV FLAG LIVE ***`
+  when one is on. The lobby's strip list became an allow-list (`LaunchEnvironment`): every
+  inherited `DW2MP_*` variable the lobby does not set itself is removed, which also covers
+  `DW2MP_CLIENT_SIMULATES`, `DW2MP_MAX_TICKS_BETWEEN_STATES` and `DW2MP_DIVERGENCE_EVERY`;
+  `DW2MP_KEYFRAME_MINUTES` stays because the mod clamps it.
+- **Smaller:** `HostPause` stops following when the link is down or the last clock sample is
+  over 10 s old; `StateSummary` is behind the handshake gate; the tolerance state is reset on
+  the main thread; the divergence dump samples by host tick on both sides and stops at 400
+  files; the host's "client requested a resync" line is throttled.
+- **A bug the review found:** new `Population` objects on the joiner were built with
+  assimilation and reproduction rate swapped. DW2's constructor is `(raceId, amount,
+  reproductionRate, assimilation)`; fixed in `PopulationArguments`, with a test.
+
+Not done: a session memory budget for adoptions (follow-up, above); a local-collection bound
+on sections that CREATE members (ship, colony, design, character and fleet additions), which
+have only the bytes-left bound because a creation is by definition not in the local
+collection.

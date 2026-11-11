@@ -86,7 +86,10 @@ public static class Desync
 
     private static bool _uiAvailable;
 
-    private static readonly long ForceAtCycle = EnvLong("DW2MP_FORCE_DESYNC_AT_CYCLE", 0);
+    // Needs the developer switch as well, like every dev flag since the 2026-11-10 security review:
+    // the mod does not rely on the lobby having stripped it.
+    private static readonly long ForceAtCycle =
+        Environment.GetEnvironmentVariable("DW2MP_DEV") == "1" ? EnvLong("DW2MP_FORCE_DESYNC_AT_CYCLE", 0) : 0;
 
     private static volatile bool _forceSpent;
 
@@ -109,6 +112,15 @@ public static class Desync
 
     public static void Install(Action<string> log)
     {
+        if (AutoChoice != 0)
+        {
+            log($"# desync: *** DEV FLAG LIVE *** DW2MP_DESYNC_AUTO_CHOICE={AutoChoice} (with DW2MP_DEV=1): this game presses a desync popup button BY ITSELF five seconds after the choice appears. Never set in a real session.");
+        }
+        else if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DW2MP_DESYNC_AUTO_CHOICE")))
+        {
+            log("# desync: DW2MP_DESYNC_AUTO_CHOICE is set but ignored -- it needs DW2MP_DEV=1 and a value of 1 or 2");
+        }
+
         _log = log;
         ResolveUi();
 
@@ -601,6 +613,15 @@ public static class Desync
     private static int ReadAutoChoice()
     {
         string text = Environment.GetEnvironmentVariable("DW2MP_DESYNC_AUTO_CHOICE") ?? "";
+
+        // The mod checks the developer switch itself; it does not rely on the lobby having
+        // stripped the flag (security review): a game started any other way inherits the shell.
+        bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
+        if (!developerMode)
+        {
+            return 0;
+        }
+
         if (text == "1")
         {
             return 1;

@@ -77,6 +77,9 @@ public static partial class Program
         // 2026-11-10 desync reduction: see DesyncReductionTests.cs.
         RunDesyncReductionTests();
 
+        // The hardening that followed the security review of protocol 4: see SecurityHardeningTests.cs.
+        RunSecurityHardeningTests();
+
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");
         foreach (var failure in _failures)
