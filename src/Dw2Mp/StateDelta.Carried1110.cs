@@ -306,7 +306,7 @@ public static partial class StateDelta
         object ships = ListField(galaxy, "Ships");
         MethodInfo getById = ById(ships, typeof(int));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 20, CountOf(ships), "ship vitals");
         int applied = 0;
 
         for (int index = 0; index < count; index++)
@@ -314,8 +314,11 @@ public static partial class StateDelta
             int shipId = reader.ReadInt32();
             var vitals = new ShipVitals(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
 
+            bool vitalsFinite = WireLimits.IsFinite(vitals.Shields) && WireLimits.IsFinite(vitals.Fuel)
+                             && WireLimits.IsFinite(vitals.Energy) && WireLimits.IsFinite(vitals.HullConstruction);
+
             object ship = Lookup(getById, ships, shipId);
-            if (ship is null)
+            if (ship is null || !vitalsFinite)
             {
                 absent++;
                 continue;
@@ -592,7 +595,7 @@ public static partial class StateDelta
         object colonies = ListField(galaxy, "Colonies");
         MethodInfo getById = ById(colonies, typeof(short)) ?? ById(colonies, typeof(int));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 43, CountOf(colonies), "colony extras");
         int applied = 0;
 
         for (int index = 0; index < count; index++)
@@ -608,14 +611,28 @@ public static partial class StateDelta
             };
 
             int raceCount = reader.ReadByte();
+            if (raceCount > MaxRacesPerColony)
+            {
+                throw new InvalidDataException($"colony extras: {raceCount} races on one colony (cap {MaxRacesPerColony})");
+            }
+
+            bool extrasFinite = WireLimits.IsFinite(extras.DevelopmentLevel) && WireLimits.IsFinite(extras.TaxRate)
+                             && WireLimits.IsFinite(extras.MigrationFactor) && WireLimits.IsFinite(extras.InfluenceRadius)
+                             && WireLimits.IsFinite(extras.GrowthFunding);
+
             for (int race = 0; race < raceCount; race++)
             {
                 var record = new PopulationRecord(reader.ReadByte(), reader.ReadInt64(), reader.ReadSingle(), reader.ReadSingle());
+                if (record.Amount < 0 || !WireLimits.IsFinite(record.Assimilation) || !WireLimits.IsFinite(record.ReproductionRate))
+                {
+                    extrasFinite = false;
+                }
+
                 extras.Populations.Add(record);
             }
 
             object colony = Lookup(getById, colonies, colonyId);
-            if (colony is null)
+            if (colony is null || !extrasFinite)
             {
                 absent++;
                 continue;
@@ -700,7 +717,9 @@ public static partial class StateDelta
                     continue;
                 }
 
-                object created = _populationConstructor.Invoke(new object[] { record.RaceId, record.Amount, record.Assimilation, record.ReproductionRate });
+                // DW2's order is (raceId, amount, reproductionRate, assimilation); see PopulationArguments.
+                object[] constructorArguments = PopulationArguments.ForConstructor(record.RaceId, record.Amount, record.Assimilation, record.ReproductionRate);
+                object created = _populationConstructor.Invoke(constructorArguments);
                 populations.Add(created);
                 continue;
             }
@@ -812,7 +831,7 @@ public static partial class StateDelta
         object designs = ListField(galaxy, "Designs");
         MethodInfo getById = ById(designs, typeof(int)) ?? ById(designs, typeof(short));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 20, CountOf(designs), "design costs");
         int applied = 0;
 
         for (int index = 0; index < count; index++)
@@ -821,8 +840,10 @@ public static partial class StateDelta
             double buildCost = reader.ReadDouble();
             double maintenanceCost = reader.ReadDouble();
 
+            bool costsFinite = WireLimits.IsFinite(buildCost) && WireLimits.IsFinite(maintenanceCost);
+
             object design = Lookup(getById, designs, designId);
-            if (design is null)
+            if (design is null || !costsFinite)
             {
                 absent++;
                 continue;
@@ -969,7 +990,7 @@ public static partial class StateDelta
         object empires = ListField(galaxy, "Empires");
         MethodInfo empireById = ById(empires, typeof(short)) ?? ById(empires, typeof(int));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 10, CountOf(empires), "empire money");
         int applied = 0;
 
         for (int index = 0; index < count; index++)
@@ -977,9 +998,10 @@ public static partial class StateDelta
             short empireId = reader.ReadInt16();
             float money = reader.ReadSingle();
             float privateMoney = reader.ReadSingle();
+            bool moneyFinite = WireLimits.IsFinite(money) && WireLimits.IsFinite(privateMoney);
 
             object empire = Lookup(empireById, empires, empireId);
-            if (empire is null)
+            if (empire is null || !moneyFinite)
             {
                 absent++;
                 continue;
@@ -1172,22 +1194,16 @@ public static partial class StateDelta
         object empires = ListField(galaxy, "Empires");
         MethodInfo empireById = ById(empires, typeof(short)) ?? ById(empires, typeof(int));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 6, CountOf(empires), "relation lists");
         int applied = 0;
 
         for (int index = 0; index < count; index++)
         {
             short empireId = reader.ReadInt16();
-            int length = reader.ReadInt32();
-            if (length <= 0 || length > MaxRelationListBytes)
+            byte[] bytes = WireLimits.ReadCappedBytes(reader, MaxRelationListBytes, "relation list");
+            if (bytes is null)
             {
-                throw new InvalidDataException($"relation list of {length} bytes");
-            }
-
-            byte[] bytes = reader.ReadBytes(length);
-            if (bytes.Length != length)
-            {
-                throw new EndOfStreamException("relation list truncated");
+                throw new InvalidDataException("relation list of 0 bytes");
             }
 
             object empire = Lookup(empireById, empires, empireId);
@@ -1232,6 +1248,20 @@ public static partial class StateDelta
             }
 
             Type listType = current.GetType();
+
+            // The bytes begin with the list's own EmpireId and its relation count. They must be
+            // for THIS empire's list (the id our own copy of the list carries) and the count
+            // must be one the bytes could hold, before DW2's reader is let loose on them.
+            object localListEmpireId = AccessTools.Field(listType, "EmpireId")?.GetValue(current);
+            if (localListEmpireId is short expectedListEmpireId)
+            {
+                if (!RelationListHeader.IsSane(bytes, expectedListEmpireId))
+                {
+                    NoteMutationFailure("Relations: header is not this empire's list or its count is impossible; list not replaced");
+                    return false;
+                }
+            }
+
             MethodInfo read = AccessTools.Method(listType, "ReadFromStream", new[] { galaxy.GetType(), typeof(BinaryReader) });
             if (read is null)
             {
@@ -1253,7 +1283,7 @@ public static partial class StateDelta
 
             if (consumed != bytes.Length)
             {
-                NoteMutationFailure($"Relations: reader consumed {consumed} of {bytes.Length} bytes; list not replaced");
+                NoteMutationFailure("Relations: reader did not consume the whole list; list not replaced", $"{consumed} of {bytes.Length} bytes");
                 return false;
             }
 
@@ -1264,7 +1294,7 @@ public static partial class StateDelta
         catch (Exception exception)
         {
             var cause = exception.InnerException ?? exception;
-            NoteMutationFailure($"Relations at {stage}: {cause.GetType().Name}: {cause.Message}");
+            NoteMutationFailure($"Relations at {stage}: {cause.GetType().Name}", cause.Message);
             return false;
         }
     }

@@ -705,15 +705,21 @@ public sealed class LobbyForm : Form
         // address or the peer port at all.
         psi.Environment["DW2MP_LOCAL_PORT"] = _localGamePort.ToString();
 
-        // The fake-desync dev flag must not leak from this shell into a real session: a joiner
-        // that inherited it would raise the desync popup on a healthy game. It only passes
-        // through when the developer switch DW2MP_DEV=1 is set as well.
+        // Nothing leaks from this shell into a real session: every inherited DW2MP_* variable
+        // the lobby does not set itself is removed (LaunchEnvironment, an allow-list), unless
+        // the developer switch DW2MP_DEV=1 is set. The dev flags (forced desync, auto-choice,
+        // divergence dump, client-simulates, the old state interval) all go this way.
         bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
-        if (!developerMode)
+        List<string> inheritedNames = psi.Environment.Keys.ToList();
+        List<string> namesToStrip = LaunchEnvironment.NamesToStrip(inheritedNames, developerMode);
+        foreach (string name in namesToStrip)
         {
-            psi.Environment.Remove("DW2MP_FORCE_DESYNC_AT_CYCLE");
-            psi.Environment.Remove("DW2MP_DESYNC_AUTO_CHOICE");
-            psi.Environment.Remove("DW2MP_DIVERGENCE_DIR");
+            psi.Environment.Remove(name);
+        }
+
+        if (namesToStrip.Count > 0)
+        {
+            Log($"Removed {namesToStrip.Count} inherited DW2MP_ variable(s) from the game's environment: {string.Join(", ", namesToStrip)}");
         }
 
         Log($"Launching {psi.FileName}");

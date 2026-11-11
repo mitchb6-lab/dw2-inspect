@@ -23,7 +23,25 @@ namespace Dw2Mp;
 /// </summary>
 public static class DivergenceDump
 {
-    private static readonly string DumpDirectory = Environment.GetEnvironmentVariable("DW2MP_DIVERGENCE_DIR") ?? "";
+    private static readonly string DumpDirectory = ReadDumpDirectory();
+
+    /// <summary>A dev measurement only: it needs the developer switch as well as a directory.</summary>
+    private static string ReadDumpDirectory()
+    {
+        bool developerMode = Environment.GetEnvironmentVariable("DW2MP_DEV") == "1";
+        if (!developerMode)
+        {
+            return "";
+        }
+
+        return Environment.GetEnvironmentVariable("DW2MP_DIVERGENCE_DIR") ?? "";
+    }
+
+    /// <summary>A run writes at most this many files, however long it lasts.</summary>
+    private const int MaxDumpFiles = 400;
+
+    /// <summary>The host's summary interval in ticks; both sides sample the same host ticks by dividing by it.</summary>
+    private const long SummaryEveryTicks = 300;
 
     /// <summary>Sample every Nth summary. A dump walks every ship, so it is not free.</summary>
     private static readonly int SampleEvery = ReadSampleEvery();
@@ -67,15 +85,19 @@ public static class DivergenceDump
         return every;
     }
 
-    /// <summary>True when the summary with this 1-based sequence number should be dumped.</summary>
-    public static bool ShouldSample(long summaryNumber)
+    /// <summary>
+    /// True when the summary at this HOST tick should be dumped. Decided from the host tick
+    /// alone, so the host and the joiner sample the same summaries without agreeing on anything.
+    /// </summary>
+    public static bool ShouldSample(long hostTick)
     {
-        if (!Enabled)
+        if (!Enabled || _dumpsWritten >= MaxDumpFiles)
         {
             return false;
         }
 
-        return summaryNumber % SampleEvery == 0;
+        long summaryIndex = hostTick / SummaryEveryTicks;
+        return summaryIndex % SampleEvery == 0;
     }
 
     /// <summary>

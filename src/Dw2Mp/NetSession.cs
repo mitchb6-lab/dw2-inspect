@@ -241,11 +241,16 @@ public static class NetSession
 
         StateDelta.Log = log;
         DivergenceDump.Log = log;
+
+        if (DivergenceDump.Enabled)
+        {
+            log("# net: *** DEV FLAG LIVE *** DW2MP_DIVERGENCE_DIR (with DW2MP_DEV=1): this game writes a census of its galaxy to disk at sampled summaries. Never set in a real session.");
+        }
         GalaxyEventWatch.Log = log;
 
         if (Role == NetRole.Host)
         {
-            _keyframes = new KeyframePolicy(LoadSyncSettings(log), MinTicksBetweenServedStates, MaxTicksBetweenFullStates);
+            _keyframes = new KeyframePolicy(LoadSyncSettings(log), MinSecondsBetweenServedStates, MaxTicksBetweenFullStates);
         }
         else
         {
@@ -608,8 +613,18 @@ public static class NetSession
                         }
 
                         byte[] raw = Decompress(payload);
+
+                        // One slot, newest wins: a full state replaces whatever is still waiting
+                        // to be adopted, so a host cannot stack them up in memory.
+                        int replaced = 0;
+                        while (_inbound.TryDequeue(out _))
+                        {
+                            replaced++;
+                        }
+
                         _inbound.Enqueue(raw);
-                        _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued)");
+                        _log($"# net[client]: state received packed={payload.Length:N0}B raw={raw.Length:N0}B (queued" +
+                             (replaced > 0 ? $", replacing {replaced} not yet adopted)" : ")"));
                         break;
                     }
 
@@ -626,6 +641,11 @@ public static class NetSession
                     // Only queued here. The comparison runs on the main thread, after every
                     // delta that arrived before this summary has been applied.
                     case Msg.StateSummary when Role == NetRole.Client:
+                        if (IncompatibilityBlocksState("check a state summary"))
+                        {
+                            break;
+                        }
+
                         OnStateSummaryReceived(payload);
                         break;
 
@@ -634,7 +654,12 @@ public static class NetSession
                     // snapshot. This only raises the flag it watches.
                     case Msg.ResyncRequest when Role == NetRole.Host:
                         _resyncRequested = true;
-                        _log("# net[host]: client requested a resync");
+                        _resyncRequestsReceived++;
+                        if (LogThrottle.ShouldLog(_resyncRequestsReceived, 5, 50))
+                        {
+                            _log($"# net[host]: client requested a resync (#{_resyncRequestsReceived})");
+                        }
+
                         break;
 
                     case Msg.Command when Role == NetRole.Host:
@@ -695,7 +720,9 @@ public static class NetSession
         {
             _connected = false;
             _log($"# net[{Role}]: disconnected from launcher");
-            _tolerance.Reset();
+
+            // The tolerance state belongs to the main thread; ask it to forget, do not touch it here.
+            _toleranceResetPending = true;
 
             // A desync popup must not outlive the link: a paused host with no peer would
             // otherwise stay paused for a resync that can never be verified.
@@ -819,7 +846,7 @@ public static class NetSession
             _throttledServeRequests++;
             if (_throttledServeRequests == 1 || _throttledServeRequests % 50 == 0)
             {
-                _log($"# net[host]: resync request ignored -- {tick - _lastSyncTick} ticks since the last full state (floor {MinTicksBetweenServedStates}); {_throttledServeRequests} ignored so far");
+                _log($"# net[host]: resync request ignored -- {_keyframes.WallSecondsSinceServed:N0} s since the last full state (floor {MinSecondsBetweenServedStates:N0} s); {_throttledServeRequests} ignored so far");
             }
         }
 
@@ -1077,7 +1104,7 @@ public static class NetSession
             _summariesSent++;
 
             // Dev measurement: this side's census for this tick, to diff against the client's.
-            if (DivergenceDump.ShouldSample(_summariesSent))
+            if (DivergenceDump.ShouldSample(tick))
             {
                 DivergenceDump.Write(galaxy, "host", tick, $"baseline={_syncsSent} deltasSent={_deltasSent} fp={fingerprint}");
             }
@@ -1142,12 +1169,45 @@ public static class NetSession
             return;
         }
 
+        // A full state this side did not ask for waits until enough time has passed since
+        // the last adoption (AdoptionGate): every adoption costs native memory that never
+        // comes back, and the host decides when to send one. Asked-for states are never held.
+        bool solicited = _syncsApplied == 0 || _resyncOutstanding || Desync.VerifyingResync;
+        double secondsSinceLastAdoption = SecondsSince(_lastAdoptionStamp);
+        if (!AdoptionGate.MayAdoptNow(solicited, secondsSinceLastAdoption))
+        {
+            if (!_loggedAdoptionHold)
+            {
+                _loggedAdoptionHold = true;
+                _unsolicitedStatesHeld++;
+                _log($"# net[client]: holding an unsolicited full state -- the last adoption was {secondsSinceLastAdoption:N0} s ago " +
+                     $"(minimum {AdoptionGate.MinSecondsBetweenUnsolicited:N0} s); {_unsolicitedStatesHeld} held so far");
+            }
+
+            return;
+        }
+
         byte[] newest = null;
         int dropped = -1;
-        while (_inbound.TryDequeue(out var next)) { newest = next; dropped++; }
-        if (newest is null) return;
+        while (_inbound.TryDequeue(out var next))
+        {
+            newest = next;
+            dropped++;
+        }
 
-        if (dropped > 0) _log($"# net[client]: dropped {dropped} stale state(s)");
+        if (newest is null)
+        {
+            return;
+        }
+
+        if (dropped > 0)
+        {
+            _log($"# net[client]: dropped {dropped} stale state(s)");
+        }
+
+        _loggedAdoptionHold = false;
+        _resyncOutstanding = false;
+        _lastAdoptionStamp = Stopwatch.GetTimestamp();
 
         if (ApplyState.ApplyBytes(newest, out var info))
         {
@@ -1155,8 +1215,29 @@ public static class NetSession
             _log($"# net[client]: APPLIED sync #{_syncsApplied}  {info}");
             ReleaseHeldDeltas();
         }
-        else _log("# net[client]: apply FAILED " + info);
+        else
+        {
+            _log("# net[client]: apply FAILED " + info);
+        }
     }
+
+    private static long _lastAdoptionStamp;
+    private static volatile bool _resyncOutstanding;
+    private static bool _loggedAdoptionHold;
+    private static long _unsolicitedStatesHeld;
+
+    /// <summary>Wall seconds since a Stopwatch timestamp; a very large number when there is none yet.</summary>
+    private static double SecondsSince(long stamp)
+    {
+        if (stamp == 0)
+        {
+            return double.MaxValue;
+        }
+
+        return (Stopwatch.GetTimestamp() - stamp) / (double)Stopwatch.Frequency;
+    }
+
+    internal static bool Connected => _connected;
 
     // ------------------------------------------------------------- framing
 
@@ -1194,6 +1275,13 @@ public static class NetSession
         if (IsDesyncMessage(type) && length > MaxDesyncFrameBytes)
         {
             _log($"# net: {type} frame of {length:N0}B exceeds the {MaxDesyncFrameBytes}B cap; dropping the connection");
+            return (null, null);
+        }
+
+        // A delta is kilobytes; the largest ever seen was 364 KB.
+        if (type == Msg.Delta && length > WireLimits.MaxDeltaFrameBytes)
+        {
+            _log($"# net: Delta frame of {length:N0}B exceeds the {WireLimits.MaxDeltaFrameBytes:N0}B cap; dropping the connection");
             return (null, null);
         }
 
@@ -1243,7 +1331,30 @@ public static class NetSession
         using var input = new MemoryStream(data, writable: false);
         using var deflate = new DeflateStream(input, CompressionMode.Decompress);
         using var output = new MemoryStream(48 * 1024 * 1024);
-        deflate.CopyTo(output);
+
+        // A bounded copy, not CopyTo: deflate expands a thousandfold, so a few megabytes on the
+        // wire could otherwise become gigabytes here. Past the cap the exception ends the
+        // receive loop, which drops the link.
+        var chunk = new byte[81920];
+        long total = 0;
+
+        while (true)
+        {
+            int read = deflate.Read(chunk, 0, chunk.Length);
+            if (read <= 0)
+            {
+                break;
+            }
+
+            total += read;
+            if (total > WireLimits.MaxRawStateBytes)
+            {
+                throw new InvalidDataException($"full state expands past the {WireLimits.MaxRawStateBytes:N0}B cap");
+            }
+
+            output.Write(chunk, 0, read);
+        }
+
         return output.ToArray();
     }
 
@@ -1304,12 +1415,17 @@ public static class NetSession
     private static readonly DesyncTolerance _tolerance = new();
 
     /// <summary>
-    /// Summaries waiting for the main thread, in arrival order, each with the number of deltas
-    /// that had arrived before it. Deltas and summaries travel in two queues, so "after
-    /// DrainDeltas" alone is not "after every earlier delta": a delta and its summary can both
-    /// land in the instant between the drain and the check. The count closes that gap exactly.
+    /// Summaries waiting for the main thread, each with the number of deltas that had arrived
+    /// before it (deltas and summaries travel in two queues, so "after DrainDeltas" alone is
+    /// not "after every earlier delta"). SummaryGate (src/Shared, tested) hands the main
+    /// thread at most one per call and at most one a second: the newest that is ready.
     /// </summary>
-    private static readonly ConcurrentQueue<(long DeltasBefore, byte[] Payload)> _pendingSummaries = new();
+    private static readonly SummaryGate _summaryGate = new();
+
+    /// <summary>Set by the network thread when the link drops; the main thread does the forgetting.</summary>
+    private static volatile bool _toleranceResetPending;
+
+    private static readonly Stopwatch _sessionClock = Stopwatch.StartNew();
 
     /// <summary>Deltas the network thread has queued, ever.</summary>
     private static long _deltasReceived;
@@ -1317,9 +1433,7 @@ public static class NetSession
     /// <summary>Deltas the main thread has taken off the queue (applied, held or dropped), each counted once.</summary>
     private static long _deltasTaken;
 
-    private const int MaxPendingSummaries = 32;
-
-    private static long _summariesDropped;
+    private static long _gateDropsLogged;
     private static long _checksMatched;
     private static long _checksSkipped;
     private static long _checksTolerated;
@@ -1358,44 +1472,53 @@ public static class NetSession
             return;
         }
 
-        if (_pendingSummaries.Count >= MaxPendingSummaries)
-        {
-            _summariesDropped++;
-            if (_summariesDropped == 1 || _summariesDropped % 50 == 0)
-            {
-                _log($"# net[client]: {_summariesDropped} summary(ies) dropped -- the main thread is not draining them");
-            }
-
-            return;
-        }
-
         long deltasBefore = Interlocked.Read(ref _deltasReceived);
-        _pendingSummaries.Enqueue((deltasBefore, payload));
+        _summaryGate.Offer(deltasBefore, payload);
     }
 
     /// <summary>Client, main thread, straight after DrainDeltas.</summary>
     private static void ProcessPendingSummaries()
     {
-        while (_pendingSummaries.TryPeek(out var next))
+        if (_toleranceResetPending)
         {
-            // Not yet: a delta that arrived before this summary is still in the queue.
-            if (Interlocked.Read(ref _deltasTaken) < next.DeltasBefore)
-            {
-                return;
-            }
+            _toleranceResetPending = false;
+            _tolerance.Reset();
+            _summaryGate.Clear();
+        }
 
-            _pendingSummaries.TryDequeue(out _);
+        // At most ONE check per call, and SummaryGate allows at most one a second. A check
+        // walks every carried collection on this thread; a flood of summaries used to mean a
+        // flood of walks in a single frame (security review H1).
+        long deltasTaken = Interlocked.Read(ref _deltasTaken);
+        byte[] payload = _summaryGate.TakeNewestReady(deltasTaken, _sessionClock.Elapsed.TotalSeconds);
 
-            try
+        long gateDrops = _summaryGate.Dropped + _summaryGate.Superseded;
+        if (gateDrops >= _gateDropsLogged + 50)
+        {
+            _gateDropsLogged = gateDrops;
+            _log($"# net[client]: {_summaryGate.Dropped} summary(ies) dropped from a full queue and {_summaryGate.Superseded} superseded by a newer one -- the host is sending them faster than one a second");
+        }
+
+        if (payload is null)
+        {
+            return;
+        }
+
+        try
+        {
+            CheckSummary(payload);
+        }
+        catch (Exception ex)
+        {
+            _checksFailed++;
+            if (LogThrottle.ShouldLog(_checksFailed, 3, 50))
             {
-                CheckSummary(next.Payload);
-            }
-            catch (Exception ex)
-            {
-                _log("# net[client]: sync check failed " + ex.GetType().Name + ": " + ex.Message);
+                _log($"# net[client]: sync check failed {ex.GetType().Name} ({_checksFailed} so far)");
             }
         }
     }
+
+    private static long _checksFailed;
 
     private static void CheckSummary(byte[] payload)
     {
@@ -1449,7 +1572,7 @@ public static class NetSession
 
         // Dev measurement: this side's census for this host tick, written with every delta
         // before the summary already applied.
-        if (DivergenceDump.Enabled)
+        if (DivergenceDump.ShouldSample(hostTick))
         {
             string dumpContext = $"baseline={_syncsApplied} summaryBaseline={summaryBaseline} verdict={result.Verdict} " +
                                  $"deltasApplied={_deltasApplied} deltasHeld={_heldDeltas.Count} [{StateDelta.MutationFailureSummary()}]";
@@ -1470,7 +1593,11 @@ public static class NetSession
         if (result.Verdict == SyncVerdict.Tolerated)
         {
             _checksTolerated++;
-            _log($"# net[client]: sync check tolerated at host tick {hostTick} -- {result.Detail} ({_checksTolerated} tolerated so far)");
+            if (LogThrottle.ShouldLog(_checksTolerated, 5, 20))
+            {
+                _log($"# net[client]: sync check tolerated at host tick {hostTick} -- {PeerText.Sanitise(result.Detail, MaxDetailLength)} ({_checksTolerated} tolerated so far)");
+            }
+
             return;
         }
 
@@ -1503,8 +1630,13 @@ public static class NetSession
             return;
         }
 
+        string detail = PeerText.Sanitise(result.Detail, MaxDetailLength);
+
         _mismatchRunLogged = result.ConsecutiveMismatches;
-        _log($"# net[client]: sync check MISMATCH {result.ConsecutiveMismatches} of {DesyncTolerance.MismatchesBeforeDesync} at host tick {hostTick} -- {result.Detail}");
+        if (LogThrottle.ShouldLog(result.ConsecutiveMismatches, DesyncTolerance.MismatchesBeforeDesync, 20))
+        {
+            _log($"# net[client]: sync check MISMATCH {result.ConsecutiveMismatches} of {DesyncTolerance.MismatchesBeforeDesync} at host tick {hostTick} -- {detail}");
+        }
 
         // A desync popup is already open: the players are deciding, so nothing is asked for here.
         if (Desync.IncidentOpen)
@@ -1514,7 +1646,7 @@ public static class NetSession
 
         if (result.BecameSustained)
         {
-            string hostText = hostDigest.Describe();
+            string hostText = PeerText.Sanitise(hostDigest.Describe(), MaxDetailLength);
             string mineText = mine.Describe();
             _log($"# net[client]: structure diverged — host {hostText} vs mine {mineText} at host tick {hostTick}");
 
@@ -1530,9 +1662,12 @@ public static class NetSession
 
         // Before the popup: ask for a repair, quietly. A real mismatch is something only a
         // full state fixes, and if one fixes it the players never need to be asked. Both
-        // floors still apply (60 s here, MinTicksBetweenServedStates on the host).
-        RequestResync($"sync check mismatched {result.ConsecutiveMismatches} time(s): {result.Detail}");
+        // floors still apply (60 s here, MinSecondsBetweenServedStates on the host).
+        RequestResync($"sync check mismatched {result.ConsecutiveMismatches} time(s): {detail}");
     }
+
+    /// <summary>Longest piece of digest text that goes into one log line.</summary>
+    private const int MaxDetailLength = 300;
 
     /// <summary>A copy of our digest that cannot match: the ship entry is seven members out.</summary>
     private static SyncDigest ForcedDigest(SyncDigest mine)
@@ -1566,6 +1701,7 @@ public static class NetSession
 
         _lastResyncRequest = DateTime.UtcNow;
         _resyncsRequested++;
+        _resyncOutstanding = true;
 
         Send(Msg.ResyncRequest, Array.Empty<byte>());
         _log($"# net[client]: requested full state #{_resyncsRequested} — {reason}");
@@ -1590,8 +1726,14 @@ public static class NetSession
         _resyncRequested = true;
     }
 
-    /// <summary>Ticks between served full states below which a plain ResyncRequest is ignored (~60 s at 10 ticks/s).</summary>
-    private const long MinTicksBetweenServedStates = 600;
+    /// <summary>
+    /// Wall seconds between served full states below which a plain ResyncRequest is ignored.
+    /// It was 600 TICKS, documented as about 60 s; the tick turned out to be about 29 a second,
+    /// so the floor was really 20 s. Seconds now, so it is what it says (2026-11-10).
+    /// </summary>
+    private const double MinSecondsBetweenServedStates = 60;
+
+    private static long _resyncRequestsReceived;
 
     private static volatile bool _desyncServeExemption;
 
@@ -1655,8 +1797,38 @@ public static class NetSession
             var (baseline, payload) = UntagDelta(tagged);
             if (payload is null) continue;
 
+            // The host serves one full state at a time, so a delta can be for the state after
+            // ours and no further. Anything beyond that is not a delta this session produced.
+            if (baseline > _syncsApplied + 1)
+            {
+                _deltasRefused++;
+                if (LogThrottle.ShouldLog(_deltasRefused, 1, 50))
+                {
+                    _log($"# net[client]: refused a delta for full state #{baseline} (have #{_syncsApplied}); {_deltasRefused} refused so far");
+                }
+
+                continue;
+            }
+
             if (baseline > _syncsApplied)
             {
+                // Held deltas wait in memory for a state that may never come, so there is a
+                // limit. Past it the delta is dropped; the state it belonged to, when it
+                // lands, is followed by a mismatch and a repair instead of unbounded growth.
+                bool heldQueueFull = _heldDeltas.Count >= MaxHeldDeltas || _heldDeltaBytes + tagged.Length > MaxHeldDeltaBytes;
+                if (heldQueueFull)
+                {
+                    _deltasRefused++;
+                    if (LogThrottle.ShouldLog(_deltasRefused, 1, 50))
+                    {
+                        _log($"# net[client]: held-delta limit reached ({_heldDeltas.Count} deltas, {_heldDeltaBytes:N0}B); delta dropped, {_deltasRefused} refused so far");
+                    }
+
+                    continue;
+                }
+
+                _heldDeltaBytes += tagged.Length;
+
                 // Built against a full state we have not applied yet. Keep it, in order.
                 _heldDeltas.Enqueue(tagged);
                 if (++_deltasHeld == 1 || _deltasHeld % 50 == 0)
@@ -1707,6 +1879,7 @@ public static class NetSession
 
         var pending = new List<byte[]>();
         while (_heldDeltas.TryDequeue(out var d)) pending.Add(d);
+        _heldDeltaBytes = 0;
 
         // These were counted when they were first taken and will be taken again.
         Interlocked.Add(ref _deltasTaken, -pending.Count);
@@ -1733,6 +1906,13 @@ public static class NetSession
 
     private static readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _heldDeltas = new();
     private static long _deltasHeld, _deltasDropped;
+    private static long _deltasRefused;
+    private static long _heldDeltaBytes;
+
+    /// <summary>About five minutes of deltas at one a second; an honest host's full state lands in seconds.</summary>
+    private const int MaxHeldDeltas = 512;
+
+    private const long MaxHeldDeltaBytes = 16L * 1024 * 1024;
     private static long _clockSamplesApplied;
 
     /// <summary>Host: which full state the next deltas are relative to. Read on the sim thread.</summary>

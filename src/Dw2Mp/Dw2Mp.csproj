@@ -39,6 +39,7 @@
     <Compile Include="..\Shared\KeyframePolicy.cs" Link="Shared\KeyframePolicy.cs" />
     <Compile Include="..\Shared\GalaxyEvents.cs" Link="Shared\GalaxyEvents.cs" />
     <Compile Include="..\Shared\SyncThresholds.cs" Link="Shared\SyncThresholds.cs" />
+    <Compile Include="..\Shared\SyncGuards.cs" Link="Shared\SyncGuards.cs" />
   </ItemGroup>
 
   <!--

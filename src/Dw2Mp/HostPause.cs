@@ -55,6 +55,8 @@ public static class HostPause
 
     private const float SpeedTolerance = 0.01f;
 
+    private const double MaxSampleAgeSeconds = 10;
+
     public static void Install(Harmony harmony, Action<string> log)
     {
         _log = log;
@@ -107,6 +109,13 @@ public static class HostPause
     public static void FollowHost()
     {
         if (!_installed || _saving || !FixedStep.Following)
+        {
+            return;
+        }
+
+        // No link, or nothing from the host for ten seconds: what we last heard is not what the
+        // host is doing now, so stop enforcing it and leave the joiner's own pause key alone.
+        if (!NetSession.Connected || FixedStep.SecondsSinceHostSample > MaxSampleAgeSeconds)
         {
             return;
         }

@@ -47,7 +47,9 @@ public sealed class KeyframeDecision
 /// </summary>
 public sealed class SyncSettings
 {
-    public const double DefaultKeyframeMinutes = 3;
+    // 5, not the 3 first asked for: each adoption leaks 43 to 48 MB on the joiner (measured
+    // 2026-11-10), so twenty an hour was the better part of a gigabyte.
+    public const double DefaultKeyframeMinutes = 5;
 
     public const double MinimumKeyframeMinutes = 1;
 
@@ -148,29 +150,35 @@ public sealed class SyncSettings
 /// Events and the periodic clock only exist once a joiner has a state (rule 1 has fired):
 /// before that the first full state carries everything anyway. Time is given in seconds by the
 /// caller, not counted in ticks: the tick rate follows the game's own cycle length, measured at
-/// about 29 a second on 2026-11-10, not the 10 the older comments assume.
+/// about 29 a second on 2026-11-10, not the 10 the older comments assume. The FLOOR is wall
+/// time too, for the same reason: as 600 ticks it was 20 seconds, not the 60 it was documented
+/// and reviewed as.
 /// </summary>
 public sealed class KeyframePolicy
 {
     private readonly double _periodicSeconds;
     private readonly bool _serveOnEvents;
-    private readonly long _floorTicks;
+    private readonly double _floorSeconds;
     private readonly long _safetyTicks;
 
     private bool _anyServed;
     private long _lastServedTick;
     private double _runningSecondsSinceServed;
+    private double _wallSecondsSinceServed;
     private readonly List<string> _pendingEvents = new();
 
     public const int MaxPendingEvents = 8;
 
-    public KeyframePolicy(SyncSettings settings, long floorTicks, long safetyTicks)
+    public KeyframePolicy(SyncSettings settings, double floorSeconds, long safetyTicks)
     {
         _periodicSeconds = settings.KeyframeSeconds;
         _serveOnEvents = settings.KeyframeOnEvents;
-        _floorTicks = floorTicks;
+        _floorSeconds = floorSeconds;
         _safetyTicks = safetyTicks;
     }
+
+    /// <summary>Wall seconds since a full state was last served, paused or not. The floor is measured on this.</summary>
+    public double WallSecondsSinceServed => _wallSecondsSinceServed;
 
     public bool AnyServed => _anyServed;
 
@@ -181,12 +189,17 @@ public sealed class KeyframePolicy
     /// <summary>Called once per host tick with the wall time since the previous one and whether the game was running.</summary>
     public void NoteTime(double elapsedSeconds, bool hostRunning)
     {
-        if (!_anyServed || !hostRunning || elapsedSeconds <= 0)
+        if (!_anyServed || elapsedSeconds <= 0)
         {
             return;
         }
 
-        _runningSecondsSinceServed += elapsedSeconds;
+        _wallSecondsSinceServed += elapsedSeconds;
+
+        if (hostRunning)
+        {
+            _runningSecondsSinceServed += elapsedSeconds;
+        }
     }
 
     /// <summary>A big event happened on the host. Remembered until a full state carries it.</summary>
@@ -208,7 +221,7 @@ public sealed class KeyframePolicy
     public KeyframeDecision Decide(long tick, bool clientAsked, bool desyncExemption)
     {
         var decision = new KeyframeDecision();
-        bool withinFloor = _anyServed && tick - _lastServedTick < _floorTicks;
+        bool withinFloor = _anyServed && _wallSecondsSinceServed < _floorSeconds;
 
         if (clientAsked)
         {
@@ -266,6 +279,7 @@ public sealed class KeyframePolicy
         _anyServed = true;
         _lastServedTick = tick;
         _runningSecondsSinceServed = 0;
+        _wallSecondsSinceServed = 0;
         _pendingEvents.Clear();
     }
 }

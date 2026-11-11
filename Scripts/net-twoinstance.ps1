@@ -225,6 +225,11 @@ function Set-GameEnvironment {
     # No autosaves into the player's own slots during a harness run.
     $env:DW2MP_BLOCK_AUTOSAVE  = '1'
 
+    # The developer switch: the mod ignores its dev flags (the divergence dump, the forced
+    # desync, the popup auto-choice) without it, and says so loudly in its log with it. This
+    # script is a dev harness; the lobby never sets it and strips it from a real session.
+    $env:DW2MP_DEV              = '1'
+
     $env:DW2MP_DIVERGENCE_DIR   = $DivergenceDir
     $env:DW2MP_DIVERGENCE_EVERY = $DivergenceEvery
 }

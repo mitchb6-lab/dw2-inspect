@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using Dw2MpShared;
 using HarmonyLib;
 
 namespace Dw2Mp;
@@ -757,7 +758,7 @@ public static partial class StateDelta
         var type = AccessTools.TypeByName(kind.TypeName);
         int applied = 0;
 
-        int removedCount = reader.ReadInt32();
+        int removedCount = WireLimits.ReadCount(reader, 2, CountOf(list), kind.Collection + " removals");
         for (int i = 0; i < removedCount; i++)
         {
             long id = ReadId(reader, kind.IdIsShort);
@@ -767,13 +768,18 @@ public static partial class StateDelta
             if (RemoveFromList(list, element)) applied++; else absent++;
         }
 
-        int upsertCount = reader.ReadInt32();
+        int upsertCount = WireLimits.ReadCount(reader, 6, -1, kind.Collection + " upserts");
         for (int i = 0; i < upsertCount; i++)
         {
             long id = ReadId(reader, kind.IdIsShort);
-            int length = reader.ReadInt32();
-            var bytes = length > 0 ? reader.ReadBytes(length) : null;
-            if (bytes is null || bytes.Length != length) { absent++; continue; }
+            // Capped, and checked against the bytes left in the frame before anything is
+            // allocated (security review P1): the length is a number the other PC chose.
+            byte[] bytes = WireLimits.ReadCappedBytes(reader, WireLimits.MaxObjectBytes, "serialised object");
+            if (bytes is null)
+            {
+                absent++;
+                continue;
+            }
 
             var existing = Lookup(getById, list, id);
 
@@ -932,7 +938,7 @@ public static partial class StateDelta
         int applied = 0;
 
         // --- removals
-        int removedCount = reader.ReadInt32();
+        int removedCount = WireLimits.ReadCount(reader, 4, localTotal, "ship removals");
         for (int i = 0; i < removedCount; i++)
         {
             int id = reader.ReadInt32();
@@ -944,19 +950,24 @@ public static partial class StateDelta
         }
 
         // --- additions, deserialised by DW2's own Ship.ReadFromStream
-        int addedCount = reader.ReadInt32();
+        int addedCount = WireLimits.ReadCount(reader, 4, -1, "ship additions");
         for (int i = 0; i < addedCount; i++)
         {
-            int length = reader.ReadInt32();
-            var bytes = length > 0 ? reader.ReadBytes(length) : null;
-            if (bytes is null || bytes.Length != length) { absent++; continue; }
+            // Capped, and checked against the bytes left in the frame before anything is
+            // allocated (security review P1): the length is a number the other PC chose.
+            byte[] bytes = WireLimits.ReadCappedBytes(reader, WireLimits.MaxObjectBytes, "serialised object");
+            if (bytes is null)
+            {
+                absent++;
+                continue;
+            }
 
             if (AddFromBytes(galaxy, ships, AccessTools.TypeByName("DistantWorlds.Types.Ship"), bytes)) applied++;
             else absent++;
         }
 
         // --- updates
-        int updatedCount = reader.ReadInt32();
+        int updatedCount = WireLimits.ReadCount(reader, 21, CountOf(ships), "ship updates");
         for (int i = 0; i < updatedCount; i++)
         {
             int id = reader.ReadInt32();
@@ -976,8 +987,6 @@ public static partial class StateDelta
     /// <summary>Set by NetSession so mutation failures can be reported. Null-safe.</summary>
     public static Action<string> Log { get; set; }
 
-    private static readonly HashSet<string> _mutationFailures = new();
-    private static long _mutationFailureCount;
 
     /// <summary>
     /// Report a failed add or remove -- ONCE per distinct reason, with a running count.
@@ -989,18 +998,28 @@ public static partial class StateDelta
     /// unless removals are not landing either. Both were failing and both were reporting
     /// success.
     /// </summary>
-    private static void NoteMutationFailure(string reason)
+    ///
+    /// The KEY is a fixed phrase: what was being done, and at most an exception type. The
+    /// DETAIL (an exception message, a byte count) is logged with the first occurrence only
+    /// and never remembered, so a peer cannot grow the set by varying it; the set is capped
+    /// in any case (FailureLedger, security review M3).
+    private static void NoteMutationFailure(string key, string detail = "")
     {
-        Interlocked.Increment(ref _mutationFailureCount);
-        bool isNew;
-        lock (_mutationFailures) isNew = _mutationFailures.Add(reason);
-        if (isNew)
-            Log?.Invoke($"# delta: MUTATION FAILED -- {reason} (distinct #{_mutationFailures.Count}, " +
-                        $"{Interlocked.Read(ref _mutationFailureCount)} total)");
+        bool isNew = _mutationFailureLedger.Note(key);
+        if (!isNew)
+        {
+            return;
+        }
+
+        string detailText = string.IsNullOrEmpty(detail) ? "" : " [" + PeerText.Sanitise(detail, 200) + "]";
+        Log?.Invoke($"# delta: MUTATION FAILED -- {key}{detailText} (distinct #{_mutationFailureLedger.DistinctCount}, " +
+                    $"{_mutationFailureLedger.Total} total)");
     }
 
+    private static readonly FailureLedger _mutationFailureLedger = new();
+
     public static string MutationFailureSummary() =>
-        $"mutation failures={Interlocked.Read(ref _mutationFailureCount)} distinct={_mutationFailures.Count}";
+        $"mutation failures={_mutationFailureLedger.Total} distinct={_mutationFailureLedger.DistinctCount}";
 
     /// <summary>The id field DW2 uses for each type we create or remove.</summary>
     private static string IdFieldFor(Type type) => type.Name switch
@@ -1090,8 +1109,7 @@ public static partial class StateDelta
             stage = "verify";
             if (!ListContains(list, item, out var why))
             {
-                NoteMutationFailure($"{name}: Add reported success but the list does not contain it" +
-                                    (why.Length > 0 ? $" ({why})" : ""));
+                NoteMutationFailure($"{name}: Add reported success but the list does not contain it", why);
                 return false;
             }
 
@@ -1110,7 +1128,7 @@ public static partial class StateDelta
         catch (Exception ex)
         {
             var cause = ex.InnerException ?? ex;
-            NoteMutationFailure($"{name} at {stage}: {cause.GetType().Name}: {cause.Message}");
+            NoteMutationFailure($"{name} at {stage}: {cause.GetType().Name}", cause.Message);
             return false;
         }
     }
@@ -1164,7 +1182,7 @@ public static partial class StateDelta
         catch (Exception ex)
         {
             var cause = ex.InnerException ?? ex;
-            NoteMutationFailure($"{name} remove: {cause.GetType().Name}: {cause.Message}");
+            NoteMutationFailure($"{name} remove: {cause.GetType().Name}", cause.Message);
             return false;
         }
     }
@@ -1178,7 +1196,7 @@ public static partial class StateDelta
         var colonyType = AccessTools.TypeByName("DistantWorlds.Types.Colony");
         int applied = 0;
 
-        int removedCount = reader.ReadInt32();
+        int removedCount = WireLimits.ReadCount(reader, 2, CountOf(colonies), "colony removals");
         for (int i = 0; i < removedCount; i++)
         {
             short id = reader.ReadInt16();
@@ -1188,17 +1206,22 @@ public static partial class StateDelta
             if (RemoveFromList(colonies, colony)) applied++; else absent++;
         }
 
-        int addedCount = reader.ReadInt32();
+        int addedCount = WireLimits.ReadCount(reader, 4, -1, "colony additions");
         for (int i = 0; i < addedCount; i++)
         {
-            int length = reader.ReadInt32();
-            var bytes = length > 0 ? reader.ReadBytes(length) : null;
-            if (bytes is null || bytes.Length != length) { absent++; continue; }
+            // Capped, and checked against the bytes left in the frame before anything is
+            // allocated (security review P1): the length is a number the other PC chose.
+            byte[] bytes = WireLimits.ReadCappedBytes(reader, WireLimits.MaxObjectBytes, "serialised object");
+            if (bytes is null)
+            {
+                absent++;
+                continue;
+            }
 
             if (AddFromBytes(galaxy, colonies, colonyType, bytes)) applied++; else absent++;
         }
 
-        int updatedCount = reader.ReadInt32();
+        int updatedCount = WireLimits.ReadCount(reader, 22, CountOf(colonies), "colony updates");
         for (int i = 0; i < updatedCount; i++)
         {
             short id = reader.ReadInt16();
@@ -1222,7 +1245,7 @@ public static partial class StateDelta
         var empires = ListField(galaxy, "Empires");
         var empireById = ById(empires, typeof(short)) ?? ById(empires, typeof(int));
 
-        int count = reader.ReadInt32();
+        int count = WireLimits.ReadCount(reader, 9, -1, "research updates");
         int applied = 0;
 
         for (int i = 0; i < count; i++)
@@ -1634,7 +1657,7 @@ public static partial class StateDelta
         var fleetType = AccessTools.TypeByName("DistantWorlds.Types.Fleet");
         int applied = 0;
 
-        int removedCount = reader.ReadInt32();
+        int removedCount = WireLimits.ReadCount(reader, 4, CountFleets(galaxy), "fleet removals");
         for (int i = 0; i < removedCount; i++)
         {
             var (empireId, fleetId) = UnpackFleetKey(reader.ReadInt32());
@@ -1646,13 +1669,18 @@ public static partial class StateDelta
             if (RemoveFromList(fleets, fleet)) applied++; else absent++;
         }
 
-        int upsertCount = reader.ReadInt32();
+        int upsertCount = WireLimits.ReadCount(reader, 8, -1, "fleet upserts");
         for (int i = 0; i < upsertCount; i++)
         {
             var (empireId, _) = UnpackFleetKey(reader.ReadInt32());
-            int length = reader.ReadInt32();
-            var bytes = length > 0 ? reader.ReadBytes(length) : null;
-            if (bytes is null || bytes.Length != length) { absent++; continue; }
+            // Capped, and checked against the bytes left in the frame before anything is
+            // allocated (security review P1): the length is a number the other PC chose.
+            byte[] bytes = WireLimits.ReadCappedBytes(reader, WireLimits.MaxObjectBytes, "serialised object");
+            if (bytes is null)
+            {
+                absent++;
+                continue;
+            }
 
             var fleets = FleetsOf(empires, empireById, empireId);
             if (fleets is null) { absent++; continue; }
