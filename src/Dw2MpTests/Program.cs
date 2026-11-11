@@ -8,7 +8,7 @@ namespace Dw2MpTests;
 /// mod's Content wire string, and the Steam app-manifest reader. No game, no sockets, no
 /// framework. Each check prints one line; the process exits 1 if any failed.
 /// </summary>
-public static class Program
+public static partial class Program
 {
     private static int _passed;
     private static readonly List<string> _failures = new();
@@ -73,6 +73,9 @@ public static class Program
         DesyncCounterCannotBeDrivenFromTheWire();
         DesyncTransitionsReportWhetherTheyHappened();
         DesyncSaveFileNameIsItsOwn();
+
+        // 2026-11-10 desync reduction: see DesyncReductionTests.cs.
+        RunDesyncReductionTests();
 
         Console.WriteLine();
         Console.WriteLine($"{_passed} passed, {_failures.Count} failed");

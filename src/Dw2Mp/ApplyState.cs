@@ -968,6 +968,13 @@ public static class ApplyState
     /// Sorted by ShipId so the two sides compare the same set regardless of list order.
     /// Cost is one pass over the ship list reading two fields — a few thousand reflection
     /// calls, against 24 MB of serialisation for a full state.
+    ///
+    /// NO LONGER WHAT THE LIVE CHECK COMPARES (2026-11-10). It folds in the Empires and Orbs
+    /// counts and the raw Ships.Count, none of which deltas carry: in that day's two-instance
+    /// run the host had 1,401 orbs and the joiner 1,400, before and after a fresh full state,
+    /// with every ship identical, and this fingerprint raised DESYNC DETECTED three summaries
+    /// after the join. StateSummary now carries StateDelta.BuildDigest instead. Kept for the
+    /// apply measurement and for comparison in logs.
     /// </summary>
     public static string StructuralFingerprint(object galaxy)
     {

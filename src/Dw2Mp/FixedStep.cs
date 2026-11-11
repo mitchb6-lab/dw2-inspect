@@ -134,6 +134,9 @@ public static class FixedStep
     /// <summary>True once the client has a host time to report.</summary>
     public static bool Following => _follow && _hostNowTicks > 0;
 
+    /// <summary>The host's game speed as of its last clock sample; 0 means the host is paused.</summary>
+    public static float HostSpeed => _hostSpeed;
+
     public static void InstallFollow(Harmony harmony, Action<string> log)
     {
         var serverType = AccessTools.TypeByName("DistantWorlds.Types.GameServer");

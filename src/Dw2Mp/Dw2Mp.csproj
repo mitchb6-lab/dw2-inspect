@@ -35,6 +35,10 @@
     <Compile Include="..\Shared\SnapshotHashWriter.cs" Link="Shared\SnapshotHashWriter.cs" />
     <Compile Include="..\Shared\DesyncPolicy.cs" Link="Shared\DesyncPolicy.cs" />
     <Compile Include="..\Shared\PeerText.cs" Link="Shared\PeerText.cs" />
+    <Compile Include="..\Shared\SyncDigest.cs" Link="Shared\SyncDigest.cs" />
+    <Compile Include="..\Shared\KeyframePolicy.cs" Link="Shared\KeyframePolicy.cs" />
+    <Compile Include="..\Shared\GalaxyEvents.cs" Link="Shared\GalaxyEvents.cs" />
+    <Compile Include="..\Shared\SyncThresholds.cs" Link="Shared\SyncThresholds.cs" />
   </ItemGroup>
 
   <!--

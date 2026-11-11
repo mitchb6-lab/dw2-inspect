@@ -8,4 +8,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
+
+  <!-- Shared SOURCE, as in the mod and the tests: the divergence comparison is pure .NET. -->
+  <ItemGroup>
+    <Compile Include="..\Shared\DivergenceReport.cs" Link="Shared\DivergenceReport.cs" />
+  </ItemGroup>
 </Project>

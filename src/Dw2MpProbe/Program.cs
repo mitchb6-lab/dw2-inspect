@@ -14,6 +14,18 @@ using System.Security.Cryptography;
 // adopt a galaxy; what is unproven is framing, compression and the host's sync loop. A
 // stub tests exactly that and nothing else, so a failure has one possible cause.
 
+// Two dev modes that are not the stub peer (2026-11-10): a lobby-free relay for two game
+// instances on one PC, and the host-versus-joiner divergence report. See DevModes.cs.
+if (args.Length > 0 && args[0] == "relay")
+{
+    return Dw2MpProbe.RelayMode.Run(args);
+}
+
+if (args.Length > 0 && args[0] == "divergence")
+{
+    return Dw2MpProbe.DivergenceMode.Run(args);
+}
+
 const int HeaderSize = 5;
 
 string host = args.Length > 0 ? args[0] : "127.0.0.1";
