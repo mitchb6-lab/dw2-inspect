@@ -1222,6 +1222,9 @@ Halving the adoptions halved the growth. DW2 was never built to swap galaxies re
 `StartGameExisting` acquires native resources for the incoming galaxy without releasing
 the outgoing one's, and nothing in the game's own lifecycle ever asks it to.
 
+(2026-11-11: identified. It is not `StartGameExisting` itself but the renderer's
+re-initialisation one frame later; see "Adoption memory: what leaks, measured" at the end.)
+
 ### What was done, and what it does not do
 
 The default sync interval is raised from 600 to 1,800 ticks. **That is a stopgap that
@@ -2338,6 +2341,8 @@ returned: ~25–36 MB when measured on 2026-09-08, 43–48 MB in the 2026-11-10 
 default 5 minutes that is twelve adoptions and roughly 550 MB an hour, before any event
 keyframe. The interval is in a file for that reason, and a per-session memory budget (stop
 serving periodic keyframes once the joiner has adopted N) is a follow-up, not built.
+(2026-11-11: measured and attributed in "Adoption memory: what leaks, measured" below. The
+budget that was built is a one-time notice to the player, not a stop to keyframes.)
 
 ### 3. More state in deltas (delta body 9)
 
@@ -2581,3 +2586,160 @@ Not done: a session memory budget for adoptions (follow-up, above); a local-coll
 on sections that CREATE members (ship, colony, design, character and fleet additions), which
 have only the bytes-left bound because a creation is by definition not in the local
 collection.
+
+(2026-11-11: the session memory budget is built; see the next section.)
+
+
+---
+
+## Adoption memory: what leaks, measured -- 2026-11-11
+
+Built on `fix/adoption-memory-1111`. Wire protocol unchanged (net protocol **4**).
+
+The question was "what holds the old galaxy alive after an adoption". **Nothing does.** The
+growth is graphics memory that DW2's renderer allocates again for every galaxy it is given and
+never frees. Two two-instance runs on one PC (`Scripts\net-twoinstance.ps1 -Cycles 16000`,
+keyframes forced to one a minute, 30 stars, 16 empires, nine adoptions each).
+
+### How it was measured
+
+`src\Dw2Mp\AdoptionMemory.cs` logs one reading per adoption and a second one 20 s later
+("SETTLED": the renderer rebuilds on later frames, so the cost is not visible at once). One
+process number cannot separate the causes, so each reading carries all of them:
+
+| Number | What it is | Growing means |
+|---|---|---|
+| `managed` / `managedAfterCollect` | the GC heap; the second is `GC.GetTotalMemory(true)` | objects are retained |
+| `gcCommitted` | what the collector has committed from Windows | the collector is holding freed memory (DW2 runs **server GC**, 24 heaps) |
+| `other` | private bytes minus `gcCommitted` | native memory: Stride, the graphics driver |
+| `textures`, `buffers` | Stride's own counters (`GraphicsDevice.TextureMemory`, `BuffersMemory`) | graphics resources nobody disposed |
+| `private`, `workingSet` | the process as Windows sees it | |
+
+The developer probe (`DW2MP_ADOPTION_MEMORY_PROBE=<first adoption>` with `DW2MP_DEV=1`) adds
+forced-collection readings BEFORE and AFTER each adoption, a count of replaced galaxies still
+alive (weak references), a census of ~3,600 collection sizes reachable from the game's statics
+and renderer, and a list of the graphics resources created since the previous adoption.
+
+### Before and after each adoption
+
+Run 1, adoptions 1 to 4, nothing forced (what a player's game does), settled readings, MB:
+
+| Adoption | private | workingSet | gcCommitted | other |
+|---:|---:|---:|---:|---:|
+| 1 | 5,434 | 2,600 | 576 | 4,858 |
+| 2 | 5,496 (+62) | 2,631 | 593 (+17) | 4,903 (+45) |
+| 3 | 5,545 (+49) | 2,650 | 600 (+7) | 4,945 (+42) |
+| 4 | 5,668 (+123) | 2,707 | 631 (+31) | 5,037 (+92) |
+
+Run 1, adoptions 6 to 9, `GC.GetTotalMemory(true)` before and after, MB:
+
+| Adoption | managed BEFORE | managed AFTER | managed SETTLED | workingSet BEFORE / AFTER / SETTLED | textures | buffers | other |
+|---:|---:|---:|---:|---|---:|---:|---:|
+| 6 | 314 | 340 | 312 | 2,581 / 2,589 / 2,572 | 2,373 | 119 | 5,079 |
+| 7 | 314 | 340 | 312 | 2,529 / 2,558 / 2,553 | 2,405 | 126 | 5,120 |
+| 8 | 314 | 340 | 312 | 2,538 / 2,577 / 2,567 | 2,437 | 133 | 5,164 |
+| 9 | 315 | 338 | 312 | 2,480 / 2,533 / 2,539 | 2,469 | 140 | 5,207 |
+
+Run 2, forced readings on every adoption, settled, MB:
+
+| Adoption | managedAfterCollect | gcCommitted | other | private | workingSet | textures | buffers |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 332 | 482 | 5,329 | 5,811 | 2,760 | 2,449 | 101 |
+| 2 | 333 | 483 | 5,375 | 5,859 | 2,775 | 2,481 | 108 |
+| 3 | 334 | 450 | 5,425 | 5,875 | 2,758 | 2,513 | 115 |
+| 4 | 334 | 477 | 5,462 | 5,938 | 2,788 | 2,545 | 122 |
+| 5 | 335 | 473 | 5,507 | 5,980 | 2,795 | 2,577 | 128 |
+| 6 | 339 | 483 | 5,554 | 6,036 | 2,811 | 2,609 | 135 |
+| 7 | 339 | 474 | 5,598 | 6,071 | 2,814 | 2,641 | 142 |
+| 8 | 339 | 506 | 5,645 | 6,151 | 2,855 | 2,673 | 149 |
+| 9 | 339 | 466 | 5,685 | 6,152 | 2,819 | 2,705 | 156 |
+
+What the tables say:
+
+- **The managed heap is flat**: 312 MB after every adoption in run 1, 332 to 339 MB across run
+  2. A galaxy is about 26 MB of managed objects (AFTER minus SETTLED), and it is collected.
+  Of all the galaxies replaced, exactly one was still alive after a forced collect in every
+  reading: the joiner's own throwaway galaxy, the one the first adoption replaces. That is a
+  one-off 26 MB, not growth, and it was not chased.
+- **`textures` grows by exactly 32 MB and `buffers` by 7 MB per adoption**, every adoption, in
+  both runs. `other` grows 37 to 50 MB with them (about 45), and private bytes follow: +341 MB
+  over eight adoptions in run 2, 43 MB each.
+- **The collector's share is slack, not a leak**: unforced, `gcCommitted` drifted up 7 to 31 MB
+  an adoption; one aggressive collect (40 ms) gave back 122 MB of it and 2 MB of `other`.
+
+### Root cause: DW2 rebuilds its render systems for every galaxy and disposes none
+
+The resource list was identical after every adoption: **63 new graphics resources, 2 gone**:
+
+```
+x17  RootSignature
+x16  Buffer`1
+x17  Buffer 224B to 288B flags=ConstantBuffer
+x8   PipelineState
+x2   Texture 2048x2048 B8G8R8A8_UNorm mips=1 flags=ShaderResource, RenderTarget
+x3   Buffer 288144B / 293808B flags=IndexBuffer
+```
+
+Read in the game's IL with `dw2inspect`:
+
+- `DWRendererBase.SetGalaxyAndPlayer` (called for every renderer by
+  `ScaledRenderer.InitializeGalaxy`, which `DWGame.StartGameExisting` calls) sets
+  `ForceGraphicsInitialization`.
+- On the next frame `DWRendererBase.CheckInitializeGraphics(forceReinitialization: true)`
+  assigns a **new** instance to every galaxy-bound render system: `_NebulaCloudSystem`,
+  `_GalaxyBackgroundSystem`, `_TerritoryMapSystem`, `_LongRangeScannerSystem` and
+  `_ExplorationDiplomacyOverlaySystem` (both `MapOverlaySystem`), `_SymbolSystem`,
+  `_FlowSystem`, `_TravelVectorSystem`, `_FleetOverlaySystem`, `_AttackVectorSystem`. The
+  instances it overwrites are not disposed, and none of these classes disposes anything.
+- `MapOverlaySystem.Initialize` alone creates a `SpriteBatch`, a `BackBufferSize` (2048) square
+  render target, two effect instances and a plane's vertex and index buffers. Two of them are
+  the two 16 MB textures: **32 of the 39 MB counted by Stride**.
+- Stride keeps every graphics resource in `GraphicsDevice.Resources` and a graphics resource
+  has no finalizer, so one nobody disposes is never released. The census showed that set
+  growing by 61 at every adoption, and nothing else growing with it.
+
+This is DW2's own behaviour: loading a save from inside a running game takes the same path and
+leaks the same 45 MB. A single-player session does it a handful of times; a joiner does it at
+every keyframe. At the default 5 minutes that is about 540 MB an hour.
+
+**One wrong theory, recorded so it is not tried again.** `DrawingHelper.GenerateTextureTinted`
+(called by `Empire.LoadFlagIfNecessary` for an empire whose secondary colour is not its race's
+default) really does leave a sprite batch and a depth buffer undisposed, and 15 tinted flags at
+4 resources each would have been 60 of the 61. A build that handed each empire's existing flag
+to the same empire in the next galaxy (so DW2 built none) was run from adoption 5 of run 2:
+16 flags carried, DW2 built 0, and the adoption still created the same 63 resources. No empire
+in the harness galaxy is tinted. The flag code was removed again; that leak is real in the IL
+and unmeasured here.
+
+### What was built: the measurement, and a session memory budget
+
+- **`AdoptionMemory`** replaces the old `MemoryReport`, which forced a compacting collect in a
+  player's game on every fifth adoption. A player's game now forces nothing: one line at the
+  adoption, one settled line 20 s later, with the change since the previous adoption.
+- **Session memory budget** (`src\Shared\SessionMemoryBudget.cs`, tested): the first settled
+  reading after the join is the baseline. When private bytes have grown **1.5 GB** over it, the
+  joiner gets **one** in-game notice recommending that the host saves and both restart, and the
+  log says `*** SESSION MEMORY BUDGET ***`. It never blocks an adoption: a refused keyframe
+  leaves two players in two galaxies, which is worse than a large process.
+  `DW2MP_MEMORY_BUDGET_MB` overrides the limit (clamped to 16 MB to 64 GB; the lobby strips it
+  from a real session like every other variable it does not set). Seen in run 2 with the limit
+  at 64 MB: the notice was queued and shown at the fourth adoption.
+- New dev flags, all needing `DW2MP_DEV=1` and all logged as `*** DEV FLAG LIVE ***`:
+  `DW2MP_ADOPTION_MEMORY_PROBE=<n>` (the probe from adoption n on) and
+  `DW2MP_ADOPTION_MEMORY_AGGRESSIVE_AT=<n>` (one aggressive collect at adoption n's settled
+  reading, to see how much the collector was holding).
+
+### Not done
+
+- **The leak itself is not released in this commit.** The recipe the evidence points to: a
+  Harmony prefix and postfix on `DWRendererBase.CheckInitializeGraphics` that notice which
+  system fields were given a new instance, then, some seconds later on the main thread,
+  dispose the discarded `MapOverlaySystem.BackBuffer` textures (32 of the 45 MB) and after that
+  the other discarded systems' buffers. `CustomOrbRenderer` and `DWRendererBase` read those
+  render targets through the renderer's fields, so a discarded instance should no longer be
+  drawn; that "should" needs a run of its own before it ships, because a texture disposed while
+  something still draws it can end the joiner's game.
+- The one surviving throwaway galaxy (26 MB, once) was not traced.
+- The 48 MB buffer `NetSession.Decompress` allocates for each full state was left alone: it is
+  collector slack, it is given back, and that path was security-reviewed the day before.
+- Nothing was tried on the late-game save, with DLC content, or between two machines.

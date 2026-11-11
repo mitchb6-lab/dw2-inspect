@@ -751,6 +751,15 @@ public static class Desync
         QueueDialog(title, text, ok, null);
     }
 
+    /// <summary>
+    /// A one-button notice from another part of the mod (the session memory budget). Shown on
+    /// the main thread like every other popup here, and logged even when the UI is unavailable.
+    /// </summary>
+    internal static void QueueNotice(string title, string text)
+    {
+        QueueInfoDialog(title, text);
+    }
+
     private static void QueueDialog(string title, string text, DialogButton first, DialogButton second)
     {
         _log($"# desync: popup queued -- {title}: {text.Replace("\n", " | ")}");

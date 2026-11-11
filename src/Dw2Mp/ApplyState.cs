@@ -166,6 +166,9 @@ public static class ApplyState
             // then.
             QuiesceBeforeSwap();
 
+            object outgoing = CurrentGalaxy;
+            AdoptionMemory.BeforeAdoption(outgoing);
+
             var sw = Stopwatch.StartNew();
 
             using var input = new MemoryStream(raw, writable: false);
@@ -197,7 +200,6 @@ public static class ApplyState
             CheckEmpirePolicies(incoming);
             VerifyComponentDefinitions(incoming);
 
-
             sw.Restart();
             _startGameExisting.Invoke(_game, new[] { incoming, ReadStartTime(incoming), incomingData });
             ResetDerivedCaches(incoming);
@@ -205,8 +207,8 @@ public static class ApplyState
 
             _incoming = incoming;
             var fp = Fingerprint(incoming);
-            _applyCount++;
-            info = $"{raw.LongLength:N0}B  read={readMs:N0}ms  apply={applyMs:N0}ms  {fp.Summary}  {MemoryReport()}";
+            string memoryText = AdoptionMemory.AfterAdoption();
+            info = $"{raw.LongLength:N0}B  read={readMs:N0}ms  apply={applyMs:N0}ms  {fp.Summary}  {memoryText}";
             return true;
         }
         catch (Exception ex)
@@ -796,57 +798,6 @@ public static class ApplyState
         {
             _log("# apply: ship summary rebuild failed " + (ex.InnerException ?? ex).Message);
         }
-    }
-
-    private static int _applyCount;
-
-    /// <summary>
-    /// Memory after an adoption, so a leak can be characterised instead of guessed at.
-    ///
-    /// Three numbers, because they separate three different causes:
-    ///   managed  — the GC heap. Growing here means objects are RETAINED (old galaxies).
-    ///   private  — the whole process. Growing while managed is flat means native memory
-    ///              (Stride/graphics) or Large Object Heap fragmentation, since a full
-    ///              state is a 24 MB byte[] and every one of those goes straight to the LOH.
-    ///   afterGC  — managed after a forced blocking collect. If this returns to baseline the
-    ///              growth was uncollected garbage, not a leak.
-    ///
-    /// The forced collect runs occasionally rather than every time: it is expensive, and the
-    /// point is to characterise the trend, not to paper over it by collecting.
-    /// </summary>
-    private static string MemoryReport()
-    {
-        try
-        {
-            var managed = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
-            var privateMb = Process.GetCurrentProcess().PrivateMemorySize64 / (1024.0 * 1024.0);
-
-            var line = $"managed={managed:N0}MB private={privateMb:N0}MB";
-
-            if (_applyCount % 5 == 0)
-            {
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-                GC.WaitForPendingFinalizers();
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-                var afterGc = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
-
-                // Does a COMPACTING collect give memory back to the OS? Every sync is a
-                // ~24 MB byte[], which goes straight to the Large Object Heap, and the LOH
-                // is not compacted by default -- so committed segments grow while live
-                // objects do not. That is exactly the shape observed: managed flat at
-                // ~543 MB, private climbing 3.5 -> 8.1 GB. This distinguishes LOH
-                // fragmentation from native (graphics) growth.
-                System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
-                    System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-
-                var privateAfter = Process.GetCurrentProcess().PrivateMemorySize64 / (1024.0 * 1024.0);
-                line += $" afterGC={afterGc:N0}MB afterLOHCompact={privateAfter:N0}MB";
-            }
-
-            return line;
-        }
-        catch { return "memory unavailable"; }
     }
 
     /// <summary>
