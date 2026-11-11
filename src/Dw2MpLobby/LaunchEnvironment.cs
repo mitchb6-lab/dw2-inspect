@@ -14,7 +14,10 @@ public static class LaunchEnvironment
 {
     private const string Prefix = "DW2MP_";
 
-    /// <summary>What the lobby sets itself in LobbyForm.StartGame, plus the one tuning knob that is clamped by the mod.</summary>
+    /// <summary>
+    /// What the lobby sets itself in LobbyForm.StartGame, plus the one tuning knob that is clamped
+    /// by the mod and the one off switch for a local-only feature.
+    /// </summary>
     public static readonly IReadOnlyCollection<string> AllowedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "DW2MP_DETERMINISM",
@@ -29,6 +32,12 @@ public static class LaunchEnvironment
         "DW2MP_SESSION",
         "DW2MP_LOCAL_PORT",
         "DW2MP_KEYFRAME_MINUTES",
+
+        // An off switch, not a dev flag (2026-11-11): "0" stops the joiner's mod releasing the
+        // render targets DW2 discards at each adoption. It changes nothing either player can
+        // see in the simulation and nothing on the wire; without it a player whose graphics
+        // driver disliked the release could only turn it off by enabling every dev flag.
+        "DW2MP_OVERLAY_RELEASE",
     };
 
     /// <summary>The inherited DW2MP_* names to remove before launching. Empty in developer mode.</summary>

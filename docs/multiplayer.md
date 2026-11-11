@@ -2692,8 +2692,12 @@ Read in the game's IL with `dw2inspect`:
   `_FlowSystem`, `_TravelVectorSystem`, `_FleetOverlaySystem`, `_AttackVectorSystem`. The
   instances it overwrites are not disposed, and none of these classes disposes anything.
 - `MapOverlaySystem.Initialize` alone creates a `SpriteBatch`, a `BackBufferSize` (2048) square
-  render target, two effect instances and a plane's vertex and index buffers. Two of them are
-  the two 16 MB textures: **32 of the 39 MB counted by Stride**.
+  render target, ~~two effect instances~~ and a plane's vertex and index buffers. Two of them are
+  the two 16 MB textures: **32 of the 39 MB counted by Stride**. (corrected 2026-11-11, same
+  day: the two effect instances are **not** created per overlay system. They are the statics
+  `EffectHelper._BasicTextureEffect` and `_BasicTextureEffectLRS`, obtained once and shared by
+  every `MapOverlaySystem`, so they must never be disposed with a discarded one. See "Overlay
+  release" below.)
 - Stride keeps every graphics resource in `GraphicsDevice.Resources` and a graphics resource
   has no finalizer, so one nobody disposes is never released. The census showed that set
   growing by 61 at every adoption, and nothing else growing with it.
@@ -2731,7 +2735,9 @@ and unmeasured here.
 
 ### Not done
 
-- **The leak itself is not released in this commit.** The recipe the evidence points to: a
+- **The leak itself is not released in this commit.** (2026-11-11, later the same day: the 32 MB
+  of render targets now are, on `fix/overlay-release-1111`; see "Overlay release" below. The
+  other systems' buffers still are not.) The recipe the evidence points to: a
   Harmony prefix and postfix on `DWRendererBase.CheckInitializeGraphics` that notice which
   system fields were given a new instance, then, some seconds later on the main thread,
   dispose the discarded `MapOverlaySystem.BackBuffer` textures (32 of the 45 MB) and after that
@@ -2743,3 +2749,129 @@ and unmeasured here.
 - The 48 MB buffer `NetSession.Decompress` allocates for each full state was left alone: it is
   collector slack, it is given back, and that path was security-reviewed the day before.
 - Nothing was tried on the late-game save, with DLC content, or between two machines.
+
+## Overlay release: the 32 MB of textures per adoption, released -- 2026-11-11
+
+Built on `fix/overlay-release-1111`, the follow-up the section above asked for. Wire protocol
+unchanged (net protocol **4**); nothing in the simulation is read or written.
+
+### What it does
+
+`src\Dw2Mp\OverlayRelease.cs`, joiner only. A Harmony prefix and postfix on
+`DWRendererBase.CheckInitializeGraphics(bool)` compare the renderer's two `MapOverlaySystem`
+fields (`_LongRangeScannerSystem`, `_ExplorationDiplomacyOverlaySystem`) before and after DW2's
+own code. An instance that was replaced goes into a waiting list
+(`src\Shared\DiscardedResourceQueue.cs`, pure, tested). After **10 seconds and 60 main-thread
+updates**, on the main thread, its `BackBuffer` (the 2048x2048 render target, 16 MB) is disposed.
+
+Guards, in the order they apply:
+
+- The patch is not applied while `CheckInitializeGraphics` still has DW2's four-byte stub body
+  (Harmony copies the body it finds; patching a stub would replace the real method with an empty
+  one). It is retried once per update until the body is real, and given up after 7,200 updates.
+- An instance that is in either field of any renderer seen is never touched: it is dropped from
+  the list, and noticed again if DW2 discards it again.
+- A texture that a live overlay system also holds is not disposed. Nor is one already disposed.
+- The discarded instance gets `Enabled = false` first. Both callers of `MapOverlaySystem.Draw`
+  check `Enabled`, so if the proof below were ever wrong, the old overlay would draw nothing
+  rather than draw into a disposed render target.
+- The first exception anywhere is logged once (`# overlay: *** FAILED ...`) and the release stops
+  for the rest of the session. That leaves DW2's own behaviour: the leak.
+- The list holds at most 64 instances; past that a replacement is counted and not queued.
+
+### Why the old render target is no longer referenced (read in the IL, game 1.3.8.4)
+
+A sweep of every method body in the four `DistantWorlds*` assemblies (1,904 types, 26,657
+methods, with a scratch tool built on the `dw2inspect` loader and IL printer) for
+`MapOverlaySystem`, the two field names, `ObtainEffectBasicTexture` and `BasicTextureKeys.Image`:
+
+- The two renderer fields are the **only** fields of type `MapOverlaySystem` in the game, and no
+  compiler-generated closure captures one. They are written only in `CheckInitializeGraphics`
+  (`newobj MapOverlaySystem::.ctor` then `stfld`).
+- They are read only in `CheckInitializeGraphics`, `DWRendererBase.UpdateMapOverlaySystems` and
+  `CustomOrbRenderer.DrawCorePreSceneInternal` / `DrawCorePostSceneInternal`. Each of those loads
+  the field again for every use (`ldarg.0; ldfld`); none keeps an instance in a local across
+  frames. An overwritten instance is therefore unreachable from the game's code.
+- `MapOverlaySystem.BackBuffer` is written only by `Initialize` (`Texture.New2D`, a new texture
+  every time) and read only by that instance's own `UpdateOverlay` and `Draw`.
+- `Draw` hands `BackBuffer` to an effect's parameters (`BasicTextureKeys.Image`). **Those two
+  effects are shared**: `EffectHelper.ObtainEffectBasicTexture` and `...LRS` return the statics
+  `_BasicTextureEffect` and `_BasicTextureEffectLRS`, and only `MapOverlaySystem.Initialize`
+  obtains them. So after an adoption a shared effect can still name the old texture, and a
+  disposed one once it is released. That stale entry is never drawn: the only code that applies
+  those effects is `MapOverlaySystem.Draw`, which sets `Image` to its own `BackBuffer` first.
+  It is also why the effects themselves are **not** disposed with a discarded instance.
+- `MapOverlaySystem.Draw` itself skips a `BackBuffer` that is null or `IsDisposed`.
+  `UpdateOverlay` does not, which is the reason for the `Enabled = false` above.
+
+What the IL of DW2 cannot show is what Stride does with a disposed texture that is still named
+in a parameter collection nobody applies. The run below is the evidence for that part.
+
+### Measured: one two-instance run, seven adoptions
+
+`Scripts\net-twoinstance.ps1 -Cycles 12000`, keyframes one a minute, the memory probe on from
+adoption 1 (`DW2MP_DEV=1`, `DW2MP_ADOPTION_MEMORY_PROBE=1`), both windows minimised. Settled
+readings on the joiner, MB. "Before" is run 2 of the section above (same harness, same settings).
+
+| Adoption | textures before | textures after | buffers before | buffers after | private before | private after |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,449 | 2,421 | 101 | 110 | 5,811 | 5,728 |
+| 2 | 2,481 (+32) | 2,421 (+0) | 108 (+7) | 117 (+7) | 5,859 | 5,766 |
+| 3 | 2,513 (+32) | 2,421 (+0) | 115 (+7) | 124 (+7) | 5,875 | 5,830 |
+| 4 | 2,545 (+32) | 2,421 (+0) | 122 (+7) | 131 (+7) | 5,938 | 5,756 |
+| 5 | 2,577 (+32) | 2,421 (+0) | 128 (+6) | 138 (+7) | 5,980 | 5,826 |
+| 6 | 2,609 (+32) | 2,421 (+0) | 135 (+7) | 145 (+7) | 6,036 | 5,763 |
+| 7 | 2,641 (+32) | 2,421 (+0) | 142 (+7) | 152 (+7) | 6,071 | 5,847 |
+
+- **Stride textures: +32 MB per adoption before, +0 MB after.** Every release logged
+  `Stride textures 2,453 MB -> 2,421 MB`; 14 render targets released in seven adoptions, none
+  skipped, the first pair being the ones built for the joiner's own throwaway galaxy.
+- Buffers still grow 7 MB an adoption: nothing was done about them (see below).
+- Private bytes went from +43 MB an adoption (5,811 to 6,071 over six) to about +20 (5,728 to
+  5,847 over six). That number is noisy from one adoption to the next (-74 to +84) because the
+  collector's committed memory moves with it; `other` (private minus collector) went from +45 an
+  adoption to +22. At the default five-minute keyframe that is roughly 240 MB an hour instead
+  of 540.
+- No `# overlay: *** FAILED` line, no exception and no failed sync check in either log, and no
+  desync popup. Both games reached `# run complete` and left on their own with the session
+  lock removed; the harness exited 0. No "Send Error Information" window was found at the
+  three checks made while the games ran.
+
+**A second, shorter run on the committed build** (`-Cycles 5500`, three adoptions). The first
+run was made before the stub-body guard was added, so the build that is committed was run
+again: `CheckInitializeGraphics body 2613 bytes, patched after 0 wait(s)` (DW2 had already
+initialised the renderer type when the mod installed, so the waiting path was **not**
+exercised), textures 2,278 MB at all three settled readings, buffers 101, 108, 114, private
+5,504, 5,512, 5,510, six render targets released, no failure line, both games left on their
+own. The texture level differs between runs (2,421 and 2,278 here, 2,373 and 2,449 in the
+section above); within a run it no longer moves.
+
+### The off switch
+
+`DW2MP_OVERLAY_RELEASE=0` switches the release off (`# overlay: OFF` in the log). Only `0` does;
+unset or anything else leaves it on. It is on the lobby's allow-list (`LaunchEnvironment`),
+unlike a dev flag: it is local, it changes nothing in the simulation or on the wire, and a
+player whose graphics driver disliked the release would otherwise have no way to turn it off
+short of `DW2MP_DEV=1`, which enables every dev flag. The off path was not run in the game.
+
+### Not done
+
+- **Nobody looked at the picture.** The harness runs both windows minimised. "No render errors"
+  above means no exception, no failure line and a normal exit; it does not mean the long-range
+  scanner and exploration overlays were seen drawing correctly after a release, and the log does
+  not say whether either overlay was switched on during the run. That wants one attended session
+  with both overlays on across an adoption.
+- **The other 7 MB of buffers per adoption**, and the 61 small resources (root signatures,
+  pipeline states, constant buffers) are still DW2's leak. The same proof was not done for the
+  other eight systems `CheckInitializeGraphics` re-creates (`_NebulaCloudSystem`,
+  `_GalaxyBackgroundSystem`, `_TerritoryMapSystem`, `_SymbolSystem`, `_FlowSystem`,
+  `_TravelVectorSystem`, `_FleetOverlaySystem`, `_AttackVectorSystem`): each needs its own sweep
+  for who else holds its buffers, and four of them are handed out through property getters
+  (`get_FlowSystem`, `get_TravelVectorSystem`, `get_AttackVectorSystem`,
+  `get_FleetOverlaySystem`), which the overlay systems are not.
+- **A discarded overlay system's `SpriteBatch` and plane vertex/index buffers** are not disposed.
+  They are small, `Draw` binds the plane buffers before its disposed-check, and whether a Stride
+  `SpriteBatch` shares its buffers with other batches of the same size was not read.
+- Host side: not installed. The host re-creates its systems once, when it loads the save.
+- One PC, one GPU and driver, the 30-star harness galaxy. Not tried on the late-game save, with
+  DLC content, or between two machines.
